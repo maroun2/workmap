@@ -1,0 +1,20 @@
+[package]
+name = "workmap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Local contextual map of repos, worktrees, docs and agent conversations"
+license = "MIT"
+repository = "https://github.com/maroun2/workmap"
+readme = "README.md"
+keywords = ["git", "worktree", "agents", "index", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde_json = "1"
+
+[dev-dependencies]
+
+[profile.release]
+debug = 0

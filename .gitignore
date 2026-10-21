@@ -1,0 +1,6 @@
+target/
+*.db
+*.db-*
+*.sqlite
+/result
+/result-*
