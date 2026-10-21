@@ -2,7 +2,7 @@ $ workmap scan --quiet
 
 $ workmap overview 
 (commands below assume: export WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home)
-workmap: 3 projects, 1 agent conversations; last scan 2026-10-21 06:30Z
+workmap: 3 projects, 1 agent conversations; last scan 2026-10-21 06:44Z
 - inkcore — 1 worktree(s), 0 conversation(s), last commit 2026-09-01
     workmap context inkcore
 - inkwell — 2 worktree(s), 1 conversation(s), last commit 2026-09-01, last conversation 2026-09-10
@@ -15,7 +15,7 @@ Remote-only, not cloned (1; metadata from authenticated gh/glab; expand remote:<
 $ workmap context inkwell 
 # inkwell — project map
 main @ $DEMO/home/src/inkwell · HEAD 36d628cc · 0 modified now · last commit 2026-09-01 · origin https://github.com/acme/inkwell.git
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sources or parse warnings
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 Codes: r/w = read/written, tool result recorded · req = requested, no result · fail = failed · sh = only named in a shell command (not access)
@@ -47,14 +47,14 @@ Codes: r/w = read/written, tool result recorded · req = requested, no result ·
 
 $ workmap search timeout 
 # search "timeout" — 1 shown of 1 matching passage(s) · all projects · all kinds
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 1. inkwell:message:5f2c9a10:l2 — claude user message · 2026-09-10 09:00Z · conversation "Parser timeout on huge files"
    "Parser [timeout] on huge files"
 Messages are historical transcript text, not decisions. Expand a ref for the full message and its neighbours.
 
 $ workmap search retry deadline --project inkwell --kind message 
 # search "retry deadline" — 1 shown of 1 matching passage(s) · inkwell (all worktrees) · message
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 1. :message:5f2c9a10:l5 — claude assistant message · 2026-09-10 09:01Z · conversation "Parser timeout on huge files"
    "The hang is the [retry] helper in inkcore: it retries a timed-out read…"
@@ -73,7 +73,7 @@ Conversation: ':conversation:Parser timeout'
 
 $ workmap related inkwell 
 # inkwell — related projects (depth 2; 2 found)
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 - :related:inkcore — Cargo path dependency
     → Cargo path dependency [declared] at $DEMO/home/src/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
@@ -84,7 +84,7 @@ Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME
 
 $ workmap why notes inkcore 
 # why notes → inkcore (max 4 steps)
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 1. notes → inkwell (1 piece(s) of evidence)
    → doc names its URL or path [documented] at $DEMO/home/src/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
 2. inkwell → inkcore (4 piece(s) of evidence)
@@ -96,7 +96,7 @@ Each step is a recorded relation; a chain does not imply the first project depen
 $ workmap context inkwell --task parser\ timeout\ on\ huge\ files --file src/check.rs --budget 2500 
 # inkwell — task context for "parser timeout on huge files"
 files: src/check.rs
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sources or parse warnings
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 
@@ -116,7 +116,7 @@ Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME
 
 $ workmap status 
 db: $DEMO/state/index.db (167936 bytes)
-Index: last scan 2026-10-21 06:30Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
 repo: 3
 checkout: 4
 doc: 6
@@ -137,7 +137,7 @@ Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sou
   (unrelated = transcript cwd outside every indexed checkout; missing = deleted since indexed, evidence kept; error = could not be parsed)
 remote discovery: enabled (opt out: `workmap remote disable`, WORKMAP_REMOTE=0 or scan --no-remote); refresh after 24h
 gh: $DEMO/bin/gh (hosts from $DEMO/home/.config/gh/hosts.yml) · glab: glab (hosts from $DEMO/home/.config/glab-cli/config.yml)
-- gh github.com: ok; 2 repositories from 2026-10-21 06:30Z; last check 2026-10-21 06:30Z
+- gh github.com: ok; 2 repositories from 2026-10-21 06:44Z; last check 2026-10-21 06:44Z
 catalog: 1 remote-only (not cloned), 1 matched to local clones
-last scan stats: {"checkouts":4,"checkouts_pruned":0,"commits_per_worktree":30,"dirs_visited":11,"docs":6,"messages":4,"ms":959,"parse_warnings":0,"relations":5,"remote":["gh github.com: 2 repositories"],"repos":3,"sessions_indexed":true,"sessions_parsed":1,"sessions_reused":0,"sessions_truncated":0,"sources_missing":0,"sources_unrelated":0,"warnings":["codex: source not found: $DEMO/home/.codex/sessions","opencode: source not found: $DEMO/home/.local/share/opencode/opencode.db"]}
+last scan stats: {"checkouts":4,"checkouts_pruned":0,"commits_per_worktree":30,"dirs_visited":11,"docs":6,"messages":4,"ms":833,"parse_warnings":0,"relations":5,"remote":["gh github.com: 2 repositories"],"repos":3,"sessions_indexed":true,"sessions_parsed":1,"sessions_reused":0,"sessions_truncated":0,"sources_missing":0,"sources_unrelated":0,"warnings":["codex: source not found: $DEMO/home/.codex/sessions","opencode: source not found: $DEMO/home/.local/share/opencode/opencode.db"]}
 

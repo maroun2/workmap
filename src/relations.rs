@@ -49,6 +49,7 @@ fn class(kind: &str) -> &'static str {
 const MAX_MANIFESTS: usize = 60;
 const MAX_LINKS: usize = 400;
 pub const MAX_HASHED: usize = 20_000;
+pub const MAX_STATS: usize = 30_000;
 pub const HASH_MIN: u64 = 1024;
 pub const HASH_MAX: u64 = 4 << 20;
 /// A blob present in more projects than this is boilerplate, not a signal.
@@ -340,14 +341,17 @@ pub fn extract_checkout(tx: &Connection, top: &Path, repo_id: &str, co_id: &str,
         add("symlink", &target.to_string_lossy(), &abs.to_string_lossy(), &l, 0, "symlink")?;
     }
     // Identical-content candidates from Git blob ids (no hashing of our own).
+    // Both inserts and `stat` calls are bounded (slow or network filesystems).
     let mut hashed = 0usize;
+    let mut stats = 0usize;
     for (mode, blob, rel) in staged {
-        if hashed >= MAX_HASHED {
+        if hashed >= MAX_HASHED || stats >= MAX_STATS {
             break;
         }
         if !(mode == "100644" || mode == "100755") || hash_excluded(rel) {
             continue;
         }
+        stats += 1;
         let Ok(md) = std::fs::symlink_metadata(top.join(rel)) else { continue };
         if !md.is_file() || md.len() < HASH_MIN || md.len() > HASH_MAX {
             continue;

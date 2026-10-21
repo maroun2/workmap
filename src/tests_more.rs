@@ -181,7 +181,7 @@ fn relations_fixture() -> Rels {
     let shared = format!("// shared helper\n{}", "fn helper() -> u32 { 42 }\n".repeat(60));
     // app: Cargo path dep on lib, registry dep named like web's package, doc link to lib's URL.
     let app = code.join("app");
-    write(&app.join("Cargo.toml"), "[package]\nname = \"app\"\n\n[dependencies]\nlib = { path = \"../lib\" }\nwidget = \"1\"\n");
+    write(&app.join("Cargo.toml"), "[package]\nname = \"app\"\n\n[dependencies]\nlib = { path = \"../lib\" }\nwidget = \"1\"\nlibgit = { git = \"https://github.com/acme/lib\", package = \"lib\" }\ntool = { git = \"ssh://git@github.com/acme/secret-tool.git\" }\n");
     write(&app.join("README.md"), "# App\n\nUses https://github.com/acme/lib/tree/main/src for parsing.\n");
     write(&app.join("src/main.rs"), "fn main() {}\n");
     write(&app.join("src/shared.rs"), &shared);
@@ -238,7 +238,7 @@ fn relations_keep_their_kind_and_evidence() {
     assert!(st.relations > 0);
     let lib_path = fx.lib.to_string_lossy().into_owned();
     let k = rel_kinds(&c, "app", &lib_path);
-    for want in [("cargo_path", "declared"), ("doc_link", "documented"), ("conversation_access", "observed")] {
+    for want in [("cargo_path", "declared"), ("cargo_git", "declared"), ("doc_link", "documented"), ("conversation_access", "observed")] {
         assert!(k.contains(&(want.0.into(), want.1.into())), "{want:?} missing: {k:?}");
     }
     let kw = rel_kinds(&c, "app", "web");
@@ -263,7 +263,7 @@ fn relations_keep_their_kind_and_evidence() {
     assert!(rv.contains("## Uncertain candidates (1; name matches only, not evidence)"), "{rv}");
     assert!(rv.contains(&*lib_handle), "lib is ambiguous by name, so it is shown by path:\n{rv}");
     let first = rv.lines().find(|l| l.starts_with("- ")).unwrap();
-    assert!(first.contains("Cargo path dependency"), "declared relations sort first:\n{rv}");
+    assert!(first.contains("Cargo git dependency") || first.contains("Cargo path dependency"), "declared relations sort first:\n{rv}");
     let ev = view::expand(&v(&c), ":related:web", &scoped("app")).unwrap();
     assert!(ev.starts_with("# :related:web — evidence between app and web") && ev.contains("## Uncertain candidates (not evidence of a relation)"), "{ev}");
     let map = view::context(&v(&c), "", &scoped("app")).unwrap();
@@ -368,8 +368,13 @@ fn remote_catalog_dedups_clones_isolates_failures_and_never_logs_secrets() {
     assert!(global(&c, "internal ops").contains("remote:github.com/acme/secret-tool"));
     let rv = view::expand(&v(&c), "remote:github.com/acme/secret-tool", &view::Req::default()).unwrap();
     assert!(rv.contains("not cloned locally") && rv.contains("default branch dev"), "{rv}");
+    assert!(
+        rv.contains("## Local projects pointing at it (1)") && rv.contains("app ← Cargo git dependency [declared]") && rv.contains("secret-tool.git"),
+        "git dependency on a non-cloned repo points at the remote entry:\n{rv}"
+    );
     let map = view::context(&v(&c), "", &scoped("app")).unwrap();
-    assert!(!map.contains("secret-tool"));
+    assert!(map.contains(":related:remote:github.com/acme/secret-tool — → Cargo git dependency [declared]"), "remote-only repo appears only as an evidenced relation:\n{map}");
+    assert_refs_roundtrip(&c, "app", &map);
     assert!(!dump(&c).contains("LEAKED"), "no token text stored anywhere");
     drop(c);
     // Within the TTL nothing is fetched again.
@@ -476,4 +481,25 @@ fn ask_note_separates_history_from_current_disk() {
     let n = more::ask_note(&c, &sid("claude", "11111111-aaaa"));
     assert!(n.starts_with("historical session: last activity 2026-02-02") && n.contains("indexed commit(s) on main") && n.contains("file(s) it wrote changed or vanished since"), "{n}");
     assert!(n.contains("not a decision record"));
+}
+
+#[test]
+fn deleted_checkouts_are_pruned_but_unmounted_parents_are_not() {
+    let fx = fixture();
+    let env = Env::with_home(&fx.home);
+    let (c, _) = scan_once(&env);
+    drop(c);
+    // `wt/` vanishes entirely (like an unmounted drive): its checkout is kept.
+    let feature = std::fs::canonicalize(&fx.feature).unwrap();
+    std::fs::remove_dir_all(fx.home.join("wt")).unwrap();
+    // The outside worktree is deleted while its parent stays: pruned.
+    let outside = std::fs::canonicalize(&fx.outside_wt).unwrap();
+    std::fs::remove_dir_all(&outside).unwrap();
+    let (c, st) = scan_once(&env);
+    let has = |p: &Path| c.query_row("SELECT count(*) FROM nodes WHERE kind='checkout' AND path=?1", [p.to_string_lossy()], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(has(&feature), 1, "parent dir missing: keep");
+    assert_eq!(has(&outside), 0, "deleted with parent present: pruned");
+    assert_eq!(st.checkouts_pruned, 1);
+    let orphans: i64 = c.query_row("SELECT count(*) FROM passages WHERE node_id NOT IN (SELECT id FROM nodes)", [], |r| r.get(0)).unwrap();
+    assert_eq!(orphans, 0);
 }

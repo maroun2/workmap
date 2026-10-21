@@ -27,7 +27,7 @@ builds three synthetic projects (`inkwell`, a CLI; `inkcore`, its library;
 `notes`, a docs repo), one Claude Code conversation and a fake `gh`. The full
 run is in [`examples/demo-output.txt`](examples/demo-output.txt).
 
-**1. What exists?**
+**1. What exists?** (excerpts below are trimmed; the full output is in the file above)
 
 ```
 $ workmap overview
@@ -241,7 +241,9 @@ WARNING: index is stale (5d ago > 48h); run `workmap scan` — recent commits, d
 
 The stale threshold is 48 hours (`WORKMAP_STALE_HOURS`). Transcripts deleted
 after indexing keep their evidence and text, flagged as missing. Checkouts
-deleted from disk are pruned on the next scan. `workmap status` breaks coverage
+deleted from disk are pruned on the next scan, but only when their parent
+directory still exists, so an unmounted drive or a missing root never empties
+the index. `workmap status` breaks coverage
 down per provider (parsed, unrelated, missing, error).
 
 ## Remote discovery (gh / glab)
@@ -273,6 +275,13 @@ GitLab hosts from their config files (`~/.config/gh/hosts.yml`,
 
 Remote metadata, private repositories included, stays in your local index and
 your generated skill files. Nothing is sent anywhere.
+
+The daily systemd timer runs with the unit's `PATH`, which may not contain
+`gh`/`glab`; it then reports them as "not installed" and keeps the cached
+catalog. Set `WORKMAP_GH_BIN` / `WORKMAP_GLAB_BIN` before `workmap install` to
+pin the paths into the unit. Under `WORKMAP_HOME` the CLIs get the fake
+home's config dirs and no `GH_TOKEN`/`GITLAB_TOKEN`-style variables, so a test
+or demo run never reaches your real accounts.
 
 ## `ask`: read-only follow-up questions
 
@@ -346,9 +355,19 @@ Known limits:
   editor for that.
 - `ask` enforcement is verified from each CLI's documented flags. OpenCode is
   unsupported.
+- Identical-file detection stats at most 30,000 tracked files and records at
+  most 20,000 per main checkout; very large repositories are only partly
+  compared.
 - The scan skips dependency, cache and build directories (`node_modules`,
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
+
+## Upgrading from 0.1
+
+0.2 adds searchable passages and relation data. The first `workmap scan` after
+upgrading re-reads every transcript and re-indexes every checkout once (about
+as long as the very first scan); later scans are incremental again. Existing
+evidence for transcripts deleted in the meantime is kept and flagged missing.
 
 ## Development
 

@@ -345,9 +345,13 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
     }
 
     // Checkouts indexed earlier whose directory is gone: drop them and what they produced.
+    // Only when the parent directory still exists, so an unmounted drive or a
+    // missing root never wipes its projects from the index.
     let live: HashSet<String> = matcher.checkouts.iter().map(|c| c.id.clone()).collect();
     for co in crate::overview::nodes(tx, "kind='checkout'", &[])? {
-        if live.contains(&co.id) || co.path.as_deref().map(|p| Path::new(p).exists()).unwrap_or(false) {
+        let path = PathBuf::from(co.path.clone().unwrap_or_default());
+        let parent_ok = path.parent().map(|p| p.is_dir()).unwrap_or(false);
+        if live.contains(&co.id) || path.as_os_str().is_empty() || path.exists() || !parent_ok {
             continue;
         }
         db::clear_origin(tx, &co.id)?;

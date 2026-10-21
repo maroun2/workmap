@@ -102,6 +102,12 @@ fn cli(env: &Env, provider: &str) -> Command {
         .env("NO_PROMPT", "1")
         .env("NO_COLOR", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
+    if env.overridden {
+        // A fake home must not reach real accounts through tokens in the environment.
+        for k in ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "GITLAB_HOST"] {
+            c.env_remove(k);
+        }
+    }
     c
 }
 
