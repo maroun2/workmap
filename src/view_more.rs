@@ -1193,6 +1193,8 @@ fn hop_edge_score(kind: &str, strength: &str) -> i64 {
         ("read", "parsed") => 22,
         (_, "requested") => 15,
         ("mentioned", _) => 3,
+        // A failed access shows nothing about the file's content.
+        (_, "failed") => 2,
         _ => 5,
     }
 }

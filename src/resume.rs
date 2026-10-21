@@ -191,10 +191,11 @@ fn missing_cwd(c: &Connection, s: &Node, recorded: &Path) -> String {
         (Some(main), false) if !cands.is_empty() && cands.iter().all(|co| co.path != main.path) => {
             let _ = write!(
                 m,
-                "\n  git -C {} worktree repair && git -C {} worktree move {} {}   # repair the moved checkout registration, restore its recorded path, then rerun",
+                // `repair` must run inside the moved checkout: run from the main
+                // checkout it cannot find a worktree that was moved by hand.
+                "\n  git -C {0} worktree repair && git -C {1} worktree move {0} {2}   # re-register the moved checkout, restore its recorded path, then rerun",
+                sh_quote(cands[0].path.as_deref().unwrap_or("")),
                 sh_quote(main.path.as_deref().unwrap_or("")),
-                sh_quote(cands[0].path.as_deref().unwrap_or("")),
-                sh_quote(cands[0].path.as_deref().unwrap_or("")),
                 sh_quote(&recorded.display().to_string())
             );
         }

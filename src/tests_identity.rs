@@ -149,6 +149,30 @@ fn duplicate_clones_get_stable_handles_in_every_listing() {
     )
     .unwrap();
     assert!(hits.contains(&format!(" {main} — project")) && hits.contains(&format!(" {clone} — project")), "{hits}");
+
+    // A commit that two clones share (a real `git clone`) lists each clone's own
+    // files, never the other clone's copies, whichever clone was indexed last.
+    let dup = fx.home.join("copies/ledger-api");
+    std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
+    git(&fx.home, &["clone", "-q", fx.api.to_str().unwrap(), dup.to_str().unwrap()]);
+    let sha = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&dup).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap().trim()[..8].to_string();
+    drop(c);
+    let (c, _) = scan_once(&env);
+    let dup_h = view::resolve_project(&c, &dup.to_string_lossy()).unwrap().handle;
+    let main = view::resolve_project(&c, &fx.api.to_string_lossy()).unwrap().handle;
+    drop(c);
+    let mut c = db::open(&env.db_path()).unwrap();
+    scan::ingest(&env, &mut c, &scan::IngestOpts { transcripts: vec![], checkouts: vec![dup.clone()] }).unwrap();
+    for (h, top) in [(&main, &fx.api), (&dup_h, &dup)] {
+        let cv = ev_expand(&c, &format!("{h}:commit:{sha}")).unwrap();
+        let files: Vec<&str> = cv.lines().skip_while(|l| !l.starts_with("## Files changed")).skip(1).take_while(|l| l.starts_with("- ")).collect();
+        let n: usize = cv.lines().find(|l| l.starts_with("## Files changed (")).and_then(|l| l["## Files changed (".len()..].split(';').next()?.parse().ok()).unwrap();
+        assert!(!files.is_empty() && files.len() == n, "{cv}");
+        assert!(files.iter().all(|l| !l.contains("other project") && !l.contains('@')), "{h}: {cv}");
+        assert_refs_roundtrip(&c, h, &cv);
+        let first = printed_refs(files[0])[0].clone();
+        assert!(expand_ref(&c, h, &first).unwrap().contains(&top.display().to_string()), "{first} -> its own clone");
+    }
 }
 
 // ------------------------------------------------------------------ raw remote URLs and credentials

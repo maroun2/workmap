@@ -65,6 +65,14 @@ fn session_start_in_an_indexed_checkout_lists_expandable_conversations_within_bu
     let text = if out.is_empty() { String::new() } else { context_of(&out, "SessionStart") };
     assert!(text.len() <= 300, "{text}");
     assert_refs_roundtrip(&c, "ledger-sdk", &text);
+    // A sibling deleted from disk is marked, never offered as a live directory.
+    std::fs::remove_dir_all(&fx.api_fix).unwrap();
+    let (c, _) = scan_once(&env);
+    let out = hook::respond(&env, Some("SessionStart"), "claude", &event("SessionStart", "s-gone", &fx.api, json!({"source": "startup"})), &ctx(1500));
+    let text = context_of(&out, "SessionStart");
+    let line = text.lines().find(|l| l.contains("branch fix/webhook-retry")).unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains("MISSING on disk since") && line.contains("(history kept)"), "{text}");
+    assert_refs_roundtrip(&c, "ledger-sdk", &text);
     // The conversation being resumed is not offered back to itself.
     let out = hook::respond(&env, Some("SessionStart"), "codex", &event("SessionStart", "aaaa1111-fix", &fx.api_fix, json!({"source": "resume"})), &ctx(1500));
     assert!(!context_of(&out, "SessionStart").contains("Recent conversations in this checkout"), "{out}");
@@ -399,21 +407,30 @@ fn resume_refuses_a_missing_cwd_with_choices_and_reports_drift_for_cwd() {
     assert!(p.render().contains("CONTEXT DRIFT"));
     // --cwd equal to the recorded one: no drift.
     assert!(resume::plan(&c, &s, Some(&fx.api_fix), &h).unwrap().drift.is_empty());
-    // The worktree is moved away: refuse, name the moved checkout and the recreate command.
+    // The worktree is moved away by hand (plain `mv`, git still registers the old
+    // path): refuse, name the moved checkout and a restore command that works.
     let moved = fx.home.join("work/ledger-api-fix-moved");
-    git(&fx.api, &["worktree", "move", fx.api_fix.to_str().unwrap(), moved.to_str().unwrap()]);
+    std::fs::rename(&fx.api_fix, &moved).unwrap();
     let (c, _) = scan_once(&env);
     let e = resume::plan(&c, &s, None, &h).unwrap_err();
     assert!(e.contains(&format!("{} no longer exists", fx.api_fix.display())), "{e}");
+    let fixline = e.lines().find(|l| l.contains("worktree repair")).unwrap_or_else(|| panic!("{e}"));
     assert!(
-        e.contains(&format!("git -C {} worktree repair && git -C {} worktree move {} {}", fx.api.display(), moved.display(), moved.display(), fx.api_fix.display())),
-        "branch is checked out at the new path: {e}"
+        fixline.contains(&format!("git -C {} worktree repair && git -C {} worktree move {} {}", moved.display(), fx.api.display(), moved.display(), fx.api_fix.display())),
+        "repair runs in the moved checkout, then git moves it back: {e}"
     );
     assert!(e.contains(&format!("--cwd {}", moved.display())), "reconnection candidate on the recorded branch: {e}");
     let p = resume::plan(&c, &s, Some(&moved), &h).unwrap();
     assert!(p.drift.iter().any(|l| l.contains("recorded cwd no longer exists")));
+    // Running the printed command restores the recorded path and resume plans again.
+    let cmd = fixline.split("   #").next().unwrap().trim();
+    let st = std::process::Command::new("sh").arg("-c").arg(cmd).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+    assert!(st.status.success(), "{cmd}: {}", String::from_utf8_lossy(&st.stderr));
+    assert!(fx.api_fix.join("ledger/webhooks.py").is_file() && !moved.exists());
+    let (c, _) = scan_once(&env);
+    assert_eq!(resume::plan(&c, &s, None, &h).unwrap().cwd, fx.api_fix);
     // Worktree deleted outright: recreate it on the recorded branch.
-    git(&fx.api, &["worktree", "remove", "--force", moved.to_str().unwrap()]);
+    git(&fx.api, &["worktree", "remove", "--force", fx.api_fix.to_str().unwrap()]);
     let (c, _) = scan_once(&env);
     let e = resume::plan(&c, &s, None, &h).unwrap_err();
     assert!(e.contains(&format!("git -C {} worktree add {} fix/webhook-retry", fx.api.display(), fx.api_fix.display())), "{e}");

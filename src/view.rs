@@ -210,7 +210,18 @@ pub fn resolve_project(c: &Connection, name: &str) -> R<Project> {
 /// `--worktree <branch|dir-name|path>` within a project.
 pub fn select_worktree(p: &mut Project, name: Option<&str>) -> R<()> {
     let Some(name) = name else { return Ok(()) };
-    let matching: Vec<Node> = p.checkouts.iter().filter(|co| branch(co) == name || dir_name(co) == name || co.path.as_deref() == Some(name)).cloned().collect();
+    let mut matching: Vec<Node> = p.checkouts.iter().filter(|co| branch(co) == name || dir_name(co) == name || co.path.as_deref() == Some(name)).cloned().collect();
+    if matching.is_empty() {
+        // Refs printed before a checkout was moved by hand name its former
+        // directory (detached HEAD or a branch shared by name); the checkout
+        // keeps those paths in `moved_paths`.
+        matching = p
+            .checkouts
+            .iter()
+            .filter(|co| co.meta.get("moved_paths").and_then(|v| v.as_array()).is_some_and(|old| old.iter().filter_map(|x| x.as_str()).any(|x| x == name || x.rsplit('/').next() == Some(name))))
+            .cloned()
+            .collect();
+    }
     let live: Vec<Node> = matching.iter().filter(|co| !is_missing(co)).cloned().collect();
     // Prefer a unique live checkout when an older, missing node shares its
     // branch name. If no live match exists, keep historical refs expandable.
@@ -813,8 +824,11 @@ fn file_ref(v: &View, p: &Project, coid: Option<&str>, path: Option<&str>, memor
 pub(crate) struct ConvRow {
     pub session: Node,
     pub link: ConvLink,
-    /// Read/write evidence (not only a shell mention).
+    /// Read/write evidence with a result (observed, or a Codex parsed read).
     pub structured: bool,
+    /// Only read/write attempts without a result (requested, failed); never
+    /// counted as "read/wrote it".
+    pub tried: bool,
     /// `(code, tool, transcript line)` per edge, strongest first.
     pub evs: Vec<(String, String, i64)>,
     /// Printed list line (`- REF day provider…: evidence — "title"`).
@@ -834,19 +848,22 @@ pub(crate) fn file_conversations(c: &Connection, pc: &mut ProjectCache, p: &Proj
     for (sid, kind, strength, line, note) in rows {
         let tool = note.split(" @").next().unwrap_or(&note).to_string();
         let ev = (edge_code(&kind, &strength).to_string(), tool, line);
-        let structured = kind == "read" || kind == "write";
+        let access = kind == "read" || kind == "write";
+        let structured = access && (strength == "observed" || strength == "parsed");
+        let tried = access && !structured;
         if let Some(x) = out.iter_mut().find(|x| x.session.id == sid) {
             if !x.evs.contains(&ev) {
                 x.evs.push(ev);
             }
             x.structured |= structured;
+            x.tried |= tried;
             continue;
         }
         let Some(s) = db(get_node(c, &sid))? else { continue };
         let link = conv_link(pc, p, all, &s, qualify);
-        out.push(ConvRow { session: s, link, structured, evs: vec![ev], line: String::new() });
+        out.push(ConvRow { session: s, link, structured, tried, evs: vec![ev], line: String::new() });
     }
-    out.sort_by_key(|x| !x.structured);
+    out.sort_by_key(|x| (!x.structured, !x.tried));
     let pv = View { c, cmd: String::new(), state: String::new() };
     for x in &mut out {
         let sub = parent_ref(&pv, p, all, &x.session).map(|r| format!(" (subagent of {r})")).unwrap_or_default();
@@ -858,6 +875,20 @@ pub(crate) fn file_conversations(c: &Connection, pc: &mut ProjectCache, p: &Proj
         };
     }
     Ok(out)
+}
+
+/// `(read/wrote it, only tried it)` conversation counts; the rest only named it in shell.
+fn conv_access_counts(convs: &[ConvRow]) -> (usize, usize) {
+    let n_struct = convs.iter().filter(|x| x.structured).count();
+    (n_struct, convs.iter().filter(|x| !x.structured && x.tried).count())
+}
+
+fn tried_note(n_tried: usize) -> String {
+    if n_tried == 0 {
+        String::new()
+    } else {
+        format!("{n_tried} only tried it (requested or failed, no result), ")
+    }
 }
 
 /// Most sibling checkouts examined per view (each costs up to three `git` calls).
@@ -987,8 +1018,8 @@ pub(crate) fn same_path_blocks(c: &Connection, pc: &mut ProjectCache, p: &Projec
         }
         let mut b = format!("- {} — {}\n", s.file_ref, s.state);
         if !s.convs.is_empty() {
-            let n_struct = s.convs.iter().filter(|x| x.structured).count();
-            let _ = writeln!(b, "    conversations there ({n_struct} read/wrote it, {} only named it in shell):", s.convs.len() - n_struct);
+            let (n_struct, n_tried) = conv_access_counts(&s.convs);
+            let _ = writeln!(b, "    conversations there ({n_struct} read/wrote it, {}{} only named it in shell):", tried_note(n_tried), s.convs.len() - n_struct - n_tried);
             for x in s.convs.iter().take(per) {
                 let _ = writeln!(b, "    {}", x.line);
             }
@@ -1136,12 +1167,13 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
     let all = sessions_of(c, p)?;
     let mut pc = ProjectCache::new(c);
     let convs = file_conversations(c, &mut pc, p, &all, &n.id, false)?;
-    let n_struct = convs.iter().filter(|x| x.structured).count();
+    let (n_struct, n_tried) = conv_access_counts(&convs);
     let _ = writeln!(
         o,
-        "\n## Conversations ({} read/wrote it, {} only named/searched it in shell) — evidence: code tool transcript-line; [cwd …] = ran in another project",
+        "\n## Conversations ({} read/wrote it, {}{} only named/searched it in shell) — evidence: code tool transcript-line; [cwd …] = ran in another project",
         n_struct,
-        convs.len() - n_struct
+        tried_note(n_tried),
+        convs.len() - n_struct - n_tried
     );
     if convs.is_empty() {
         let _ = writeln!(o, "- none recorded");
@@ -1255,7 +1287,14 @@ pub fn commit_view(v: &View, p: &Project, prefix: &str, lim: &FileLimits) -> R<S
     let _ = writeln!(o, "{sha} · {} · {} · in worktree(s): {}", meta(&cm, "author"), fmt_ts(cm.ts), if names.is_empty() { "none".into() } else { names.join(", ") });
     o.push_str(&header(v, p, false));
     let mut st = db(c.prepare("SELECT n.path, n.checkout_id, e.note FROM edges e JOIN nodes n ON n.id=e.dst WHERE e.src=?1 AND e.kind='touched' ORDER BY n.path"))?;
-    let files: Vec<(Option<String>, Option<String>, String)> = db(db(st.query_map([&cm.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>())?;
+    let mut files: Vec<(Option<String>, Option<String>, String)> = db(db(st.query_map([&cm.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>())?;
+    // The commit node is shared by every clone and worktree holding the SHA, so
+    // `touched` edges point at each copy of a file. List this project's copies,
+    // the focus checkout's first; other clones only when this project has none.
+    if files.iter().any(|f| co_of(p, f.1.as_deref()).is_some()) {
+        files.retain(|f| co_of(p, f.1.as_deref()).is_some());
+    }
+    files.sort_by_key(|f| f.1.as_deref() != Some(p.focus.id.as_str()));
     let mut seen = std::collections::HashSet::new();
     let uniq: Vec<_> = files
         .into_iter()

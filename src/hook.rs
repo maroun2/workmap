@@ -303,6 +303,10 @@ fn session_start(c: &Connection, p: &Project, session_id: &str, ctx: &Ctx) -> Re
     if !sib.is_empty() && push_line(&mut o, "Other worktrees of this project:", budget) {
         for (ts, x, last) in sib.into_iter().take(4) {
             let mut line = format!("- {} · branch {} · {} · last activity {}", view::worktree_name(p, x), view::branch(x), p.top(x), if ts > 0 { fmt_date(ts) } else { "unknown".into() });
+            if view::is_missing(x) {
+                let since = x.meta.get("missing_since").and_then(|t| t.as_i64()).unwrap_or(0);
+                let _ = write!(line, " · MISSING on disk since {} (history kept)", if since > 0 { fmt_date(since) } else { "unknown".into() });
+            }
             if let Some(s) = last {
                 let _ = write!(line, " · latest conversation {} \"{}\"", conv_ref(p, &all, s), clip(&s.label, 40));
             }
@@ -509,7 +513,8 @@ fn prompt_context(env: &Env, c: &Connection, p: &Project, session_id: &str, prom
     for t in &paths {
         let like = format!("%/{}", t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         let cands = nodes(c, "repo_id=?1 AND kind IN ('file','doc') AND path LIKE ?2 ESCAPE '\\' LIMIT 20", &[&p.repo.id, &like]).unwrap_or_default();
-        let n_conv = |id: &str| c.query_row("SELECT count(DISTINCT src) FROM edges WHERE dst=?1 AND kind IN ('read','write')", [id], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        let n_conv =
+            |id: &str| c.query_row("SELECT count(DISTINCT src) FROM edges WHERE dst=?1 AND kind IN ('read','write') AND strength IN ('observed','parsed')", [id], |r| r.get::<_, i64>(0)).unwrap_or(0);
         let best = cands
             .iter()
             .filter_map(|n| n.checkout_id.as_deref().and_then(|id| p.checkouts.iter().find(|x| x.id == id)).map(|co| (n_conv(&n.id), co.id == p.focus.id, n, co)))

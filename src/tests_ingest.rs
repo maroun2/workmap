@@ -433,6 +433,10 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
     assert!(old_fv.contains("Batch charges spike"), "{old_fv}");
     let live_fv = view::expand(&v(&c), &format!("{api}@spike/batching:ledger/batch.py"), &scoped(&api)).unwrap();
     assert!(live_fv.contains("Batch charges spike") && !live_fv.contains("NOT ON DISK"), "{live_fv}");
+    // Refs naming the former directory (printed for detached or same-named
+    // checkouts) resolve to the moved checkout.
+    let by_dir = view::expand(&v(&c), &format!("{api}@ledger-api-spike:ledger/batch.py"), &scoped(&api)).unwrap();
+    assert!(by_dir.contains("Batch charges spike") && by_dir.contains(&moved.display().to_string()), "{by_dir}");
     // Every ref in the view remains scoped to its live branch after the move.
     for r in printed_refs(&fv) {
         let mut req = scoped(&api);
@@ -557,6 +561,16 @@ fn codex_parsed_shell_reads_are_their_own_evidence_class() {
     let fv = view::expand(&v(&c), ":ledger/charges.py", &scoped(&api)).unwrap();
     assert!(fv.lines().any(|l| l.contains("cr shell:read") && l.contains("codex")), "{fv}");
     assert_refs_roundtrip(&c, &api, &fv);
+    // A failed or unanswered read is listed, but never counted as "read/wrote it".
+    for (f, code) in [(":README.md", "r-fail shell:read"), (":docs/adr/0003-charge-dedup.md", "r-req")] {
+        let fv = view::expand(&v(&c), f, &scoped(&api)).unwrap();
+        let head = fv.lines().find(|l| l.starts_with("## Conversations (")).unwrap();
+        let rows = conv_section(&fv, head.trim_start_matches("## "));
+        // The fixture's other conversations on these files are Claude Read/Edit rows.
+        let ok = rows.iter().filter(|l| !l.contains("codex")).count();
+        assert!(rows.iter().any(|l| l.contains(code) && l.contains("codex")), "{fv}");
+        assert!(head.contains(&format!("({ok} read/wrote it, 1 only tried it (requested or failed, no result), ")), "{head}\n{fv}");
+    }
     // Ranking: a confirmed provider Read (conv_cross) outranks a parsed shell read.
     let t = view::task(&v(&c), &api, &view::Req::default(), &view::more::TaskReq { task: None, files: &["ledger/charges.py".to_string()], budget: 6000 }).unwrap();
     let pos = |needle: &str| t.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} missing:\n{t}"));
