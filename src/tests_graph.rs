@@ -81,7 +81,7 @@ fn cross_project_file_view_lists_conversations_from_other_projects() {
 fn file_view_pagination_counts_and_more_lines_work() {
     let fx = crate::testutil::ledger();
     let retry = fx.sdk.join("src/retry.ts");
-    claude_conv(&fx.home, &fx.sdk, "cccc3333-sdk", "Tune sdk backoff jitter", "2026-09-05T08:00:00Z", &[retry.clone()]);
+    claude_conv(&fx.home, &fx.sdk, "cccc3333-sdk", "Tune sdk backoff jitter", "2026-09-05T08:00:00Z", std::slice::from_ref(&retry));
     claude_conv(&fx.home, &fx.api_fix, "dddd4444-fixwt", "Compare retry helpers", "2026-09-06T08:00:00Z", &[retry]);
     let env = Env::with_home(&fx.home);
     let (c, _) = scan_once(&env);
