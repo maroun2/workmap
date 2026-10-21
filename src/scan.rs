@@ -1179,7 +1179,18 @@ pub fn ingest(env: &Env, c: &mut Connection, o: &IngestOpts) -> Result<IngestSta
         }
         let path = source_key(raw, &[cdir.clone(), sdir.clone(), odir.clone()]);
         let Ok(m) = std::fs::metadata(&path) else {
-            out.lines.push(format!("missing {}", path.display()));
+            // Gone since indexed: evidence stays, flagged missing (as scan does).
+            let key = path.to_string_lossy().into_owned();
+            let sid: Option<Option<String>> = tx.query_row("SELECT session_id FROM source_files WHERE path=?1 AND status IN ('parsed','missing')", [&key], |r| r.get(0)).optional().map_err(e)?;
+            if let Some(sid) = sid {
+                tx.execute("UPDATE source_files SET status='missing' WHERE path=?1", [&key]).map_err(e)?;
+                if let Some(sid) = sid {
+                    tx.execute("UPDATE nodes SET meta=json_set(meta,'$.source_missing',json('true')) WHERE id=?1", [&sid]).map_err(e)?;
+                }
+                out.lines.push(format!("missing {} (indexed earlier; evidence kept, flagged missing)", path.display()));
+            } else {
+                out.lines.push(format!("missing {} (not a file; nothing indexed)", path.display()));
+            }
             continue;
         };
         let key = path.to_string_lossy().into_owned();

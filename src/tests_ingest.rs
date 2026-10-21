@@ -165,6 +165,12 @@ fn targeted_ingest_is_fast_touches_only_named_sources_and_is_visible_to_other_co
     let r = scan::ingest(&env, &mut c3, &scan::IngestOpts { transcripts: vec![fresh.clone()], checkouts: vec![] }).unwrap();
     assert!(r.lines[0].starts_with("unchanged claude"), "{:?}", r.lines);
     assert_eq!(count(&c3, "SELECT count(*) FROM source_files WHERE path LIKE '%cccc3333-new.jsonl'"), 1);
+    // A transcript deleted since: evidence kept, flagged missing.
+    std::fs::remove_file(&fresh).unwrap();
+    let r = scan::ingest(&env, &mut c3, &scan::IngestOpts { transcripts: vec![fresh.clone()], checkouts: vec![] }).unwrap();
+    assert!(r.lines[0].contains("flagged missing"), "{:?}", r.lines);
+    let conv = view::expand(&v(&c3), ":conversation:Quarantine flaky", &scoped(&api)).unwrap();
+    assert!(conv.contains("source transcript missing") && conv.contains(":README.md"), "{conv}");
     // OpenCode databases need a session; the message says how.
     let e = scan::ingest(&env, &mut c3, &scan::IngestOpts { transcripts: vec![fx.home.join(".local/share/opencode/opencode.db")], checkouts: vec![] }).unwrap_err();
     assert!(e.contains("#session=<id>"), "{e}");
