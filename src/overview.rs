@@ -124,21 +124,28 @@ pub(crate) fn rank_files(c: &Connection, checkout_ids: &[String], top_of: &BTree
             let r = out.get_mut(&dst).unwrap();
             match kind.as_str() {
                 "references" => {
-                    r.score += 3;
+                    r.score += 12;
                     let heading = note.split(" | ").next().unwrap_or("");
                     r.refs.push(format!("{}:{}{}", rel(&sp, &top), line, if heading.is_empty() { String::new() } else { format!(" ({heading})") }));
                 }
                 "entrypoint" => {
-                    r.score += 2;
+                    r.score += 8;
                     r.entry = Some(format!("{}:{} {}", rel(&sp, &top), line, note));
                 }
                 "touched" => {
                     r.commits += 1;
-                    r.score += if generated(&r.node.label) { 0 } else { 1 };
+                    r.score += if generated(&r.node.label) { 0 } else { 4 };
                     r.last_commit = r.last_commit.max(ts.unwrap_or(0));
                 }
-                "read" | "write" if strength == "observed" || strength == "requested" => {
-                    r.score += if kind == "write" { 2 } else { 1 };
+                // Confirmed provider tool result > Codex-parsed shell read (exit 0) > requested only.
+                "read" | "write" if matches!(strength.as_str(), "observed" | "requested" | "parsed") => {
+                    r.score += match (kind.as_str(), strength.as_str()) {
+                        ("write", "observed") => 8,
+                        ("write", _) => 4,
+                        ("read", "observed") => 4,
+                        ("read", "parsed") => 3,
+                        _ => 2,
+                    };
                     r.sessions.push(format!("{kind}:{src}"));
                 }
                 _ => {}
@@ -296,7 +303,11 @@ pub fn context(c: &Connection, target: &Node, lim: &Limits) -> rusqlite::Result<
     let scope: Vec<String> = checkouts.iter().map(|c| c.id.clone()).collect();
     // Ranking stays within one checkout so sibling worktrees don't repeat the same paths.
     let ranked = rank_files(c, std::slice::from_ref(&primary), &top_of)?;
-    let _ = writeln!(o, "\n## Important files in {} (score = 3/doc ref + 2/entry point + 1/recent commit + 2/session write + 1/session read)", ptop.rsplit('/').next().unwrap_or(""));
+    let _ = writeln!(
+        o,
+        "\n## Important files in {} (score = 12/doc ref + 8/entry point + 4/recent commit + 8/session write (4 requested) + 4/session read (3 parsed from a shell command, 2 requested))",
+        ptop.rsplit('/').next().unwrap_or("")
+    );
     for r in ranked.iter().take(lim.files) {
         let top = r.node.checkout_id.as_ref().and_then(|c| top_of.get(c)).cloned().unwrap_or_default();
         let mut why = Vec::new();

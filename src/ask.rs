@@ -57,6 +57,26 @@ fn require(help: Option<String>, what: &str, needles: &[&str]) -> Result<(), Str
     Ok(())
 }
 
+/// A subagent transcript (Claude Code `<session>/subagents/agent-*.jsonl`) has no
+/// session id of its own: every line carries the parent's `sessionId`, and
+/// `claude --help` (2.1.x) documents `--resume <session-id>` only. Resuming a
+/// child alone is therefore unsupported; point at the parent instead of
+/// inventing an id. Shared by `ask` and `resume`.
+pub fn subagent_refusal(c: &Connection, node: &crate::overview::Node) -> Option<String> {
+    let parent = node.meta.pointer("/parent/native_id").and_then(|x| x.as_str())?;
+    let provider = node.meta.get("provider").and_then(|x| x.as_str()).unwrap_or("claude");
+    let pid = crate::util::stable_id("session", &format!("{provider}:{parent}"));
+    let r = get_node(c, &pid)
+        .ok()
+        .flatten()
+        .and_then(|pn| pn.checkout_id.as_deref().and_then(|id| get_node(c, id).ok().flatten()))
+        .and_then(|co| crate::view::qualified_ref(c, &co, &format!("session:{parent}")).ok())
+        .unwrap_or_else(|| format!("session {parent} (parent transcript not indexed)"));
+    Some(format!(
+        "this is a subagent transcript (child of session {parent}); it shares its parent's session id and the provider CLI cannot resume a subagent on its own. Resume the parent {r} instead."
+    ))
+}
+
 pub fn plan(c: &Connection, session: &str, question: &str, help: HelpFn) -> Result<AskPlan, String> {
     let node = get_node(c, session).map_err(|e| e.to_string())?.ok_or_else(|| format!("unknown session id {session}"))?;
     if node.kind != "session" {
@@ -68,8 +88,15 @@ pub fn plan(c: &Connection, session: &str, question: &str, help: HelpFn) -> Resu
     if native.is_empty() {
         return Err("session has no native id; cannot resume".into());
     }
+    if let Some(e) = subagent_refusal(c, &node) {
+        return Err(e);
+    }
     if !cwd.is_dir() {
-        return Err(format!("recorded cwd {} no longer exists; native resume is keyed by it, refusing", cwd.display()));
+        let mut m = format!("recorded cwd {} no longer exists; native resume is keyed by it, refusing", cwd.display());
+        if let Some(note) = node.checkout_id.as_deref().and_then(|id| get_node(c, id).ok().flatten()).and_then(|co| crate::view::missing_note(c, &co)) {
+            m.push_str(&format!("\n{note}\n(to resume, recreate the checkout at the recorded path, e.g. `git worktree repair` after moving it back, or `git worktree add <recorded path> <branch>`)"));
+        }
+        return Err(m);
     }
     let plan = match provider.as_str() {
         "claude" => {

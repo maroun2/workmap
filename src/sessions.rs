@@ -2,9 +2,11 @@
 //! OpenCode SQLite (current) and OpenCode legacy JSON storage.
 //!
 //! Parsers extract only metadata and file-access evidence from *structured tool
-//! calls*. Shell commands never count as access; paths found in them are
-//! reported as `mentioned` candidates which the scanner keeps only if they name
-//! a tracked file.
+//! calls*. Shell commands never count as confirmed access; paths found in them
+//! are reported as `mentioned` candidates which the scanner keeps only if they
+//! name a tracked file. Codex's own classification of a shell command
+//! (`parsed_cmd`: read/search/list_files) is kept as its own, weaker class
+//! (`parsed`), tied to the command's recorded exit status.
 
 use crate::util::{clip, parse_iso, read_line_bounded, redact, Line};
 use serde_json::Value;
@@ -37,9 +39,10 @@ pub struct Msg {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEvent {
     pub path: String,
-    /// read | write | mention
+    /// read | write | mention | search | list (search/list: Codex parsed shell commands)
     pub op: &'static str,
     /// observed (tool result recorded ok) | requested (no result seen) | failed | mentioned
+    /// | parsed (a shell command Codex itself parsed as read/search/list, exit 0; best effort)
     pub strength: &'static str,
     /// Line in the transcript (JSONL) or 0 for database rows.
     pub line: usize,
@@ -47,6 +50,19 @@ pub struct FileEvent {
     pub tool: String,
     /// Extra locator such as an OpenCode part id.
     pub locator: String,
+}
+
+/// A child conversation (Claude Code subagent) and the evidence naming its parent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParentLink {
+    /// Parent's provider session id.
+    pub native_id: String,
+    /// Which path/fields proved the relation.
+    pub evidence: Vec<String>,
+    /// Parent tool call that spawned the child (`toolUseId` in the sibling meta file).
+    pub tool_use_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,6 +84,8 @@ pub struct Session {
     pub msg_bytes: usize,
     /// Message text beyond MAX_MSGS / MAX_MSG_BYTES was not kept.
     pub messages_capped: bool,
+    /// Set for subagent transcripts: the conversation that spawned this one.
+    pub parent: Option<ParentLink>,
     seen_msgs: std::collections::HashSet<u64>,
 }
 
@@ -221,10 +239,27 @@ pub fn claude_head_cwd(path: &Path) -> Option<String> {
     Some(rest[..j].replace("\\\\", "\\"))
 }
 
+/// `<session-id>/subagents/agent-<agent-id>.jsonl` (Claude Code 2.x layout):
+/// returns (parent session id from the directory name, agent id from the file name).
+pub fn claude_subagent_path(path: &Path) -> Option<(String, String)> {
+    let dir = path.parent()?;
+    if dir.file_name()? != "subagents" {
+        return None;
+    }
+    let parent = dir.parent()?.file_name()?.to_string_lossy().into_owned();
+    let agent = path.file_stem()?.to_string_lossy().strip_prefix("agent-")?.to_string();
+    (!parent.is_empty() && !agent.is_empty()).then_some((parent, agent))
+}
+
 pub fn parse_claude(path: &Path) -> std::io::Result<Session> {
     let mut sess = Session { provider: "claude", source_path: path.display().to_string(), ..Default::default() };
     sess.native_id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let mut pending: HashMap<String, usize> = HashMap::new();
+    // Subagent transcripts carry the *parent's* `sessionId` on every line plus
+    // `isSidechain: true` and their own `agentId`.
+    let mut line_sid: Option<String> = None;
+    let mut agent_id: Option<String> = None;
+    let mut sidechain = false;
     for_each_json(path, &mut sess, |sess, line, v| {
         let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_iso);
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -235,8 +270,12 @@ pub fn parse_claude(path: &Path) -> std::io::Result<Session> {
             sess.branch = s(&v, "gitBranch").filter(|b| !b.is_empty() && b != "HEAD");
         }
         if let Some(id) = s(&v, "sessionId") {
-            sess.native_id = id;
+            line_sid = Some(id);
         }
+        if agent_id.is_none() {
+            agent_id = s(&v, "agentId").filter(|a| !a.is_empty());
+        }
+        sidechain |= v.get("isSidechain").and_then(|x| x.as_bool()) == Some(true);
         if ty == "summary" {
             if let Some(t) = s(&v, "summary") {
                 sess.title = Some(clip(&t, 120));
@@ -319,6 +358,52 @@ pub fn parse_claude(path: &Path) -> std::io::Result<Session> {
             }
         }
     })?;
+    let by_path = claude_subagent_path(path);
+    if by_path.is_some() || (sidechain && agent_id.is_some()) {
+        let mut ev = Vec::new();
+        let parent = match (&by_path, &line_sid) {
+            (Some((dir_sid, _)), Some(l)) if l == dir_sid => {
+                ev.push(format!("path {dir_sid}/subagents/{}", path.file_name().unwrap_or_default().to_string_lossy()));
+                ev.push("sessionId field names the parent".to_string());
+                Some(dir_sid.clone())
+            }
+            (Some((dir_sid, _)), _) => {
+                ev.push(format!("path {dir_sid}/subagents/{}", path.file_name().unwrap_or_default().to_string_lossy()));
+                Some(dir_sid.clone())
+            }
+            (None, Some(l)) => {
+                ev.push("sessionId field names the parent".to_string());
+                Some(l.clone())
+            }
+            (None, None) => None,
+        };
+        if sidechain {
+            ev.push("isSidechain=true".to_string());
+        }
+        sess.native_id = agent_id.clone().or_else(|| by_path.as_ref().map(|b| b.1.clone())).unwrap_or_default();
+        if let Some(parent) = parent.filter(|p| *p != sess.native_id) {
+            let mut link = ParentLink { native_id: parent, ..Default::default() };
+            // Sibling `agent-<id>.meta.json`: {agentType, description, toolUseId, spawnDepth}.
+            let meta_path = path.with_file_name(format!("{}.meta.json", path.file_stem().unwrap_or_default().to_string_lossy()));
+            if let Some(m) = crate::util::read_head(&meta_path, 64 << 10).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                link.tool_use_id = s(&m, "toolUseId");
+                link.agent_type = s(&m, "agentType");
+                link.description = s(&m, "description").map(|d| redact(&clip(&d, 100)));
+                if link.tool_use_id.is_some() {
+                    ev.push("meta.json toolUseId = the parent's Agent tool call".to_string());
+                }
+            }
+            link.evidence = ev;
+            if sess.title.is_none() {
+                if let Some(d) = link.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                    sess.title = Some(clip(&format!("subagent: {d}"), 120));
+                }
+            }
+            sess.parent = Some(link);
+        }
+    } else if let Some(l) = line_sid {
+        sess.native_id = l;
+    }
     Ok(sess)
 }
 
@@ -368,8 +453,95 @@ pub fn codex_head_cwd(path: &Path) -> Option<String> {
     v.pointer("/payload/cwd").and_then(|x| x.as_str()).map(str::to_string)
 }
 
+/// `file:///a%20b` -> `/a b`; plain paths unchanged.
+fn uri_path(s: &str) -> String {
+    let Some(rest) = s.strip_prefix("file://") else { return s.to_string() };
+    let b = rest.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(x) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+                out.push(x);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Outcome of a Codex command execution: `parsed` only for a recorded exit code 0
+/// (or status completed without an exit code), `failed` for a non-zero exit code
+/// or a failed/declined status, otherwise `requested` (no result seen).
+fn cmd_strength(status: Option<&str>, exit: Option<i64>) -> &'static str {
+    match (status, exit) {
+        (Some("failed") | Some("declined"), _) => "failed",
+        (_, Some(0)) => "parsed",
+        (_, Some(_)) => "failed",
+        (Some("completed"), None) => "parsed",
+        _ => "requested",
+    }
+}
+
+/// Codex's own classification of a shell command (`parsed_cmd`, codex-rs
+/// `ParsedCommand`): `read {cmd,name,path}`, `search {cmd,query,path}`,
+/// `list_files {cmd,path}`; `unknown` is ignored. Paths are best effort.
+#[allow(clippy::too_many_arguments)]
+fn codex_parsed_cmd(sess: &mut Session, pc: Option<&Value>, cwd: Option<&str>, strength: &'static str, line: usize, ts: Option<i64>, cmd: &str, keys: &mut HashMap<usize, u64>) -> Vec<usize> {
+    let mut idx = Vec::new();
+    let Some(Value::Array(items)) = pc else { return idx };
+    for it in items {
+        let (op, tool) = match it.get("type").and_then(|x| x.as_str()) {
+            Some("read") => ("read", "shell:read"),
+            Some("search") => ("search", "shell:search"),
+            Some("list_files") => ("list", "shell:list"),
+            _ => continue,
+        };
+        let Some(p) = s(it, "path").filter(|p| !p.is_empty()).or_else(|| if op == "read" { s(it, "name").filter(|p| !p.is_empty()) } else { None }) else { continue };
+        let abs = match cwd {
+            Some(c) if !Path::new(&p).is_absolute() && !c.is_empty() => Path::new(c).join(&p).to_string_lossy().into_owned(),
+            _ => p,
+        };
+        sess.events.push(FileEvent { path: abs.clone(), op, strength, line, ts, tool: tool.into(), locator: String::new() });
+        keys.insert(sess.events.len() - 1, crate::util::fnv64(&format!("{cmd}\0{op}\0{abs}")));
+        idx.push(sess.events.len() - 1);
+    }
+    idx
+}
+
+fn cmd_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(c)) => c.clone(),
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "),
+        _ => String::new(),
+    }
+}
+
 pub fn parse_codex(path: &Path) -> std::io::Result<Session> {
     let mut sess = Session { provider: "codex", source_path: path.display().to_string(), ..Default::default() };
+    // Parsed-command events by execution id (item id / call_id), and a
+    // command+path key per event for deduplication across event shapes.
+    let mut by_exec: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut keys: HashMap<usize, u64> = HashMap::new();
+    let mut exec = |sess: &mut Session, id: Option<String>, done: bool, status: Option<&str>, exit: Option<i64>, pc: Option<&Value>, cwd: Option<String>, cmd: String, line: usize, ts: Option<i64>| {
+        let strength = if done { cmd_strength(status, exit) } else { "requested" };
+        if let Some(prev) = id.as_ref().and_then(|i| by_exec.get(i)).filter(|v| !v.is_empty()) {
+            if done {
+                for &i in prev {
+                    sess.events[i].strength = strength;
+                }
+            }
+            return;
+        }
+        let cwd = cwd.map(|c| uri_path(&c)).or_else(|| sess.cwd.clone());
+        let added = codex_parsed_cmd(sess, pc, cwd.as_deref(), strength, line, ts, &cmd, &mut keys);
+        if let Some(id) = id {
+            by_exec.insert(id, added);
+        }
+    };
     for_each_json(path, &mut sess, |sess, line, v| {
         let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_iso);
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -421,9 +593,46 @@ pub fn parse_codex(path: &Path) -> std::io::Result<Session> {
                     }
                 }
             }
+            ("event_msg", "exec_command_begin") | ("event_msg", "exec_command_end") => {
+                // Older rollouts: {call_id, command, cwd, parsed_cmd, exit_code, ...}.
+                let done = pty == "exec_command_end";
+                exec(
+                    sess,
+                    s(&p, "call_id"),
+                    done,
+                    p.get("status").and_then(|x| x.as_str()),
+                    p.get("exit_code").and_then(|x| x.as_i64()),
+                    p.get("parsed_cmd"),
+                    s(&p, "cwd"),
+                    cmd_text(p.get("command")),
+                    line,
+                    ts,
+                );
+            }
+            ("event_msg", "item_started") => {
+                let item = p.get("item").cloned().unwrap_or(Value::Null);
+                if item.get("type").and_then(|x| x.as_str()) == Some("CommandExecution") {
+                    exec(sess, s(&item, "id"), false, None, None, item.get("parsed_cmd"), s(&item, "cwd"), cmd_text(item.get("command")), line, ts);
+                }
+            }
             ("event_msg", "item_completed") => {
                 // Newer rollouts: {item: {type: "FileChange", status, changes: {<abs path>: {...}}}}
                 let item = p.get("item").cloned().unwrap_or(Value::Null);
+                if item.get("type").and_then(|x| x.as_str()) == Some("CommandExecution") {
+                    // {id, command: [..], cwd: "file:///..", parsed_cmd: [..], status, exit_code, aggregated_output}
+                    exec(
+                        sess,
+                        s(&item, "id"),
+                        true,
+                        item.get("status").and_then(|x| x.as_str()),
+                        item.get("exit_code").and_then(|x| x.as_i64()),
+                        item.get("parsed_cmd"),
+                        s(&item, "cwd"),
+                        cmd_text(item.get("command")),
+                        line,
+                        ts,
+                    );
+                }
                 match item.get("type").and_then(|x| x.as_str()) {
                     Some("UserMessage") => {
                         sess.touch(ts);
@@ -489,11 +698,46 @@ pub fn parse_codex(path: &Path) -> std::io::Result<Session> {
             _ => {}
         }
     })?;
+    dedup_parsed_cmds(&mut sess, &keys);
     // A patch both requested and confirmed applied keeps only the observed record.
     let observed: Vec<String> = sess.events.iter().filter(|e| e.strength == "observed" && e.op == "write").map(|e| e.path.clone()).collect();
     let cwd = sess.cwd.clone().unwrap_or_default();
     sess.events.retain(|e| !(e.strength == "requested" && e.op == "write" && observed.iter().any(|o| o == &e.path || Path::new(&cwd).join(&e.path) == Path::new(o))));
     Ok(sess)
+}
+
+/// Parsed-command evidence cleanup: search/list only when the command succeeded;
+/// one event per (command, op, path) keeping the strongest outcome (the same
+/// command can be recorded by several event shapes); and a path Codex parsed
+/// from a command is no longer also reported as a bare shell mention.
+fn dedup_parsed_cmds(sess: &mut Session, keys: &HashMap<usize, u64>) {
+    let cwd = sess.cwd.clone().unwrap_or_default();
+    let abs = |p: &str| crate::util::resolve_against(Path::new(&cwd), p);
+    let rank = |s: &str| match s {
+        "parsed" => 3,
+        "failed" => 2,
+        _ => 1,
+    };
+    let parsed_paths: std::collections::HashSet<PathBuf> = keys.keys().map(|&i| abs(&sess.events[i].path)).collect();
+    let mut best: HashMap<u64, usize> = HashMap::new();
+    for (&i, &k) in keys {
+        let e = best.entry(k).or_insert(i);
+        let (a, b) = (&sess.events[i], &sess.events[*e]);
+        if rank(a.strength) > rank(b.strength) || (rank(a.strength) == rank(b.strength) && i < *e) {
+            *e = i;
+        }
+    }
+    let keep: Vec<bool> = sess
+        .events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| match keys.get(&i) {
+            Some(k) => best.get(k) == Some(&i) && (e.op == "read" || e.strength == "parsed"),
+            None => !(e.op == "mention" && parsed_paths.contains(&abs(&e.path))),
+        })
+        .collect();
+    let mut it = keep.into_iter();
+    sess.events.retain(|_| it.next().unwrap_or(true));
 }
 
 /// Fast `rollout_path -> (cwd, title, first_user_message)` from Codex's own

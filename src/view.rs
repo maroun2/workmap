@@ -66,8 +66,40 @@ fn all_projects(c: &Connection) -> R<Vec<Node>> {
     db(nodes(c, "kind='repo' ORDER BY label, id", &[]))
 }
 
+/// Live checkouts first (main, then newest); checkouts gone from disk but kept
+/// for their recorded conversations last, so defaults and refs stay on live ones.
 fn checkouts_of(c: &Connection, repo_id: &str) -> R<Vec<Node>> {
-    db(nodes(c, "kind='checkout' AND repo_id=?1 ORDER BY json_extract(meta,'$.main') DESC, ts DESC, path", &[&repo_id]))
+    db(nodes(c, "kind='checkout' AND repo_id=?1 ORDER BY coalesce(json_extract(meta,'$.missing'),0), json_extract(meta,'$.main') DESC, ts DESC, path", &[&repo_id]))
+}
+
+pub fn is_missing(co: &Node) -> bool {
+    co.meta.get("missing").and_then(|x| x.as_bool()) == Some(true)
+}
+
+/// For a checkout gone from disk: when, where it was recorded, and where it may
+/// be now (only with identity evidence; ambiguous candidates are listed, not chosen).
+pub fn missing_note(c: &Connection, co: &Node) -> Option<String> {
+    if !is_missing(co) {
+        return None;
+    }
+    let since = co.meta.get("missing_since").and_then(|x| x.as_i64()).unwrap_or(0);
+    let scan = co.meta.get("missing_scan").and_then(|x| x.as_i64()).map(|n| format!(" (scan #{n})")).unwrap_or_default();
+    let mut o = format!("checkout missing since {}{scan}, recorded at {} on branch {}", fmt_date(since), co.path.clone().unwrap_or_default(), branch(co));
+    if let Some(t) = co.meta.get("first_observed").and_then(|x| x.as_i64()) {
+        let _ = write!(o, "; first observed {}", fmt_date(t));
+    }
+    let to_ref = |m: &Value| -> String {
+        let id = m.get("checkout_id").and_then(|x| x.as_str()).unwrap_or("");
+        let path = m.get("path").and_then(|x| x.as_str()).unwrap_or("");
+        let r = get_node(c, id).ok().flatten().and_then(|n| qualified_ref(c, &n, "").ok()).map(|r| format!(" = {r}")).unwrap_or_default();
+        format!("{path}{r} ({})", m.get("evidence").and_then(|x| x.as_str()).unwrap_or(""))
+    };
+    if let Some(m) = co.meta.get("moved_to").filter(|m| m.is_object()) {
+        let _ = write!(o, "; now at {}", to_ref(m));
+    } else if let Some(Value::Array(a)) = co.meta.get("moved_candidates").filter(|a| a.as_array().map(|x| !x.is_empty()).unwrap_or(false)) {
+        let _ = write!(o, "; NOT reconnected, {} possible new locations (ambiguous): {}", a.len(), a.iter().map(to_ref).collect::<Vec<_>>().join(" | "));
+    }
+    Some(o)
 }
 
 /// The name printed for a project: its label when unique, else `label~<hex>`, the
@@ -93,7 +125,6 @@ pub fn project_handle(c: &Connection, repo: &Node) -> R<String> {
 
 /// Fully qualified, scope-independent reference: `<handle>[@<worktree>]:<rest>`
 /// (shell-quoted). `@<worktree>` is omitted for the project's main checkout.
-#[allow(dead_code)] // used by the graph views (foundation for cross-checkout refs)
 pub fn qualified_ref(c: &Connection, co: &Node, rest: &str) -> R<String> {
     let repo = db(get_node(c, co.repo_id.as_deref().unwrap_or("")))?.ok_or("checkout without repository")?;
     let p = build_project(c, repo, Some(co.clone()))?;
@@ -430,7 +461,7 @@ fn header(v: &View, p: &Project, codes: bool) -> String {
     }
     let mut o = format!("Scope: export {} (or add {flags}); then: {} expand REF · {} ask REF 'question' --dry-run\n", vars.join(" "), v.cmd, v.cmd);
     if codes {
-        o.push_str("Codes: r/w = read/written, tool result recorded · req = requested, no result · fail = failed · sh = only named in a shell command (not access)\n");
+        o.push_str("Codes: r/w = read/written, tool result recorded · cr = read via shell command (parsed by Codex, best effort; exit 0, not proof of a full read) · req = requested, no result · fail = failed · srch/ls = searched/listed via shell (parsed by Codex) · sh = only named in a shell command (not access)\n");
     }
     o
 }
@@ -467,16 +498,32 @@ struct Access {
     r: (i64, i64, i64),
     w: (i64, i64, i64),
     sh: i64,
+    /// Reads Codex parsed out of a successful shell command.
+    cr: i64,
+    srch: i64,
+    ls: i64,
 }
 
 fn access_counts(c: &Connection, sid: &str) -> R<Access> {
-    let mut st = db(c.prepare("SELECT kind, strength, count(*) FROM edges WHERE src=?1 AND kind IN ('read','write','mentioned') GROUP BY 1,2"))?;
+    let mut st = db(c.prepare("SELECT kind, strength, count(*) FROM edges WHERE src=?1 AND kind IN ('read','write','mentioned','searched','listed') GROUP BY 1,2"))?;
     let rows: Vec<(String, String, i64)> = db(db(st.query_map([sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>())?;
     let mut a = Access::default();
     for (k, s, n) in rows {
-        let slot = match k.as_str() {
-            "read" => &mut a.r,
-            "write" => &mut a.w,
+        let slot = match (k.as_str(), s.as_str()) {
+            ("read", "parsed") => {
+                a.cr += n;
+                continue;
+            }
+            ("read", _) => &mut a.r,
+            ("write", _) => &mut a.w,
+            ("searched", _) => {
+                a.srch += n;
+                continue;
+            }
+            ("listed", _) => {
+                a.ls += n;
+                continue;
+            }
             _ => {
                 a.sh += n;
                 continue;
@@ -500,11 +547,20 @@ fn codes(a: &Access) -> String {
     if a.w.0 > 0 {
         v.push(format!("w{}", a.w.0));
     }
+    if a.cr > 0 {
+        v.push(format!("cr{}", a.cr));
+    }
     if a.r.1 + a.w.1 > 0 {
         v.push(format!("req{}", a.r.1 + a.w.1));
     }
     if a.r.2 + a.w.2 > 0 {
         v.push(format!("fail{}", a.r.2 + a.w.2));
+    }
+    if a.srch > 0 {
+        v.push(format!("srch{}", a.srch));
+    }
+    if a.ls > 0 {
+        v.push(format!("ls{}", a.ls));
     }
     if a.sh > 0 {
         v.push(format!("sh{}", a.sh));
@@ -519,6 +575,9 @@ fn codes(a: &Access) -> String {
 fn edge_code(kind: &str, strength: &str) -> &'static str {
     match (kind, strength) {
         ("mentioned", _) => "sh",
+        ("searched", _) => "srch",
+        ("listed", _) => "ls",
+        ("read", "parsed") => "cr",
         ("read", "observed") => "r",
         ("write", "observed") => "w",
         ("read", "requested") => "r-req",
@@ -585,7 +644,8 @@ pub fn project_map(v: &View, p: &Project, lim: &MapLimits) -> R<String> {
         let _ = writeln!(o, "\n## Worktrees ({}) — select with WORKMAP_WORKTREE=<name> or --worktree <name>", p.checkouts.len());
         for x in &p.checkouts {
             let ses: i64 = db(c.query_row("SELECT count(*) FROM nodes WHERE kind='session' AND checkout_id=?1", [&x.id], |r| r.get(0)))?;
-            let _ = writeln!(o, "{} {} @ {} — last commit {}, {ses} conversation(s)", if x.id == co.id { "*" } else { "-" }, worktree_name(p, x), x.path.clone().unwrap_or_default(), day(x.ts));
+            let gone = if is_missing(x) { format!(" — MISSING since {} (history kept)", day(x.meta.get("missing_since").and_then(|t| t.as_i64()).unwrap_or(0))) } else { String::new() };
+            let _ = writeln!(o, "{} {} @ {} — last commit {}, {ses} conversation(s){gone}", if x.id == co.id { "*" } else { "-" }, worktree_name(p, x), x.path.clone().unwrap_or_default(), day(x.ts));
         }
     }
 
@@ -674,7 +734,7 @@ pub fn project_map(v: &View, p: &Project, lim: &MapLimits) -> R<String> {
     let mut active: Vec<(bool, &Node, Access)> = Vec::new();
     for s in &all {
         let a = access_counts(c, &s.id)?;
-        active.push((a.r.0 + a.r.1 + a.w.0 + a.w.1 > 0, s, a));
+        active.push((a.r.0 + a.r.1 + a.w.0 + a.w.1 + a.cr > 0, s, a));
     }
     active.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.ts.cmp(&a.1.ts)).then(a.1.id.cmp(&b.1.id)));
     let n_active = active.iter().filter(|x| x.0).count();
@@ -748,14 +808,14 @@ pub(crate) struct ConvRow {
 pub(crate) fn file_conversations(c: &Connection, pc: &mut ProjectCache, p: &Project, all: &[Node], file_id: &str, qualify: bool) -> R<Vec<ConvRow>> {
     let mut st = db(c.prepare(
         "SELECT e.src, e.kind, e.strength, e.source_line, e.note FROM edges e JOIN nodes s ON s.id=e.src
-         WHERE e.dst=?1 AND s.kind='session' AND e.kind IN ('read','write','mentioned') ORDER BY s.ts DESC, s.id, e.kind DESC, e.source_line",
+         WHERE e.dst=?1 AND s.kind='session' AND e.kind IN ('read','write','mentioned','searched','listed') ORDER BY s.ts DESC, s.id, e.kind DESC, e.source_line",
     ))?;
     let rows: Vec<(String, String, String, i64, String)> = db(db(st.query_map([file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?.collect::<Result<_, _>>())?;
     let mut out: Vec<ConvRow> = Vec::new();
     for (sid, kind, strength, line, note) in rows {
         let tool = note.split(" @").next().unwrap_or(&note).to_string();
         let ev = (edge_code(&kind, &strength).to_string(), tool, line);
-        let structured = kind != "mentioned";
+        let structured = kind == "read" || kind == "write";
         if let Some(x) = out.iter_mut().find(|x| x.session.id == sid) {
             x.evs.push(ev);
             x.structured |= structured;
@@ -766,12 +826,14 @@ pub(crate) fn file_conversations(c: &Connection, pc: &mut ProjectCache, p: &Proj
         out.push(ConvRow { session: s, link, structured, evs: vec![ev], line: String::new() });
     }
     out.sort_by_key(|x| !x.structured);
+    let pv = View { c, cmd: String::new(), state: String::new() };
     for x in &mut out {
+        let sub = parent_ref(&pv, p, all, &x.session).map(|r| format!(" (subagent of {r})")).unwrap_or_default();
         let evs: Vec<String> = x.evs.iter().take(3).map(|(code, tool, l)| format!("{code} {tool}{}", if *l > 0 { format!(" l.{l}") } else { String::new() })).collect();
         let s = &x.session;
         x.line = match &x.link.r {
-            Some(r) => format!("- {r} {} {}: {} — \"{}\"", day(s.ts), x.link.prov, evs.join("; "), clip(&s.label, 50)),
-            None => format!("- conversation \"{}\" {} {} (not expandable; transcript {}): {}", clip(&s.label, 50), day(s.ts), x.link.prov, s.path.clone().unwrap_or_default(), evs.join("; ")),
+            Some(r) => format!("- {r} {} {}: {} — \"{}\"{sub}", day(s.ts), x.link.prov, evs.join("; "), clip(&s.label, 50)),
+            None => format!("- conversation \"{}\" {} {} (not expandable; transcript {}): {}{sub}", clip(&s.label, 50), day(s.ts), x.link.prov, s.path.clone().unwrap_or_default(), evs.join("; ")),
         };
     }
     Ok(out)
@@ -1042,6 +1104,9 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
     }
 
     let _ = writeln!(o, "# {} — {} in {} @{}{state}\n{path}", this, if n.kind == "file" { "file" } else { "document" }, p.handle, branch(co));
+    if let Some(note) = missing_note(c, co) {
+        let _ = writeln!(o, "{note}");
+    }
     o.push_str(&header(v, p, true));
 
     // Conversations first: they are what is easily lost under commit noise.
@@ -1051,7 +1116,12 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
     let mut pc = ProjectCache::new(c);
     let convs = file_conversations(c, &mut pc, p, &all, &n.id, false)?;
     let n_struct = convs.iter().filter(|x| x.structured).count();
-    let _ = writeln!(o, "\n## Conversations ({} read/wrote it, {} only named it in shell) — evidence: code tool transcript-line; [cwd …] = ran in another project", n_struct, convs.len() - n_struct);
+    let _ = writeln!(
+        o,
+        "\n## Conversations ({} read/wrote it, {} only named/searched it in shell) — evidence: code tool transcript-line; [cwd …] = ran in another project",
+        n_struct,
+        convs.len() - n_struct
+    );
     if convs.is_empty() {
         let _ = writeln!(o, "- none recorded");
     }
@@ -1182,6 +1252,35 @@ pub fn commit_view(v: &View, p: &Project, prefix: &str, lim: &FileLimits) -> R<S
 
 // ------------------------------------------------------------------ conversation
 
+/// Child conversations (subagents) whose `subagent_of` edge points at `sid`.
+fn children_of(c: &Connection, sid: &str) -> R<Vec<Node>> {
+    db(nodes(c, "kind='session' AND id IN (SELECT src FROM edges WHERE dst=?1 AND kind='subagent_of') ORDER BY ts, id", &[&sid]))
+}
+
+/// Qualified conversation reference for a session of any project.
+fn other_conv_ref(c: &Connection, s: &Node) -> Option<String> {
+    let co = get_node(c, s.checkout_id.as_deref()?).ok()??;
+    let repo = get_node(c, co.repo_id.as_deref()?).ok()??;
+    let op = build_project(c, repo, Some(co.clone())).ok()?;
+    let osess = sessions_of(c, &op).ok()?;
+    Some(q(&format!("{}{}", op.handle, conv_ref_raw(&osess, s))))
+}
+
+/// For a subagent transcript: the parent conversation's reference (or its raw
+/// session id when the parent transcript is not indexed).
+pub fn parent_ref(v: &View, p: &Project, all: &[Node], s: &Node) -> Option<String> {
+    let native = s.meta.pointer("/parent/native_id").and_then(|x| x.as_str())?;
+    let pid = crate::util::stable_id("session", &format!("{}:{native}", meta(s, "provider")));
+    if let Some(x) = all.iter().find(|x| x.id == pid) {
+        return Some(conv_ref(all, x));
+    }
+    let _ = p;
+    match get_node(v.c, &pid).ok().flatten() {
+        Some(n) => other_conv_ref(v.c, &n).or_else(|| Some(format!("session {native}"))),
+        None => Some(format!("session {native} (parent transcript not indexed)")),
+    }
+}
+
 pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R<String> {
     let c = v.c;
     let all = sessions_of(c, p)?;
@@ -1193,6 +1292,18 @@ pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R
     let started = s.meta.get("started").and_then(|x| x.as_i64()).unwrap_or(0);
     let _ = writeln!(o, "session {} · {} → {} · cwd {}", meta(s, "native_id"), fmt_ts(started), fmt_ts(s.ts), meta(s, "cwd"));
     let _ = writeln!(o, "transcript {}{}", s.path.clone().unwrap_or_default(), if s.meta.get("source_missing").is_some() { " (source file no longer exists)" } else { "" });
+    if let Some(note) = wt.and_then(|x| missing_note(c, x)) {
+        let _ = writeln!(o, "{note}");
+    } else if wt.is_none() {
+        if let Some(rc) = s.meta.get("checkout").filter(|x| x.is_object()) {
+            let g = |k: &str| rc.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
+            let _ = writeln!(o, "recorded checkout {} on branch {} (no longer indexed)", g("path"), g("branch"));
+        }
+    }
+    if let Some(r) = parent_ref(v, p, &all, s) {
+        let ev = s.meta.pointer("/parent/evidence").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default();
+        let _ = writeln!(o, "subagent of {r} — evidence: {ev}");
+    }
     for (k, label) in [("first_prompt", "first user input"), ("last_prompt", "latest user input (as typed; not a decision record)")] {
         if let Some(pr) = s.meta.get(k).filter(|x| !x.is_null()) {
             if k == "last_prompt" && s.meta.get("first_prompt") == Some(pr) {
@@ -1231,10 +1342,13 @@ pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R
     let groups = [
         ("w — written", "write", "observed"),
         ("r — read", "read", "observed"),
+        ("cr — read via shell command (parsed by Codex, best effort; exit 0, not proof of a full read)", "read", "parsed"),
         ("w-req — write requested, no result", "write", "requested"),
         ("r-req — read requested, no result", "read", "requested"),
         ("w-fail — write failed", "write", "failed"),
         ("r-fail — read failed", "read", "failed"),
+        ("srch — searched via shell command (parsed by Codex; not a read)", "searched", "parsed"),
+        ("ls — listed via shell command (parsed by Codex; not a read)", "listed", "parsed"),
         ("sh — named in shell commands (not access)", "mentioned", "mentioned"),
     ];
     for (title, kind, strength) in groups {
@@ -1253,7 +1367,21 @@ pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R
         }
         more_line(&mut o, v, &this, lim.per_category.min(rows.len()), rows.len());
     }
-    if meta(s, "provider").starts_with("opencode") {
+    let children = children_of(c, &s.id)?;
+    if !children.is_empty() {
+        let _ = writeln!(o, "\n## Subagents ({}) — child transcripts this conversation spawned (evidence: subagent_of)", children.len());
+        for ch in children.iter().take(lim.per_category) {
+            let r = match all.iter().find(|x| x.id == ch.id) {
+                Some(x) => conv_ref(&all, x),
+                None => other_conv_ref(c, ch).unwrap_or_else(|| format!("session {}", meta(ch, "native_id"))),
+            };
+            let _ = writeln!(o, "- {r} {} {} — \"{}\"", day(ch.ts), codes(&access_counts(c, &ch.id)?), clip(&ch.label, 60));
+        }
+        more_line(&mut o, v, &this, lim.per_category.min(children.len()), children.len());
+    }
+    if let Some(r) = parent_ref(v, p, &all, s) {
+        let _ = writeln!(o, "\nAsk: not available for a subagent transcript (claude --resume takes a session id; a subagent shares its parent's), resume the parent {r}");
+    } else if meta(s, "provider").starts_with("opencode") {
         let _ = writeln!(o, "\nAsk: not available for OpenCode (read-only cannot be enforced; ask fails closed)");
     } else {
         let _ = writeln!(o, "\nAsk (read-only resume of this session): {} ask {this} 'question' --dry-run", v.cmd);

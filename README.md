@@ -162,6 +162,7 @@ session bus. `--no-activate` writes the units without enabling them.
 | `workmap resume REF [--cwd DIR] [--dry-run]` | Reopen the original conversation interactively in its own CLI and recorded directory |
 | `workmap hooks status\|install\|uninstall [--harness claude\|codex] [--scope user\|project] [--dry-run]` | Opt-in host hooks: context at session start and per prompt, ingest when a session stops |
 | `workmap scan [--root DIR] [--full] [--no-sessions] [--no-remote] [--refresh-remote]` | Incremental re-index |
+| `workmap ingest --transcript FILE… [--checkout DIR…] [--quiet]` | Index only these transcripts/checkouts now, in one transaction (milliseconds; no home walk, no pruning, no remote sync). OpenCode: `--transcript '<opencode.db>#session=<id>'`. The daily timer's full scan stays the backstop |
 | `workmap roots add DIR` / `roots list` | Extra roots to scan, persisted |
 | `workmap remote status\|list\|refresh\|enable\|disable` | The gh/glab catalog |
 | `workmap remote snapshots status\|enable\|disable\|set KEY VALUE` | Opt-in shallow snapshots of remote-only repositories |
@@ -196,8 +197,8 @@ Ambiguous names fail with the candidates listed; nothing is fuzzy-picked.
 | Git checkouts under `$HOME` and your roots | repository identity (Git common dir), all worktrees, remotes (credentials stripped), branches, the newest 30 commits per worktree (`scan --commits N`) with changed files |
 | Docs: `README*`, `CLAUDE.md`, `AGENTS.md`, `docs/*.md`, top-level `*.md`, Claude Code project memory | headings, short excerpts with line numbers, links to files, doc sections as searchable text (≤ 80 passages per doc) |
 | Manifests: `Cargo.toml`, `package.json`, `pyproject.toml`, `.gitmodules` | local path and Git dependencies, declared package names |
-| Claude Code `~/.claude/projects/*/*.jsonl` | file reads/writes from structured tool calls with their results, user and assistant text messages |
-| Codex `~/.codex/sessions/**/rollout-*.jsonl` | `apply_patch` writes, shell mentions, user and assistant messages (both rollout formats) |
+| Claude Code `~/.claude/projects/*/*.jsonl` | file reads/writes from structured tool calls with their results, user and assistant text messages; subagent transcripts (`<session>/subagents/agent-*.jsonl`) as child conversations linked to their parent |
+| Codex `~/.codex/sessions/**/rollout-*.jsonl` | `apply_patch` writes, shell commands Codex itself parsed as read/search/list (`parsed_cmd`, with the command's exit status), shell mentions, user and assistant messages (both rollout formats) |
 | OpenCode `opencode.db` (read-only) and legacy JSON storage | file tools and patches, user and assistant text parts |
 | `gh` / `glab` (optional) | names and metadata of repositories you can access |
 
@@ -467,10 +468,18 @@ unchanged checkouts.
 
 Known limits:
 
-- Codex has no structured read tool, so Codex reads appear only as shell
-  mentions.
-- Claude Code sub-agent transcripts (`<session>/subagents/*.jsonl`) are not
-  parsed.
+- Codex has no structured read tool. Reads come from Codex's own best-effort
+  parse of shell commands (`parsed_cmd`): code `cr`, only when the command
+  exited 0, never shown as a confirmed full-file read and ranked below a
+  provider `Read` result. Searches and listings are kept apart (`srch`, `ls`);
+  older rollouts without `parsed_cmd` give shell mentions only.
+- A subagent transcript cannot be resumed on its own (it shares its parent's
+  session id); `ask` refuses and names the parent.
+- A checkout deleted or moved after conversations ran in it stays in the index
+  as missing, with its recorded path and branch. A new location is named only
+  with identity evidence (same git worktree admin dir, or same HEAD and
+  branch); several candidates are listed, never chosen. A moved main checkout
+  becomes a different repository.
 - Only HEAD history of each worktree is indexed (default 30 commits, 40 files
   each). Other branches appear by name.
 - Relations come from each repository's main checkout. A dependency added only

@@ -1174,7 +1174,9 @@ fn strength_score(kind: &str, strength: &str) -> i64 {
     match (kind, strength) {
         ("write", "observed") => 100,
         ("read", "observed") => 90,
+        ("read", "parsed") => 70,
         (_, "requested") => 45,
+        ("searched", _) | ("listed", _) => 5,
         ("mentioned", _) => 5,
         _ => 10,
     }
@@ -1298,11 +1300,15 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
                 continue;
             };
             let r = if row.link.other { format!("{r} (other project)") } else { r };
-            let mut st = db(c.prepare("SELECT kind, strength, source_line, note FROM edges WHERE src=?1 AND dst=?2 AND kind IN ('read','write','mentioned') ORDER BY kind DESC, source_line"))?;
+            let mut st = db(
+                c.prepare("SELECT kind, strength, source_line, note FROM edges WHERE src=?1 AND dst=?2 AND kind IN ('read','write','mentioned','searched','listed') ORDER BY kind DESC, source_line")
+            )?;
             let edges: Vec<(String, String, i64, String)> = db(db(st.query_map(params![s.id, n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?.collect::<Result<_, _>>())?;
             for (kind, strength, line, note) in edges {
                 let what = match kind.as_str() {
                     "mentioned" => format!("only named {relp} in a shell command"),
+                    "searched" | "listed" => format!("{kind} {relp} via a shell command (parsed by Codex; not a read)"),
+                    "read" if strength == "parsed" => format!("read {relp} via shell command (parsed by Codex, best effort)"),
                     _ => format!("{} {relp} ({strength}, {})", if kind == "write" { "wrote" } else { "read" }, note.split(" @").next().unwrap_or("")),
                 };
                 let at = if row.link.other { format!(", {}", row.link.prov) } else { String::new() };

@@ -821,7 +821,7 @@ fn unique_name_matches_are_unverified_candidates_not_references() {
     let top_of: std::collections::BTreeMap<String, String> = [(crate::util::stable_id("checkout", &fx.main.to_string_lossy()), fx.main.to_string_lossy().into_owned())].into_iter().collect();
     let ranked = crate::overview::rank_files(&c, &top_of.keys().cloned().collect::<Vec<_>>(), &top_of).unwrap();
     let r = ranked.iter().find(|r| r.node.path.as_deref() == Some(research.as_str())).unwrap();
-    assert!(r.refs.is_empty() && r.score == 1, "only its commit scores");
+    assert!(r.refs.is_empty() && r.score == 4, "only its commit scores (4 per recent commit)");
     let f = view::expand(&v(&c), ":deep/x/research.md", &scoped("proj")).unwrap();
     assert!(f.contains("## Docs naming it (exact path) (0)"), "{f}");
     assert!(f.contains("## Unverified mentions") && f.contains("- :docs/notes.md#sources l.4 `research.md`:"), "{f}");
