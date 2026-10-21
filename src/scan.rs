@@ -63,6 +63,8 @@ pub struct Stats {
     pub dirs_visited: usize,
     pub ms: u128,
     pub checkouts_pruned: usize,
+    /// Checkouts gone from disk but kept (marked missing) because conversations were recorded there.
+    pub checkouts_missing: usize,
     pub messages: usize,
     pub sessions_truncated: usize,
     pub relations: usize,
@@ -77,6 +79,25 @@ pub struct Checkout {
     /// Other spellings of the same directory (e.g. git-reported vs canonical).
     pub aliases: Vec<PathBuf>,
     pub dev_ino: Option<(u64, u64)>,
+    /// Indexed earlier, directory gone now: kept so recorded evidence stays attached.
+    pub missing: bool,
+}
+
+/// Checkouts known to the index but not in `skip` (not walked by this run):
+/// live ones when their directory exists, otherwise flagged missing.
+pub fn db_checkouts(c: &Connection, skip: &HashSet<String>) -> rusqlite::Result<Vec<Checkout>> {
+    let mut out = Vec::new();
+    for n in crate::overview::nodes(c, "kind='checkout'", &[])? {
+        if skip.contains(&n.id) {
+            continue;
+        }
+        let Some(top) = n.path.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from) else { continue };
+        let exists = top.is_dir();
+        let aliases: Vec<PathBuf> = n.meta.get("reported_path").and_then(|x| x.as_str()).map(PathBuf::from).filter(|r| r != &top).into_iter().collect();
+        let missing = !exists || n.meta.get("missing").and_then(|x| x.as_bool()) == Some(true);
+        out.push(Checkout { id: n.id, repo_id: n.repo_id.unwrap_or_default(), dev_ino: if missing { None } else { discover::dev_ino(&top) }, top, aliases, missing });
+    }
+    Ok(out)
 }
 
 /// Maps arbitrary paths (session cwd, tool file paths) onto checkouts, handling
@@ -93,11 +114,24 @@ impl Matcher {
         Matcher { checkouts, by_inode, cache: HashMap::new() }
     }
 
-    /// Return (checkout index, path relative to checkout top).
+    /// Return (checkout index, path relative to checkout top) among live checkouts.
     pub fn locate(&mut self, p: &Path) -> Option<(usize, PathBuf)> {
+        self.locate_in(p, false)
+    }
+
+    /// Like [`Matcher::locate`], but a path under a checkout that is gone from
+    /// disk (kept as missing) maps onto that historical checkout.
+    pub fn locate_any(&mut self, p: &Path) -> Option<(usize, PathBuf)> {
+        self.locate_in(p, true)
+    }
+
+    fn locate_in(&mut self, p: &Path, any: bool) -> Option<(usize, PathBuf)> {
         // Longest textual prefix first (cheap, also works for deleted files).
         let mut best: Option<(usize, usize, PathBuf)> = None;
         for (i, c) in self.checkouts.iter().enumerate() {
+            if c.missing && !any {
+                continue;
+            }
             for root in std::iter::once(&c.top).chain(c.aliases.iter()) {
                 if let Ok(rel) = p.strip_prefix(root) {
                     let n = root.as_os_str().len();
@@ -172,180 +206,21 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
     if ws.capped {
         st.warnings.push(format!("directory walk stopped at {} dirs (raise --max-dirs)", opts.max_dirs));
     }
-
-    // Group checkouts by common git dir = repository identity.
-    let mut repos: BTreeMap<PathBuf, Vec<(PathBuf, Option<PathBuf>)>> = BTreeMap::new(); // common -> [(canonical top, reported path)]
-    let mut seen_tops: HashSet<(u64, u64)> = HashSet::new();
-    let mut add_top = |repos: &mut BTreeMap<PathBuf, Vec<(PathBuf, Option<PathBuf>)>>, common: &Path, top: PathBuf, reported: Option<PathBuf>| {
-        if let Some(di) = discover::dev_ino(&top) {
-            if !seen_tops.insert(di) {
-                if let (Some(rep), Some(list)) = (reported, repos.get_mut(common)) {
-                    if let Some(e) = list.iter_mut().find(|e| discover::dev_ino(&e.0) == Some(di)) {
-                        e.1.get_or_insert(rep);
-                    }
-                }
-                return;
-            }
-        }
-        repos.entry(common.to_path_buf()).or_default().push((top, reported));
-    };
-    for cand in &cands {
-        if let Some((top, common)) = git::probe_fast(cand).or_else(|| git::probe(cand)) {
-            add_top(&mut repos, &common, top, None);
-        }
-    }
-    let commons: Vec<PathBuf> = repos.keys().cloned().collect();
-    let mut wt_meta: HashMap<PathBuf, git::Worktree> = HashMap::new();
-    for common in &commons {
-        let first = repos[common][0].0.clone();
-        for wt in git::worktrees(&first) {
-            if wt.bare {
-                continue;
-            }
-            let canon = std::fs::canonicalize(&wt.path).unwrap_or(wt.path.clone());
-            if canon.exists() {
-                add_top(&mut repos, common, canon.clone(), Some(wt.path.clone()));
-            }
-            wt_meta.insert(canon, wt);
-        }
-    }
+    let (repos, wt_meta) = group_checkouts(cands.iter().map(|p| p.as_path()));
 
     let mut checkouts: Vec<Checkout> = Vec::new();
     let mut indexes: HashMap<String, FileIndex> = HashMap::new();
     for (common, tops) in &repos {
         // One transaction per repository: an interrupted scan keeps finished repos.
-        let tx = c.transaction()?;
-        let main_top = tops.iter().map(|t| &t.0).find(|t| t.join(".git").is_dir()).unwrap_or(&tops[0].0).clone();
-        let remotes = git::remotes(&main_top);
-        let repo_id = stable_id("repo", &common.to_string_lossy());
-        let label = repo_label(common, &remotes, &main_top);
-        let branches = git::branches(&main_top, 20);
-        let repo_meta = json!({"common_dir": common, "remotes": remotes.iter().map(|r| json!({"name": r.0, "url": r.1})).collect::<Vec<_>>(),
-            "branches": branches.iter().map(|b| json!({"name": b.0, "ts": b.1, "sha": &b.2[..b.2.len().min(10)]})).collect::<Vec<_>>(), "checkouts": tops.len()});
-        let repo_ts = branches.iter().map(|b| b.1).max();
-        db::upsert_node(&tx, &NodeRow { id: &repo_id, kind: "repo", label: &label, path: Some(&common.to_string_lossy()), repo_id: Some(&repo_id), checkout_id: None, ts: repo_ts, meta: &repo_meta })?;
-        // Project-level searchable text: name, remotes, main checkout path.
-        let porigin = format!("repo:{repo_id}");
-        db::clear_origin(&tx, &porigin)?;
-        let ids: Vec<String> = remotes.iter().filter_map(|r| crate::util::remote_identity(&r.1)).collect();
-        let ptext = format!("{label} {} {} {}", ids.join(" "), remotes.iter().map(|r| r.1.as_str()).collect::<Vec<_>>().join(" "), main_top.display());
-        db::add_passage(
-            &tx,
-            &db::Passage {
-                kind: "project",
-                node_id: &repo_id,
-                repo_id: Some(&repo_id),
-                checkout_id: None,
-                source_path: &main_top.to_string_lossy(),
-                line: 0,
-                loc: "",
-                part: 0,
-                speaker: "",
-                ts: repo_ts,
-                title: &label,
-                heading: "",
-                text: &ptext,
-                origin: &porigin,
-            },
-        )?;
-        st.repos += 1;
-        for (top, reported) in tops {
-            let co_id = stable_id("checkout", &top.to_string_lossy());
-            let wt = wt_meta.get(top);
-            let mut aliases: Vec<PathBuf> = reported.iter().filter(|r| *r != top).cloned().collect();
-            if let Some(w) = wt {
-                if &w.path != top && !aliases.contains(&w.path) {
-                    aliases.push(w.path.clone());
-                }
-            }
-            checkouts.push(Checkout { id: co_id.clone(), repo_id: repo_id.clone(), top: top.clone(), aliases, dev_ino: discover::dev_ino(top) });
-            st.checkouts += 1;
-            // Unchanged HEAD, index and doc files: keep the previous derived edges.
-            let sig = checkout_signature(&tx, &co_id, top, wt.map(|w| w.head.as_str()).unwrap_or(""))?;
-            let old_sig: Option<String> = tx.query_row("SELECT json_extract(meta,'$.sig') FROM nodes WHERE id=?1", [&co_id], |r| r.get(0)).optional()?.flatten();
-            if !opts.full && old_sig.as_deref() == Some(sig.as_str()) {
-                st.checkouts_reused += 1;
-                continue;
-            }
-            db::clear_origin(&tx, &co_id)?;
-            tx.execute("DELETE FROM excerpts WHERE node_id IN (SELECT id FROM nodes WHERE checkout_id=?1 AND kind IN ('doc','memory'))", [&co_id])?;
-            let branch = wt.and_then(|w| w.branch.clone());
-            let head = wt.map(|w| w.head.clone()).unwrap_or_default();
-            let is_main = top == &main_top;
-            let name = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let co_label = format!("{label}:{}", branch.clone().unwrap_or(name));
-            let log = git::log(top, opts.commits, 40);
-            let co_ts = log.first().map(|c| c.ts);
-            let meta = json!({"branch": branch, "head": &head[..head.len().min(10)], "main": is_main, "reported_path": reported});
-            db::upsert_node(
-                &tx,
-                &NodeRow { id: &co_id, kind: "checkout", label: &co_label, path: Some(&top.to_string_lossy()), repo_id: Some(&repo_id), checkout_id: Some(&co_id), ts: co_ts, meta: &meta },
-            )?;
-            db::add_edge(&tx, &EdgeRow { src: &co_id, dst: &repo_id, kind: "worktree_of", strength: "structural", source_path: "", source_line: 0, ts: None, note: "", origin: &co_id })?;
-
-            let staged = git::ls_files_stage(top, 50_000);
-            let idx = FileIndex::new(staged.iter().map(|x| x.2.clone()).collect());
-            // A failed/timed-out git call must not be cached as "no history": warn and retry next scan.
-            let git_ok = head.is_empty() || (!log.is_empty() && !idx.files.is_empty());
-            if !git_ok {
-                st.warnings.push(format!("git log/ls-files returned nothing for {} (timeout or error); will retry next scan", top.display()));
-            }
-            index_docs(&tx, env, top, reported.as_deref(), &repo_id, &co_id, &idx, is_main, &mut st)?;
-            if is_main {
-                relations::extract_checkout(&tx, top, &repo_id, &co_id, &staged)?;
-            }
-            for ep in docs::entry_points(top, &idx) {
-                let abs = top.join(&ep.rel).to_string_lossy().into_owned();
-                let fid = db::ensure_file_node(&tx, &abs, Some(&repo_id), Some(&co_id), &ep.rel)?;
-                let src = top.join(&ep.source).to_string_lossy().into_owned();
-                db::add_edge(
-                    &tx,
-                    &EdgeRow { src: &co_id, dst: &fid, kind: "entrypoint", strength: "structural", source_path: &src, source_line: ep.line as i64, ts: None, note: &ep.note, origin: &co_id },
-                )?;
-            }
-            for cm in &log {
-                let cid = stable_id("commit", &cm.sha);
-                let label = format!("{} {}", &cm.sha[..cm.sha.len().min(8)], redact(&clip(&cm.subject, 100)));
-                let meta = json!({"sha": cm.sha, "author": cm.author, "files": cm.files.len()});
-                db::upsert_node(&tx, &NodeRow { id: &cid, kind: "commit", label: &label, path: None, repo_id: Some(&repo_id), checkout_id: None, ts: Some(cm.ts), meta: &meta })?;
-                db::add_edge(&tx, &EdgeRow { src: &co_id, dst: &cid, kind: "history", strength: "structural", source_path: "", source_line: 0, ts: Some(cm.ts), note: "", origin: &co_id })?;
-                let files: Vec<&str> = cm.files.iter().take(20).map(|f| f.1.as_str()).collect();
-                let ctext = format!("{} {} {}", redact(&clip(&cm.subject, 300)), cm.author, files.join(" "));
-                db::add_passage(
-                    &tx,
-                    &db::Passage {
-                        kind: "commit",
-                        node_id: &cid,
-                        repo_id: Some(&repo_id),
-                        checkout_id: Some(&co_id),
-                        source_path: "",
-                        line: 0,
-                        loc: &cm.sha,
-                        part: 0,
-                        speaker: &cm.author,
-                        ts: Some(cm.ts),
-                        title: &label,
-                        heading: "",
-                        text: &ctext,
-                        origin: &co_id,
-                    },
-                )?;
-                for (status, rel) in &cm.files {
-                    let abs = top.join(rel).to_string_lossy().into_owned();
-                    let fid = db::ensure_file_node(&tx, &abs, Some(&repo_id), Some(&co_id), rel)?;
-                    db::add_edge(&tx, &EdgeRow { src: &cid, dst: &fid, kind: "touched", strength: "structural", source_path: "", source_line: 0, ts: Some(cm.ts), note: status, origin: &co_id })?;
-                }
-            }
-            // Signature after docs are indexed, so the next scan compares like with like.
-            let sig = if git_ok { checkout_signature(&tx, &co_id, top, &head)? } else { String::new() };
-            tx.execute("UPDATE nodes SET meta=json_set(meta,'$.sig',?2) WHERE id=?1", params![co_id, sig])?;
-            indexes.insert(co_id, idx);
-        }
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        index_repo(&tx, env, opts, common, tops, None, &wt_meta, &mut st, &mut checkouts, &mut indexes)?;
         tx.commit()?;
     }
     // Sessions: batches of explicit transactions so a long first scan keeps progress.
+    // IMMEDIATE: take the write lock up front, so a concurrent `ingest` waits
+    // (busy timeout) instead of failing a read-then-write upgrade.
     let tx: &Connection = c;
-    tx.execute_batch("BEGIN")?;
+    tx.execute_batch("BEGIN IMMEDIATE")?;
     // Checkouts listed by `git worktree list` whose directory is gone.
     for (p, wt) in &wt_meta {
         if !p.exists() {
@@ -353,26 +228,35 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
         }
     }
 
+    // Checkouts this run did not walk (outside the given roots, or gone) still
+    // locate transcripts and file paths, so a partial scan never re-attributes
+    // or drops evidence that belongs to them.
+    let walked: HashSet<String> = checkouts.iter().map(|c| c.id.clone()).collect();
+    checkouts.extend(db_checkouts(tx, &walked)?);
     let mut matcher = Matcher::new(checkouts);
     if opts.sessions {
         index_sessions(tx, env, &mut matcher, &mut indexes, opts, &mut st)?;
     }
 
-    // Checkouts indexed earlier whose directory is gone: drop them and what they produced.
-    // Only when the parent directory still exists, so an unmounted drive or a
-    // missing root never wipes its projects from the index.
-    let live: HashSet<String> = matcher.checkouts.iter().map(|c| c.id.clone()).collect();
+    // Checkouts indexed earlier whose directory is gone. Only when the parent
+    // directory still exists, so an unmounted drive or a missing root never
+    // touches its projects. Conversations recorded there keep the checkout
+    // (marked missing, with its recorded path and branch); others are dropped.
     for co in crate::overview::nodes(tx, "kind='checkout'", &[])? {
         let path = PathBuf::from(co.path.clone().unwrap_or_default());
         let parent_ok = path.parent().map(|p| p.is_dir()).unwrap_or(false);
-        if live.contains(&co.id) || path.as_os_str().is_empty() || path.exists() || !parent_ok {
+        if walked.contains(&co.id) || path.as_os_str().is_empty() || path.exists() || !parent_ok {
             continue;
         }
-        db::clear_origin(tx, &co.id)?;
-        tx.execute("DELETE FROM nodes WHERE id=?1 OR (kind IN ('doc','memory') AND checkout_id=?1)", [&co.id])?;
-        tx.execute("UPDATE nodes SET checkout_id=NULL WHERE kind='session' AND checkout_id=?1", [&co.id])?;
-        st.checkouts_pruned += 1;
-        st.warnings.push(format!("pruned checkout no longer on disk: {}", co.path.unwrap_or_default()));
+        let recorded: i64 = tx.query_row("SELECT count(*) FROM nodes WHERE kind='session' AND checkout_id=?1", [&co.id], |r| r.get(0))?;
+        if recorded == 0 {
+            db::clear_origin(tx, &co.id)?;
+            tx.execute("DELETE FROM nodes WHERE id=?1 OR (kind IN ('doc','memory') AND checkout_id=?1)", [&co.id])?;
+            st.checkouts_pruned += 1;
+            st.warnings.push(format!("pruned checkout no longer on disk: {}", co.path.unwrap_or_default()));
+            continue;
+        }
+        mark_missing(tx, &co, &walked, scan_id, recorded, &mut st)?;
     }
     tx.execute("DELETE FROM nodes WHERE kind='repo' AND id NOT IN (SELECT repo_id FROM nodes WHERE kind='checkout' AND repo_id IS NOT NULL)", [])?;
 
@@ -393,11 +277,273 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
     let stats = json!({"ms": st.ms, "checkouts": st.checkouts, "repos": st.repos, "docs": st.docs, "sessions_parsed": st.sessions_parsed,
         "sessions_reused": st.sessions_reused, "sources_unrelated": st.sources_unrelated, "sources_missing": st.sources_missing,
         "parse_warnings": st.parse_warnings, "dirs_visited": st.dirs_visited, "warnings": st.warnings, "commits_per_worktree": opts.commits,
-        "checkouts_pruned": st.checkouts_pruned, "messages": st.messages, "sessions_truncated": st.sessions_truncated, "relations": st.relations,
+        "checkouts_pruned": st.checkouts_pruned, "checkouts_missing": st.checkouts_missing, "messages": st.messages, "sessions_truncated": st.sessions_truncated, "relations": st.relations,
         "remote": st.remote, "sessions_indexed": opts.sessions});
     tx.execute("UPDATE scans SET finished=?1, stats=?2 WHERE id=?3", params![now_unix(), stats.to_string(), scan_id])?;
     tx.execute_batch("COMMIT")?;
     Ok(st)
+}
+
+type RepoTops = BTreeMap<PathBuf, Vec<(PathBuf, Option<PathBuf>)>>;
+
+/// Group checkout candidates by common git dir (= repository identity) and add
+/// every existing worktree git knows of. Returns (common -> [(canonical top,
+/// reported path)], `git worktree list` entries by canonical path).
+fn group_checkouts<'a>(cands: impl Iterator<Item = &'a Path>) -> (RepoTops, HashMap<PathBuf, git::Worktree>) {
+    let mut repos: RepoTops = BTreeMap::new();
+    let mut seen_tops: HashSet<(u64, u64)> = HashSet::new();
+    let mut add_top = |repos: &mut RepoTops, common: &Path, top: PathBuf, reported: Option<PathBuf>| {
+        if let Some(di) = discover::dev_ino(&top) {
+            if !seen_tops.insert(di) {
+                if let (Some(rep), Some(list)) = (reported, repos.get_mut(common)) {
+                    if let Some(e) = list.iter_mut().find(|e| discover::dev_ino(&e.0) == Some(di)) {
+                        e.1.get_or_insert(rep);
+                    }
+                }
+                return;
+            }
+        }
+        repos.entry(common.to_path_buf()).or_default().push((top, reported));
+    };
+    for cand in cands {
+        if let Some((top, common)) = git::probe_fast(cand).or_else(|| git::probe(cand)) {
+            add_top(&mut repos, &common, top, None);
+        }
+    }
+    let commons: Vec<PathBuf> = repos.keys().cloned().collect();
+    let mut wt_meta: HashMap<PathBuf, git::Worktree> = HashMap::new();
+    for common in &commons {
+        let first = repos[common][0].0.clone();
+        for wt in git::worktrees(&first) {
+            if wt.bare {
+                continue;
+            }
+            let canon = std::fs::canonicalize(&wt.path).unwrap_or(wt.path.clone());
+            if canon.exists() {
+                add_top(&mut repos, common, canon.clone(), Some(wt.path.clone()));
+            }
+            wt_meta.insert(canon, wt);
+        }
+    }
+    (repos, wt_meta)
+}
+
+/// Index one repository and its checkouts. With `only`, the other checkouts are
+/// registered for path matching but not re-indexed (targeted ingest).
+#[allow(clippy::too_many_arguments)]
+fn index_repo(
+    tx: &Connection,
+    env: &Env,
+    opts: &ScanOpts,
+    common: &Path,
+    tops: &[(PathBuf, Option<PathBuf>)],
+    only: Option<&HashSet<PathBuf>>,
+    wt_meta: &HashMap<PathBuf, git::Worktree>,
+    st: &mut Stats,
+    checkouts: &mut Vec<Checkout>,
+    indexes: &mut HashMap<String, FileIndex>,
+) -> rusqlite::Result<()> {
+    let main_top = tops.iter().map(|t| &t.0).find(|t| t.join(".git").is_dir()).unwrap_or(&tops[0].0).clone();
+    let remotes = git::remotes(&main_top);
+    let repo_id = stable_id("repo", &common.to_string_lossy());
+    let label = repo_label(common, &remotes, &main_top);
+    let branches = git::branches(&main_top, 20);
+    let repo_meta = json!({"common_dir": common, "remotes": remotes.iter().map(|r| json!({"name": r.0, "url": r.1})).collect::<Vec<_>>(),
+        "branches": branches.iter().map(|b| json!({"name": b.0, "ts": b.1, "sha": &b.2[..b.2.len().min(10)]})).collect::<Vec<_>>(), "checkouts": tops.len()});
+    let repo_ts = branches.iter().map(|b| b.1).max();
+    db::upsert_node(tx, &NodeRow { id: &repo_id, kind: "repo", label: &label, path: Some(&common.to_string_lossy()), repo_id: Some(&repo_id), checkout_id: None, ts: repo_ts, meta: &repo_meta })?;
+    // Project-level searchable text: name, remotes, main checkout path.
+    let porigin = format!("repo:{repo_id}");
+    db::clear_origin(tx, &porigin)?;
+    let ids: Vec<String> = remotes.iter().filter_map(|r| crate::util::remote_identity(&r.1)).collect();
+    let ptext = format!("{label} {} {} {}", ids.join(" "), remotes.iter().map(|r| r.1.as_str()).collect::<Vec<_>>().join(" "), main_top.display());
+    db::add_passage(
+        tx,
+        &db::Passage {
+            kind: "project",
+            node_id: &repo_id,
+            repo_id: Some(&repo_id),
+            checkout_id: None,
+            source_path: &main_top.to_string_lossy(),
+            line: 0,
+            loc: "",
+            part: 0,
+            speaker: "",
+            ts: repo_ts,
+            title: &label,
+            heading: "",
+            text: &ptext,
+            origin: &porigin,
+        },
+    )?;
+    st.repos += 1;
+    for (top, reported) in tops {
+        let co_id = stable_id("checkout", &top.to_string_lossy());
+        let wt = wt_meta.get(top);
+        let mut aliases: Vec<PathBuf> = reported.iter().filter(|r| *r != top).cloned().collect();
+        if let Some(w) = wt {
+            if &w.path != top && !aliases.contains(&w.path) {
+                aliases.push(w.path.clone());
+            }
+        }
+        checkouts.push(Checkout { id: co_id.clone(), repo_id: repo_id.clone(), top: top.clone(), aliases, dev_ino: discover::dev_ino(top), missing: false });
+        if only.map(|o| !o.contains(top)).unwrap_or(false) {
+            continue;
+        }
+        st.checkouts += 1;
+        // Back on disk (or never gone): drop any earlier "missing" marker.
+        tx.execute(
+            "UPDATE nodes SET meta=json_remove(meta,'$.missing','$.missing_since','$.missing_scan','$.moved_to','$.moved_candidates') WHERE id=?1 AND json_extract(meta,'$.missing') IS NOT NULL",
+            [&co_id],
+        )?;
+        // A checkout `git worktree list` reports under another path (moved without
+        // `git worktree repair`): read HEAD and branch from the checkout itself.
+        let (head, branch) = match wt {
+            Some(w) => (w.head.clone(), w.branch.clone()),
+            None => git::head_info(top),
+        };
+        // Unchanged HEAD, index and doc files: keep the previous derived edges.
+        let sig = checkout_signature(tx, &co_id, top, &head)?;
+        let old: Option<(Option<String>, Option<i64>)> =
+            tx.query_row("SELECT json_extract(meta,'$.sig'), json_extract(meta,'$.first_observed') FROM nodes WHERE id=?1", [&co_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (old_sig, first_observed) = old.unwrap_or((None, None));
+        if !opts.full && old_sig.as_deref() == Some(sig.as_str()) {
+            st.checkouts_reused += 1;
+            continue;
+        }
+        db::clear_origin(tx, &co_id)?;
+        tx.execute("DELETE FROM excerpts WHERE node_id IN (SELECT id FROM nodes WHERE checkout_id=?1 AND kind IN ('doc','memory'))", [&co_id])?;
+        let is_main = top == &main_top;
+        let name = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let co_label = format!("{label}:{}", branch.clone().unwrap_or(name));
+        let log = git::log(top, opts.commits, 40);
+        let co_ts = log.first().map(|c| c.ts);
+        // Identity evidence for recognising this checkout after a move: the git
+        // admin dir its `.git` points at, full HEAD and branch. `first_observed` is
+        // when workmap first indexed it (never a creation time).
+        let git_dir = git::git_dir(top).map(|g| std::fs::canonicalize(&g).unwrap_or(g).to_string_lossy().into_owned());
+        let meta = json!({"branch": branch, "head": &head[..head.len().min(10)], "main": is_main, "reported_path": reported,
+            "git_dir": git_dir, "head_full": head, "first_observed": first_observed.unwrap_or_else(now_unix)});
+        db::upsert_node(
+            tx,
+            &NodeRow { id: &co_id, kind: "checkout", label: &co_label, path: Some(&top.to_string_lossy()), repo_id: Some(&repo_id), checkout_id: Some(&co_id), ts: co_ts, meta: &meta },
+        )?;
+        db::add_edge(tx, &EdgeRow { src: &co_id, dst: &repo_id, kind: "worktree_of", strength: "structural", source_path: "", source_line: 0, ts: None, note: "", origin: &co_id })?;
+
+        let staged = git::ls_files_stage(top, 50_000);
+        let idx = FileIndex::new(staged.iter().map(|x| x.2.clone()).collect());
+        // A failed/timed-out git call must not be cached as "no history": warn and retry next scan.
+        let git_ok = head.is_empty() || (!log.is_empty() && !idx.files.is_empty());
+        if !git_ok {
+            st.warnings.push(format!("git log/ls-files returned nothing for {} (timeout or error); will retry next scan", top.display()));
+        }
+        index_docs(tx, env, top, reported.as_deref(), &repo_id, &co_id, &idx, is_main, st)?;
+        if is_main {
+            relations::extract_checkout(tx, top, &repo_id, &co_id, &staged)?;
+        }
+        for ep in docs::entry_points(top, &idx) {
+            let abs = top.join(&ep.rel).to_string_lossy().into_owned();
+            let fid = db::ensure_file_node(tx, &abs, Some(&repo_id), Some(&co_id), &ep.rel)?;
+            let src = top.join(&ep.source).to_string_lossy().into_owned();
+            db::add_edge(
+                tx,
+                &EdgeRow { src: &co_id, dst: &fid, kind: "entrypoint", strength: "structural", source_path: &src, source_line: ep.line as i64, ts: None, note: &ep.note, origin: &co_id },
+            )?;
+        }
+        for cm in &log {
+            let cid = stable_id("commit", &cm.sha);
+            let label = format!("{} {}", &cm.sha[..cm.sha.len().min(8)], redact(&clip(&cm.subject, 100)));
+            let meta = json!({"sha": cm.sha, "author": cm.author, "files": cm.files.len()});
+            db::upsert_node(tx, &NodeRow { id: &cid, kind: "commit", label: &label, path: None, repo_id: Some(&repo_id), checkout_id: None, ts: Some(cm.ts), meta: &meta })?;
+            db::add_edge(tx, &EdgeRow { src: &co_id, dst: &cid, kind: "history", strength: "structural", source_path: "", source_line: 0, ts: Some(cm.ts), note: "", origin: &co_id })?;
+            let files: Vec<&str> = cm.files.iter().take(20).map(|f| f.1.as_str()).collect();
+            let ctext = format!("{} {} {}", redact(&clip(&cm.subject, 300)), cm.author, files.join(" "));
+            db::add_passage(
+                tx,
+                &db::Passage {
+                    kind: "commit",
+                    node_id: &cid,
+                    repo_id: Some(&repo_id),
+                    checkout_id: Some(&co_id),
+                    source_path: "",
+                    line: 0,
+                    loc: &cm.sha,
+                    part: 0,
+                    speaker: &cm.author,
+                    ts: Some(cm.ts),
+                    title: &label,
+                    heading: "",
+                    text: &ctext,
+                    origin: &co_id,
+                },
+            )?;
+            for (status, rel) in &cm.files {
+                let abs = top.join(rel).to_string_lossy().into_owned();
+                let fid = db::ensure_file_node(tx, &abs, Some(&repo_id), Some(&co_id), rel)?;
+                db::add_edge(tx, &EdgeRow { src: &cid, dst: &fid, kind: "touched", strength: "structural", source_path: "", source_line: 0, ts: Some(cm.ts), note: status, origin: &co_id })?;
+            }
+        }
+        // Signature after docs are indexed, so the next scan compares like with like.
+        let sig = if git_ok { checkout_signature(tx, &co_id, top, &head)? } else { String::new() };
+        tx.execute("UPDATE nodes SET meta=json_set(meta,'$.sig',?2) WHERE id=?1", params![co_id, sig])?;
+        indexes.insert(co_id, idx);
+    }
+    Ok(())
+}
+
+/// Keep a checkout whose directory disappeared because conversations were
+/// recorded in it: its node stays (flagged missing, with the recorded path and
+/// branch); what was derived from its files (docs, commit list) is dropped.
+/// A live checkout is named as its new location only with identity evidence:
+/// the same git worktree admin dir plus the same branch or HEAD, or else the
+/// same HEAD commit and the same branch. A branch name alone never counts, and
+/// several candidates are listed, never chosen.
+fn mark_missing(tx: &Connection, co: &crate::overview::Node, walked: &HashSet<String>, scan_id: i64, recorded: i64, st: &mut Stats) -> rusqlite::Result<()> {
+    let already = co.meta.get("missing").and_then(|x| x.as_bool()) == Some(true);
+    if !already {
+        db::clear_origin(tx, &co.id)?;
+        tx.execute("DELETE FROM excerpts WHERE node_id IN (SELECT id FROM nodes WHERE checkout_id=?1 AND kind IN ('doc','memory'))", [&co.id])?;
+        tx.execute("DELETE FROM nodes WHERE kind IN ('doc','memory') AND checkout_id=?1", [&co.id])?;
+    }
+    let ms = |n: &crate::overview::Node, k: &str| n.meta.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let (gd, head, branch) = (ms(co, "git_dir"), ms(co, "head_full"), ms(co, "branch"));
+    let mut strong: Vec<(String, String, String)> = Vec::new();
+    let mut weak: Vec<(String, String, String)> = Vec::new();
+    for live in crate::overview::nodes(tx, "kind='checkout'", &[])? {
+        if live.id == co.id || !walked.contains(&live.id) {
+            continue;
+        }
+        let path = live.path.clone().unwrap_or_default();
+        let (lgd, lhead, lbranch) = (ms(&live, "git_dir"), ms(&live, "head_full"), ms(&live, "branch"));
+        let same_branch = !branch.is_empty() && lbranch == branch;
+        let same_head = !head.is_empty() && lhead == head;
+        if !gd.is_empty() && lgd == gd && (same_branch || same_head) {
+            strong.push((
+                live.id.clone(),
+                path,
+                format!("same git worktree admin dir {gd}{}", if same_branch { format!(", branch {branch}") } else { format!(", HEAD {}", &head[..head.len().min(10)]) }),
+            ));
+        } else if same_head && same_branch {
+            weak.push((live.id.clone(), path, format!("same HEAD {} and branch {branch}", &head[..head.len().min(10)])));
+        }
+    }
+    let cands = if strong.is_empty() { weak } else { strong };
+    let as_json = |v: &[(String, String, String)]| v.iter().map(|(id, p, e)| json!({"checkout_id": id, "path": p, "evidence": e})).collect::<Vec<_>>();
+    let (moved_to, ambiguous) = match cands.len() {
+        1 => (as_json(&cands).pop(), vec![]),
+        0 => (None, vec![]),
+        _ => (None, as_json(&cands)),
+    };
+    tx.execute(
+        "UPDATE nodes SET meta=json_set(meta,'$.missing',json('true'),'$.missing_since',coalesce(json_extract(meta,'$.missing_since'),?2),
+           '$.missing_scan',coalesce(json_extract(meta,'$.missing_scan'),?3),'$.moved_to',json(?4),'$.moved_candidates',json(?5)) WHERE id=?1",
+        params![co.id, now_unix(), scan_id, moved_to.map(|m| m.to_string()).unwrap_or_else(|| "null".into()), serde_json::Value::from(ambiguous).to_string()],
+    )?;
+    st.checkouts_missing += 1;
+    if !already {
+        st.warnings.push(format!("checkout no longer on disk: {} — kept as missing ({recorded} conversation(s) recorded there)", co.path.clone().unwrap_or_default()));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -558,31 +704,111 @@ pub(crate) fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, a
     Ok(())
 }
 
-/// Decide whether a source must be (re)parsed. Returns Some(cwd) when related.
+/// Decide whether a source must be (re)parsed.
 enum Decision {
     Reuse,
     Unrelated(Option<String>),
+    /// Indexed before, but its cwd is in no checkout this run knows: leave the
+    /// recorded evidence untouched (never re-attribute or drop it).
+    Keep,
     Parse,
 }
 
-fn decide(tx: &Connection, key: &str, size: i64, mtime: i64, matcher: &mut Matcher, head_cwd: impl FnOnce() -> Option<String>) -> rusqlite::Result<Decision> {
-    if let Some((s0, m0, status, cwd)) = db::source_state(tx, key)? {
-        if s0 == size && m0 == mtime {
+fn decide(tx: &Connection, key: &str, size: i64, mtime: i64, matcher: &mut Matcher, head_cwd: &mut dyn FnMut() -> Option<String>) -> rusqlite::Result<Decision> {
+    let prev = db::source_state(tx, key)?;
+    if let Some((s0, m0, status, cwd)) = &prev {
+        if *s0 == size && *m0 == mtime {
             if status == "parsed" {
                 return Ok(Decision::Reuse);
             }
             if status == "unrelated" {
                 // Roots may have changed since: re-check the cached cwd without opening the file.
-                let related = cwd.as_deref().map(|c| matcher.locate(Path::new(c)).is_some()).unwrap_or(false);
-                return Ok(if related { Decision::Parse } else { Decision::Unrelated(cwd) });
+                let related = cwd.as_deref().map(|c| matcher.locate_any(Path::new(c)).is_some()).unwrap_or(false);
+                return Ok(if related { Decision::Parse } else { Decision::Unrelated(cwd.clone()) });
             }
         }
     }
     let cwd = head_cwd();
     match cwd.as_deref() {
-        Some(c) if matcher.locate(Path::new(c)).is_some() => Ok(Decision::Parse),
+        Some(c) if matcher.locate_any(Path::new(c)).is_some() => Ok(Decision::Parse),
+        _ if prev.as_ref().map(|p| p.2 == "parsed").unwrap_or(false) => Ok(Decision::Keep),
         _ => Ok(Decision::Unrelated(cwd)),
     }
+}
+
+/// What happened to one transcript source.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    Reused,
+    Kept,
+    Unrelated(Option<String>),
+    Parsed(String),
+    Error,
+}
+
+/// Decide, parse and store one source exactly the same way for `scan` and `ingest`.
+#[allow(clippy::too_many_arguments)]
+fn process_source(
+    tx: &Connection,
+    key: &str,
+    provider: &str,
+    size: i64,
+    mtime: i64,
+    matcher: &mut Matcher,
+    indexes: &mut HashMap<String, FileIndex>,
+    st: &mut Stats,
+    head: &mut dyn FnMut() -> Option<String>,
+    parse: &mut dyn FnMut() -> Option<Session>,
+) -> rusqlite::Result<Outcome> {
+    Ok(match decide(tx, key, size, mtime, matcher, head)? {
+        Decision::Reuse => {
+            st.sessions_reused += 1;
+            Outcome::Reused
+        }
+        Decision::Keep => {
+            st.sessions_reused += 1;
+            Outcome::Kept
+        }
+        Decision::Unrelated(cwd) => {
+            st.sources_unrelated += 1;
+            db::set_source(tx, key, provider, size, mtime, cwd.as_deref(), "unrelated", None, 0)?;
+            Outcome::Unrelated(cwd)
+        }
+        Decision::Parse => match parse() {
+            Some(sess) => {
+                st.parse_warnings += sess.warnings;
+                let sid = store_session(tx, key, &sess, matcher, indexes)?;
+                db::set_source(tx, key, provider, size, mtime, sess.cwd.as_deref(), "parsed", Some(&sid), sess.warnings as i64)?;
+                st.sessions_parsed += 1;
+                Outcome::Parsed(sid)
+            }
+            None => {
+                st.parse_warnings += 1;
+                db::set_source(tx, key, provider, size, mtime, None, "error", None, 1)?;
+                Outcome::Error
+            }
+        },
+    })
+}
+
+/// Claude Code subagent transcripts: `<encoded-cwd>/<session-id>/subagents/agent-*.jsonl`.
+fn claude_subagent_files(cdir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(projects) = std::fs::read_dir(cdir) else { return out };
+    for p in projects.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)) {
+        let Ok(sessions) = std::fs::read_dir(p.path()) else { continue };
+        for sdir in sessions.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)) {
+            let Ok(rd) = std::fs::read_dir(sdir.path().join("subagents")) else { continue };
+            for f in rd.flatten() {
+                let path = f.path();
+                let name = f.file_name().to_string_lossy().into_owned();
+                if name.starts_with("agent-") && name.ends_with(".jsonl") && f.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn list_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -611,30 +837,13 @@ fn index_sessions(tx: &Connection, env: &Env, matcher: &mut Matcher, indexes: &m
                       parse: &mut dyn FnMut() -> Option<Session>|
      -> rusqlite::Result<()> {
         seen.insert(key.to_string());
-        match decide(tx, key, size, mtime, matcher, head)? {
-            Decision::Reuse => st.sessions_reused += 1,
-            Decision::Unrelated(cwd) => {
-                st.sources_unrelated += 1;
-                db::set_source(tx, key, provider, size, mtime, cwd.as_deref(), "unrelated", None, 0)?;
+        if let Outcome::Parsed(_) = process_source(tx, key, provider, size, mtime, matcher, indexes, st, head, parse)? {
+            if st.sessions_parsed % 25 == 0 {
+                tx.execute_batch("COMMIT; BEGIN IMMEDIATE")?;
             }
-            Decision::Parse => match parse() {
-                Some(sess) => {
-                    st.parse_warnings += sess.warnings;
-                    let sid = store_session(tx, key, &sess, matcher, indexes)?;
-                    db::set_source(tx, key, provider, size, mtime, sess.cwd.as_deref(), "parsed", Some(&sid), sess.warnings as i64)?;
-                    st.sessions_parsed += 1;
-                    if st.sessions_parsed % 25 == 0 {
-                        tx.execute_batch("COMMIT; BEGIN")?;
-                    }
-                    if opts.verbose {
-                        eprintln!("parsed {provider} {key}");
-                    }
-                }
-                None => {
-                    st.parse_warnings += 1;
-                    db::set_source(tx, key, provider, size, mtime, None, "error", None, 1)?;
-                }
-            },
+            if opts.verbose {
+                eprintln!("parsed {provider} {key}");
+            }
         }
         Ok(())
     };
@@ -644,6 +853,7 @@ fn index_sessions(tx: &Connection, env: &Env, matcher: &mut Matcher, indexes: &m
     if cdir.is_dir() {
         let mut files = Vec::new();
         list_jsonl(&cdir, 1, &mut files);
+        files.extend(claude_subagent_files(&cdir));
         files.sort();
         for f in files {
             let Ok(m) = std::fs::metadata(&f) else { continue };
@@ -738,24 +948,34 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
     db::clear_origin(tx, &origin)?;
     let sid = stable_id("session", &format!("{}:{}", s.provider, s.native_id));
     let cwd = s.cwd.clone().unwrap_or_default();
-    let loc = matcher.locate(Path::new(&cwd));
+    let loc = matcher.locate_any(Path::new(&cwd));
     let (co_id, repo_id) = loc.as_ref().map(|(i, _)| (matcher.checkouts[*i].id.clone(), matcher.checkouts[*i].repo_id.clone())).unzip();
     let label = s.title.clone().filter(|t| !t.is_empty()).or_else(|| s.first_prompt.as_ref().map(|p| clip(&p.1, 80))).unwrap_or_else(|| "(untitled)".into());
+    // Where the conversation ran, as recorded at parse time: survives the checkout
+    // later disappearing from disk.
+    let checkout_snapshot = match &co_id {
+        Some(id) => {
+            let row: Option<(Option<String>, Option<String>)> = tx.query_row("SELECT path, json_extract(meta,'$.branch') FROM nodes WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            let (path, branch) = row.unwrap_or((None, None));
+            json!({"id": id, "path": path, "branch": branch})
+        }
+        None => serde_json::Value::Null,
+    };
 
     // Aggregate: first occurrence per (file, op, strength), with a count.
     let mut agg: BTreeMap<(String, &'static str, &'static str), (usize, &sessions::FileEvent, PathBuf)> = BTreeMap::new();
     let mut external = 0usize;
     for ev in &s.events {
         let abs = crate::util::resolve_against(Path::new(&cwd), &ev.path);
-        let Some((ci, rel)) = matcher.locate(&abs) else {
+        let Some((ci, rel)) = matcher.locate_any(&abs) else {
             external += 1;
             continue;
         };
         let co = &matcher.checkouts[ci];
         // Reused checkouts load their tracked-file list only when a session needs it.
         let ix = indexes.entry(co.id.clone()).or_insert_with(|| FileIndex::new(git::ls_files(&co.top, 50_000)));
-        if ev.op == "mention" && !ix.files.contains(&*rel.to_string_lossy()) {
-            continue; // mentioned paths only count when they name a tracked file
+        if matches!(ev.op, "mention" | "search" | "list") && !ix.files.contains(&*rel.to_string_lossy()) {
+            continue; // mentioned/searched/listed paths only count when they name a tracked file
         }
         let canon = co.top.join(&rel);
         let entry = agg.entry((canon.to_string_lossy().into_owned(), ev.op, ev.strength)).or_insert((0, ev, rel));
@@ -765,6 +985,7 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
         "read": agg.keys().filter(|k| k.1 == "read").count(),
         "write": agg.keys().filter(|k| k.1 == "write").count(),
         "mentioned": agg.keys().filter(|k| k.1 == "mention").count(),
+        "read_via_shell": agg.keys().filter(|k| k.1 == "read" && k.2 == "parsed").count(),
         "external_paths_skipped": external,
     });
     let meta = json!({
@@ -773,6 +994,9 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
         "last_prompt": s.last_prompt.as_ref().map(|p| json!({"ts": p.0, "text": p.1, "line": p.2})),
         "started": s.started, "updated": s.updated, "warnings": s.warnings, "truncated": s.truncated, "files": counts,
         "messages": s.messages.len(), "messages_capped": s.messages_capped,
+        "checkout": checkout_snapshot,
+        "parent": s.parent.as_ref().map(|l| json!({"provider": s.provider, "native_id": l.native_id, "evidence": l.evidence, "tool_use_id": l.tool_use_id,
+            "agent_type": l.agent_type, "description": l.description})),
     });
     db::upsert_node(
         tx,
@@ -817,14 +1041,210 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
     if let Some(co) = &co_id {
         db::add_edge(tx, &EdgeRow { src: &sid, dst: co, kind: "ran_in", strength: "inferred", source_path: &s.source_path, source_line: 0, ts: Some(s.started), note: "cwd", origin: &origin })?;
     }
+    // Subagent -> parent conversation, with the evidence that proved it. The parent
+    // id is derived the same way as every session id, so the edge resolves once
+    // (or whenever) the parent transcript is indexed.
+    if let Some(l) = &s.parent {
+        let parent = stable_id("session", &format!("{}:{}", s.provider, l.native_id));
+        let first = s.messages.first().map(|m| m.line as i64).unwrap_or(0);
+        db::add_edge(
+            tx,
+            &EdgeRow {
+                src: &sid,
+                dst: &parent,
+                kind: "subagent_of",
+                strength: "structural",
+                source_path: src_file,
+                source_line: first,
+                ts: Some(s.started),
+                note: &l.evidence.join("; "),
+                origin: &origin,
+            },
+        )?;
+    }
     for ((abs, op, strength), (n, ev, rel)) in agg.iter().take(400) {
-        let (ci, _) = matcher.locate(Path::new(abs)).unwrap_or((0, PathBuf::new()));
+        let (ci, _) = matcher.locate_any(Path::new(abs)).unwrap_or((0, PathBuf::new()));
         let co = matcher.checkouts[ci].clone();
         let fid = db::ensure_file_node(tx, abs, Some(&co.repo_id), Some(&co.id), &rel.to_string_lossy())?;
-        let kind = if *op == "mention" { "mentioned" } else { op };
+        let kind = match *op {
+            "mention" => "mentioned",
+            "search" => "searched",
+            "list" => "listed",
+            other => other,
+        };
         let note = format!("{}{}{}", ev.tool, if *n > 1 { format!(" x{n}") } else { String::new() }, if ev.locator.is_empty() { String::new() } else { format!(" @{}", ev.locator) });
         let src_path = s.source_path.split("#session=").next().unwrap_or(&s.source_path);
         db::add_edge(tx, &EdgeRow { src: &sid, dst: &fid, kind, strength, source_path: src_path, source_line: ev.line as i64, ts: ev.ts, note: &note, origin: &origin })?;
     }
     Ok(sid)
+}
+
+// ------------------------------------------------------------------ targeted ingest
+
+/// `workmap ingest`: refresh only the named transcripts and/or checkouts.
+#[derive(Default, Debug, Clone)]
+pub struct IngestOpts {
+    /// Transcript sources: a Claude Code `.jsonl` (incl. `subagents/agent-*.jsonl`),
+    /// a Codex `rollout-*.jsonl`, an OpenCode legacy `storage/session/**.json`, or
+    /// `<opencode.db>#session=<id>`.
+    pub transcripts: Vec<PathBuf>,
+    /// Checkout directories to re-index (docs, entry points, recent commits).
+    pub checkouts: Vec<PathBuf>,
+}
+
+#[derive(Default, Debug)]
+pub struct IngestStats {
+    pub ms: u128,
+    pub checkouts: usize,
+    /// One line per requested source: `<outcome> <provider> <key>`.
+    pub lines: Vec<String>,
+    pub stats: Stats,
+}
+
+/// Same spelling of a source path as the scan walk produces (`<provider dir>/<rest>`),
+/// so ingest and scan replace the same rows instead of creating twins.
+fn source_key(p: &Path, dirs: &[PathBuf]) -> PathBuf {
+    let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) };
+    let canon = std::fs::canonicalize(&abs).unwrap_or(abs.clone());
+    for d in dirs {
+        if let Ok(rest) = abs.strip_prefix(d) {
+            return d.join(rest);
+        }
+        if let Some(rest) = std::fs::canonicalize(d).ok().and_then(|cd| canon.strip_prefix(&cd).ok().map(Path::to_path_buf)) {
+            return d.join(rest);
+        }
+    }
+    canon
+}
+
+/// Refresh only the given sources/checkouts in ONE immediate transaction: no
+/// home walk, no pruning of anything else, no remote sync, no relation pass.
+/// Parsing and storing go through the same code as `scan` (`process_source` →
+/// `store_session`), so the rows are those a full scan would write. Readers
+/// (WAL) see either the previous or the new state of a conversation, never a mix.
+pub fn ingest(env: &Env, c: &mut Connection, o: &IngestOpts) -> Result<IngestStats, String> {
+    let t0 = Instant::now();
+    let mut out = IngestStats::default();
+    // A running scan holds the write lock for a while; a hook-spawned ingest waits.
+    c.busy_timeout(std::time::Duration::from_secs(120)).map_err(|e| e.to_string())?;
+    let opts = ScanOpts { full: true, ..Default::default() };
+    let e = |e: rusqlite::Error| e.to_string();
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(e)?;
+    let mut st = Stats::default();
+    let mut checkouts: Vec<Checkout> = Vec::new();
+    let mut indexes: HashMap<String, FileIndex> = HashMap::new();
+    if !o.checkouts.is_empty() {
+        let mut only: HashSet<PathBuf> = HashSet::new();
+        let mut cands: Vec<PathBuf> = Vec::new();
+        for d in &o.checkouts {
+            let (top, _) = git::probe_fast(d).or_else(|| git::probe(d)).ok_or_else(|| format!("{} is not a git checkout", d.display()))?;
+            only.insert(top.clone());
+            cands.push(top);
+        }
+        let (repos, wt_meta) = group_checkouts(cands.iter().map(|p| p.as_path()));
+        for (common, tops) in &repos {
+            index_repo(&tx, env, &opts, common, tops, Some(&only), &wt_meta, &mut st, &mut checkouts, &mut indexes).map_err(e)?;
+        }
+        out.checkouts = st.checkouts;
+        for top in &only {
+            out.lines.push(format!("indexed checkout {}", top.display()));
+        }
+    }
+    let known: HashSet<String> = checkouts.iter().map(|c| c.id.clone()).collect();
+    checkouts.extend(db_checkouts(&tx, &known).map_err(e)?);
+    let mut matcher = Matcher::new(checkouts);
+
+    let cdir = env.claude_projects();
+    let sdir = env.codex_home().join("sessions");
+    let odir = env.opencode_dir();
+    let mut codex_threads: Option<HashMap<String, (String, String, String)>> = None;
+    for raw in &o.transcripts {
+        let raw_s = raw.to_string_lossy().into_owned();
+        // OpenCode SQLite: one session of the database, `<db>#session=<id>`.
+        if let Some((db_part, ses)) = raw_s.split_once("#session=") {
+            let dbp = source_key(Path::new(db_part), std::slice::from_ref(&odir));
+            let rows = sessions::opencode_sessions(&dbp).map_err(|er| format!("{}: cannot read OpenCode database read-only: {er}", dbp.display()))?;
+            let row = rows.into_iter().find(|r| r.id == ses).ok_or_else(|| format!("{}: no OpenCode session {ses}", dbp.display()))?;
+            let key = format!("{}#session={}", dbp.display(), row.id);
+            let dir = row.directory.clone();
+            let updated = row.updated;
+            let r =
+                process_source(&tx, &key, "opencode", 0, updated, &mut matcher, &mut indexes, &mut st, &mut || Some(dir.clone()), &mut || sessions::parse_opencode_db(&dbp, &row, opts.max_parts).ok())
+                    .map_err(e)?;
+            out.lines.push(outcome_line(&r, "opencode", &key));
+            continue;
+        }
+        if raw.extension().map(|x| x == "db").unwrap_or(false) {
+            return Err(format!("{}: an OpenCode database holds many sessions; pass one as --transcript '{}#session=<id>' (or run `workmap scan`)", raw.display(), raw.display()));
+        }
+        let path = source_key(raw, &[cdir.clone(), sdir.clone(), odir.clone()]);
+        let Ok(m) = std::fs::metadata(&path) else {
+            out.lines.push(format!("missing {}", path.display()));
+            continue;
+        };
+        let key = path.to_string_lossy().into_owned();
+        let provider = if path.starts_with(&cdir) {
+            "claude"
+        } else if path.starts_with(&sdir) {
+            "codex"
+        } else if path.starts_with(odir.join("storage")) {
+            "opencode-legacy"
+        } else {
+            sniff_provider(&path).ok_or_else(|| format!("{}: not a Claude Code, Codex or OpenCode transcript", path.display()))?
+        };
+        let (size, mtime) = (m.len() as i64, mtime_unix(&m));
+        let r = match provider {
+            "claude" => process_source(&tx, &key, provider, size, mtime, &mut matcher, &mut indexes, &mut st, &mut || sessions::claude_head_cwd(&path), &mut || sessions::parse_claude(&path).ok()),
+            "codex" => {
+                let threads = codex_threads.get_or_insert_with(|| sessions::codex_thread_index(&env.codex_home()));
+                let known = threads.get(&key).cloned();
+                let k2 = known.clone();
+                process_source(&tx, &key, provider, size, mtime, &mut matcher, &mut indexes, &mut st, &mut || k2.as_ref().map(|t| t.0.clone()).or_else(|| sessions::codex_head_cwd(&path)), &mut || {
+                    let mut s = sessions::parse_codex(&path).ok()?;
+                    if let Some((_, title, _)) = &known {
+                        if !title.trim().is_empty() {
+                            s.title = Some(clip(&redact(title), 120));
+                        }
+                    }
+                    Some(s)
+                })
+            }
+            _ => {
+                let storage = odir.join("storage");
+                process_source(&tx, &key, provider, size, mtime, &mut matcher, &mut indexes, &mut st, &mut || sessions::legacy_opencode_info(&path).map(|x| x.1), &mut || {
+                    sessions::parse_opencode_legacy(&storage, &path, opts.max_parts)
+                })
+            }
+        }
+        .map_err(e)?;
+        out.lines.push(outcome_line(&r, provider, &key));
+    }
+    // Nodes only this ingest's replaced evidence pointed at.
+    tx.execute("DELETE FROM nodes WHERE kind IN ('file','commit') AND id NOT IN (SELECT dst FROM edges) AND id NOT IN (SELECT src FROM edges)", []).map_err(e)?;
+    tx.commit().map_err(e)?;
+    out.ms = t0.elapsed().as_millis();
+    out.stats = st;
+    Ok(out)
+}
+
+fn outcome_line(r: &Outcome, provider: &str, key: &str) -> String {
+    match r {
+        Outcome::Parsed(_) => format!("parsed {provider} {key}"),
+        Outcome::Reused => format!("unchanged {provider} {key}"),
+        Outcome::Kept => format!("kept {provider} {key} (cwd in no known checkout; earlier evidence left as is)"),
+        Outcome::Unrelated(cwd) => format!("unrelated {provider} {key} (cwd {} is in no indexed checkout)", cwd.as_deref().unwrap_or("unknown")),
+        Outcome::Error => format!("error {provider} {key} (could not be parsed)"),
+    }
+}
+
+/// Provider of a transcript outside the default stores, from its first record.
+fn sniff_provider(p: &Path) -> Option<&'static str> {
+    let head = crate::util::read_head(p, 256 << 10).ok()?;
+    let first = head.split(|b| *b == b'\n').find(|l| !l.iter().all(|b| b.is_ascii_whitespace()))?;
+    let v: serde_json::Value = serde_json::from_slice(first).ok()?;
+    if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
+        return Some("codex");
+    }
+    let txt = String::from_utf8_lossy(&head);
+    (txt.contains("\"sessionId\"") || v.get("type").and_then(|x| x.as_str()) == Some("summary")).then_some("claude")
 }

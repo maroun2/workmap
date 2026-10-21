@@ -25,7 +25,7 @@ pub fn probe(dir: &Path) -> Option<(PathBuf, PathBuf)> {
 }
 
 /// `.git` dir for a checkout: the directory itself, or the target of a `gitdir:` file.
-fn git_dir(dir: &Path) -> Option<PathBuf> {
+pub fn git_dir(dir: &Path) -> Option<PathBuf> {
     let dotgit = dir.join(".git");
     let md = std::fs::symlink_metadata(&dotgit).ok()?;
     if md.is_dir() {
@@ -45,6 +45,16 @@ pub fn probe_fast(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     };
     let top = std::fs::canonicalize(dir).ok()?;
     Some((top, std::fs::canonicalize(&common).unwrap_or(common)))
+}
+
+/// `(HEAD sha, branch)` of a checkout straight from git (for checkouts that
+/// `git worktree list` reports under another path, e.g. moved worktrees).
+pub fn head_info(dir: &Path) -> (String, Option<String>) {
+    let Some(out) = run_cmd(git(dir).args(["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"]), T) else { return (String::new(), None) };
+    let mut it = out.lines();
+    let sha = it.next().unwrap_or("").trim().to_string();
+    let branch = it.next().and_then(|b| b.trim().strip_prefix("refs/heads/")).map(str::to_string);
+    (sha, branch)
 }
 
 /// mtime of the checkout's index file (changes on commit, checkout, add, reset).

@@ -49,7 +49,9 @@ USAGE:
                                                        opt-in: index docs/manifests of remote-only repos from
                                                        temporary shallow clones (cached per commit)
   workmap ingest --transcript FILE... [--checkout DIR]... [--quiet]
-                                                       index only these sources now (no home walk, no pruning)
+                                                       index only these sources now (no home walk, no pruning,
+                                                       no remote sync); OpenCode: --transcript '<db>#session=<id>'.
+                                                       `install` adds a daily systemd user timer running a full scan
   workmap hook <event> --harness claude                read a host hook event (JSON) on stdin; print
                                                        bounded context or nothing
   workmap hooks status|install|uninstall [--harness claude]
@@ -261,8 +263,8 @@ fn run() -> Result<(), String> {
                     bytes
                 );
                 println!(
-                    "indexed: {} searchable messages, {} truncated/capped conversations, {} relation evidence rows, {} checkouts pruned",
-                    st.messages, st.sessions_truncated, st.relations, st.checkouts_pruned
+                    "indexed: {} searchable messages, {} truncated/capped conversations, {} relation evidence rows, {} checkouts pruned, {} missing (kept: conversations recorded there)",
+                    st.messages, st.sessions_truncated, st.relations, st.checkouts_pruned, st.checkouts_missing
                 );
                 for r in &st.remote {
                     println!("remote: {r}");
@@ -448,8 +450,17 @@ fn run() -> Result<(), String> {
             println!("last scan stats: {last}");
         }
         "ingest" => {
-            let _ = (&a.all("--transcript"), &a.all("--checkout"));
-            return Err("ingest: not implemented yet".into());
+            let o = scan::IngestOpts { transcripts: a.all("--transcript").iter().map(PathBuf::from).collect(), checkouts: a.all("--checkout").iter().map(PathBuf::from).collect() };
+            if o.transcripts.is_empty() && o.checkouts.is_empty() {
+                return Err("usage: workmap ingest --transcript FILE... [--checkout DIR]... [--quiet]".into());
+            }
+            let r = scan::ingest(&env, &mut c, &o)?;
+            if !a.has("--quiet") {
+                for l in &r.lines {
+                    println!("{l}");
+                }
+                println!("ingest: {} ms, {} source(s), {} checkout(s); nothing else was walked, pruned or synced (full refresh: workmap scan)", r.ms, o.transcripts.len(), r.checkouts);
+            }
         }
         "hook" => {
             let event = a.pos.get(1).ok_or("usage: workmap hook <event> --harness claude   (event JSON on stdin)")?;

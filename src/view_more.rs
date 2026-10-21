@@ -523,7 +523,9 @@ fn strength_score(kind: &str, strength: &str) -> i64 {
     match (kind, strength) {
         ("write", "observed") => 100,
         ("read", "observed") => 90,
+        ("read", "parsed") => 70,
         (_, "requested") => 45,
+        ("searched", _) | ("listed", _) => 5,
         ("mentioned", _) => 5,
         _ => 10,
     }
@@ -573,6 +575,8 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
             };
             let what = match kind.as_str() {
                 "mentioned" => format!("only named {relp} in a shell command"),
+                "searched" | "listed" => format!("{kind} {relp} via a shell command (parsed by Codex; not a read)"),
+                "read" if strength == "parsed" => format!("read {relp} via shell command (parsed by Codex, best effort)"),
                 _ => format!("{} {relp} ({strength}, {})", if kind == "write" { "wrote" } else { "read" }, note.split(" @").next().unwrap_or("")),
             };
             add_item(&mut items, strength_score(&kind, &strength), s.ts, r, format!("{what} at transcript l.{line}, {}", day(s.ts)), Some(format!("conversation \"{}\"", clip(&title, 70))));
