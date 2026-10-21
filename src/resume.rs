@@ -105,8 +105,18 @@ fn handle_of(c: &Connection, s: &Node) -> Option<String> {
 }
 
 /// Checkouts of the same project on the recorded branch that still exist.
+/// Branch the session worked on: the transcript's own field, else the branch of
+/// the checkout it was recorded in (snapshot kept even after the checkout is gone).
+fn recorded_branch(s: &Node) -> &str {
+    let b = meta(s, "branch");
+    if !b.is_empty() {
+        return b;
+    }
+    s.meta.pointer("/checkout/branch").and_then(|x| x.as_str()).unwrap_or("")
+}
+
 fn candidates(c: &Connection, s: &Node) -> Vec<Node> {
-    let (Some(repo), b) = (s.repo_id.as_deref(), meta(s, "branch")) else { return vec![] };
+    let (Some(repo), b) = (s.repo_id.as_deref(), recorded_branch(s)) else { return vec![] };
     let all = nodes(c, "kind='checkout' AND repo_id=?1 ORDER BY json_extract(meta,'$.main') DESC, path", &[&repo]).unwrap_or_default();
     all.into_iter().filter(|co| !b.is_empty() && meta(co, "branch") == b && co.path.as_deref().map(|p| Path::new(p).is_dir()).unwrap_or(false)).collect()
 }
@@ -175,7 +185,7 @@ fn missing_cwd(c: &Connection, s: &Node, recorded: &Path) -> String {
     for co in &cands {
         let _ = write!(m, "\n  workmap resume <same ref> --cwd {}   # existing worktree on the recorded branch {}", sh_quote(co.path.as_deref().unwrap_or("")), meta(co, "branch"));
     }
-    let b = meta(s, "branch");
+    let b = recorded_branch(s);
     match (main_checkout(c, s), b.is_empty()) {
         // The branch is checked out elsewhere, so `worktree add` would fail; move it back instead.
         (Some(main), false) if !cands.is_empty() && cands.iter().all(|co| co.path != main.path) => {
@@ -190,7 +200,7 @@ fn missing_cwd(c: &Connection, s: &Node, recorded: &Path) -> String {
         (Some(main), false) if cands.is_empty() => {
             let _ = write!(
                 m,
-                "\n  git -C {} worktree add {} {}   # recreate the worktree at the recorded path, then rerun",
+                "\n  git -C {0} worktree prune && git -C {0} worktree add {1} {2}   # recreate the worktree at the recorded path (prune drops the stale registration of the deleted one), then rerun",
                 sh_quote(main.path.as_deref().unwrap_or("")),
                 sh_quote(&recorded.display().to_string()),
                 sh_quote(b)
@@ -204,7 +214,7 @@ fn missing_cwd(c: &Connection, s: &Node, recorded: &Path) -> String {
 
 fn drift(c: &Connection, s: &Node, recorded: &Path, cwd: &Path, provider: &str) -> Vec<String> {
     let co = s.checkout_id.as_deref().and_then(|id| get_node(c, id).ok().flatten());
-    let rb = meta(s, "branch");
+    let rb = recorded_branch(s);
     let rh = co.as_ref().map(|co| meta(co, "head").to_string()).unwrap_or_default();
     let cb = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "(not a git checkout)".into());
     let ch = git_out(cwd, &["rev-parse", "--short=10", "HEAD"]).unwrap_or_default();

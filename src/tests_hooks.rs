@@ -418,6 +418,31 @@ fn resume_refuses_a_missing_cwd_with_choices_and_reports_drift_for_cwd() {
     assert!(resume::plan(&c, &s, Some(&fx.home.join("nope")), &h).unwrap_err().contains("--cwd"));
 }
 
+/// Review replay: a transcript without `gitBranch` whose worktree was `rm -rf`'d
+/// (still registered in git) must still get a working recreate hint, using the
+/// branch of the checkout it was recorded in.
+#[test]
+fn resume_hint_for_deleted_worktree_uses_recorded_checkout_branch() {
+    let fx = crate::testutil::ledger();
+    let wt = fx.home.join("work/ledger-api-old");
+    git(&fx.api, &["worktree", "add", "-q", "-b", "old/experiment", wt.to_str().unwrap()]);
+    let w = wt.display().to_string();
+    let t = fx.home.join(".claude/projects").join(crate::util::claude_project_dir_name(&w)).join("dddd4444-old.jsonl");
+    write(
+        &t,
+        &crate::testutil::jsonl(&[serde_json::json!({"type":"user","cwd":w,"sessionId":"dddd4444-old","timestamp":"2026-08-15T10:00:00Z","message":{"role":"user","content":"try advisory locks"}})]),
+    );
+    let env = Env::with_home(&fx.home);
+    let (_c, _) = scan_once(&env);
+    std::fs::remove_dir_all(&wt).unwrap();
+    let (c, _) = scan_once(&env);
+    let s = sid("claude", "dddd4444-old");
+    let h = |_: &str, _: &[&str]| Some("--resume".to_string());
+    let e = resume::plan(&c, &s, None, &h).unwrap_err();
+    let main = fx.api.display();
+    assert!(e.contains(&format!("git -C {main} worktree prune && git -C {main} worktree add {w} old/experiment")), "{e}");
+}
+
 #[test]
 fn resume_refuses_subagent_transcripts_and_runs_argv_without_a_shell() {
     let fx = fixture();
