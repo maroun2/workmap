@@ -126,6 +126,35 @@ pub fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// Split text into at most `max_chunks` pieces of about `max` chars, breaking
+/// at whitespace. Whitespace inside each piece is collapsed.
+pub fn chunks(text: &str, max: usize, max_chunks: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0usize;
+    for w in text.split_whitespace() {
+        let wl = w.chars().count();
+        if n > 0 && n + 1 + wl > max {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+            if out.len() >= max_chunks {
+                return out;
+            }
+        }
+        if n > 0 {
+            cur.push(' ');
+            n += 1;
+        }
+        let piece: String = w.chars().take(max).collect();
+        n += piece.chars().count();
+        cur.push_str(&piece);
+    }
+    if !cur.is_empty() && out.len() < max_chunks {
+        out.push(cur);
+    }
+    out
+}
+
 /// Replace secret-looking tokens before anything is stored or printed.
 pub fn redact(s: &str) -> String {
     let prefixes = ["sk-", "ghp_", "gho_", "ghs_", "github_pat_", "xoxb-", "xoxp-", "AKIA", "eyJ", "glpat-", "AIza"];
@@ -226,6 +255,40 @@ pub fn run_cmd(cmd: &mut Command, timeout: Duration) -> Option<String> {
     }
 }
 
+/// Like [`run_cmd`] but reports why it failed with a fixed message (never the
+/// command's stderr, which may echo credentials).
+pub fn run_status(cmd: &mut Command, timeout: Duration) -> Result<String, String> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "not installed".to_string()
+        } else {
+            "could not start".to_string()
+        }
+    })?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = (&mut stdout).take(64 << 20).read_to_end(&mut v);
+        v
+    });
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                let out = reader.join().map_err(|_| "output reader failed".to_string())?;
+                return if st.success() { Ok(String::from_utf8_lossy(&out).into_owned()) } else { Err(format!("exit code {}", st.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()))) };
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return Err("wait failed".into()),
+        }
+    }
+}
+
 /// POSIX shell quoting: bare when safe, otherwise single-quoted.
 pub fn sh_quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_=./:,+@#%".contains(c)) && !s.starts_with('#') {
@@ -258,9 +321,77 @@ pub fn claude_project_dir_name(path: &str) -> String {
     path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
+/// `(host, path segments)` of a Git remote or web URL: https, ssh://, git://,
+/// git+https, and scp-like `git@host:ns/repo.git`. Credentials, ports, `www.`
+/// and a trailing `.git` are dropped; host and segments are lowercased.
+pub fn url_parts(url: &str) -> Option<(String, Vec<String>)> {
+    let u = url.trim().trim_end_matches(['/', ')', '.', ',', '>', '"', '\'', '`']);
+    let u = u.strip_prefix("git+").unwrap_or(u);
+    let (host_part, path) = if let Some((scheme, rest)) = u.split_once("://") {
+        if !matches!(scheme, "http" | "https" | "ssh" | "git") {
+            return None;
+        }
+        let rest = rest.rsplit_once('@').filter(|(a, _)| !a.contains('/')).map(|x| x.1).unwrap_or(rest);
+        let (h, p) = rest.split_once('/')?;
+        (h.to_string(), p.to_string())
+    } else {
+        // scp-like: [user@]host:path (no scheme, colon before any slash)
+        let (left, path) = u.split_once(':')?;
+        if left.contains('/') || path.starts_with("//") || !left.contains('.') {
+            return None;
+        }
+        (left.rsplit_once('@').map(|x| x.1).unwrap_or(left).to_string(), path.to_string())
+    };
+    let host = host_part.split(':').next()?.trim_start_matches("www.").to_lowercase();
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| s.trim_end_matches(".git").to_lowercase()).collect();
+    if segs.len() < 2 {
+        return None;
+    }
+    Some((host, segs))
+}
+
+/// Normalized `host/namespace/repo` of a Git remote URL (all path segments).
+pub fn remote_identity(url: &str) -> Option<String> {
+    let (h, s) = url_parts(url)?;
+    Some(format!("{h}/{}", s.join("/")))
+}
+
+/// Possible repository identities inside a web URL (`…/ns/repo/tree/main/x`),
+/// longest first; GitLab's `/-/` separator ends the repository path.
+pub fn identity_candidates(url: &str) -> Vec<String> {
+    let Some((h, segs)) = url_parts(url) else { return vec![] };
+    let end = segs.iter().position(|s| s == "-").unwrap_or(segs.len()).min(8);
+    (2..=end).rev().map(|n| format!("{h}/{}", segs[..n].join("/"))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_identities_normalize_every_url_form() {
+        let want = Some("github.com/acme/tool".to_string());
+        for u in [
+            "https://github.com/Acme/tool.git",
+            "https://user:secret@github.com/acme/tool",
+            "git@github.com:acme/tool.git",
+            "ssh://git@github.com:22/acme/tool.git",
+            "git+https://github.com/acme/tool.git",
+            "https://www.github.com/acme/tool/",
+        ] {
+            assert_eq!(remote_identity(u), want, "{u}");
+        }
+        assert_eq!(remote_identity("git@gitlab.example.org:group/sub/proj.git").as_deref(), Some("gitlab.example.org/group/sub/proj"));
+        assert_eq!(identity_candidates("https://gitlab.com/g/sub/p/-/blob/main/x.md"), vec!["gitlab.com/g/sub/p", "gitlab.com/g/sub"]);
+        assert_eq!(identity_candidates("https://github.com/acme/tool/tree/main/src")[3], "github.com/acme/tool");
+        assert_eq!(remote_identity("../sibling.git"), None);
+        assert_eq!(remote_identity("C:/x/y"), None);
+        assert_eq!(remote_identity("/abs/path"), None);
+    }
 
     #[test]
     fn ids_are_stable_and_prefixed() {

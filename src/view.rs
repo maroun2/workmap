@@ -351,40 +351,16 @@ fn on_disk(n: &Node) -> bool {
 }
 
 /// Heading list `(line, level, text, slug)` read from the file (bounded), with GitHub duplicate suffixes.
-fn headings(path: &str) -> Vec<(usize, usize, String, String)> {
+pub(crate) fn headings(path: &str) -> Vec<(usize, usize, String, String)> {
     let Ok(bytes) = crate::util::read_head(Path::new(path), 256 << 10) else { return vec![] };
-    let text = String::from_utf8_lossy(&bytes);
-    let mut out = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut fence = false;
-    for (i, l) in text.lines().enumerate() {
-        let t = l.trim_start();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fence = !fence;
-            continue;
-        }
-        if fence || !t.starts_with('#') {
-            continue;
-        }
-        let level = t.chars().take_while(|c| *c == '#').count();
-        let h = t[level..].trim();
-        if level > 6 || h.is_empty() || !t[level..].starts_with(' ') {
-            continue;
-        }
-        let base = slug(h);
-        let n = seen.entry(base.clone()).or_insert(0);
-        let s = if *n == 0 { base.clone() } else { format!("{base}-{n}") };
-        *n += 1;
-        out.push((i + 1, level, h.to_string(), s));
-    }
-    out
+    crate::docs::sections(&String::from_utf8_lossy(&bytes)).into_iter().map(|s| (s.line, s.level, s.heading, s.slug)).collect()
 }
 
 fn section_of_line(hs: &[(usize, usize, String, String)], line: usize) -> Option<&(usize, usize, String, String)> {
     hs.iter().filter(|h| h.0 <= line).last()
 }
 
-fn line_text(path: &str, line: usize, max: usize) -> Option<String> {
+pub(crate) fn line_text(path: &str, line: usize, max: usize) -> Option<String> {
     let bytes = crate::util::read_head(Path::new(path), 256 << 10).ok()?;
     String::from_utf8_lossy(&bytes).lines().nth(line.checked_sub(1)?).map(|l| crate::util::redact(&clip(l.trim(), max)))
 }

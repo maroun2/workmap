@@ -163,6 +163,22 @@ pub fn ls_files(dir: &Path, cap: usize) -> Vec<String> {
     run_cmd(git(dir).args(["ls-files", "-z"]), T).map(|o| o.split('\0').filter(|s| !s.is_empty()).take(cap).map(str::to_string).collect()).unwrap_or_default()
 }
 
+/// Tracked entries with mode and blob id: `(mode, blob, repo-relative path)`, capped.
+pub fn ls_files_stage(dir: &Path, cap: usize) -> Vec<(String, String, String)> {
+    run_cmd(git(dir).args(["ls-files", "-s", "-z"]), T)
+        .map(|o| {
+            o.split('\0')
+                .filter_map(|rec| {
+                    let (meta, path) = rec.split_once('\t')?;
+                    let mut m = meta.split(' ');
+                    Some((m.next()?.to_string(), m.next()?.to_string(), path.to_string()))
+                })
+                .take(cap)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Count of modified tracked entries. Untracked files are not walked (slow on big trees).
 pub fn dirty_count(dir: &Path) -> Option<usize> {
     run_cmd(git(dir).args(["status", "--porcelain", "--untracked-files=no"]), T).map(|o| o.lines().count())

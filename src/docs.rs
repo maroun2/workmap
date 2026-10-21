@@ -131,6 +131,77 @@ pub fn analyze_markdown(text: &str, max_excerpts: usize, max_refs: usize) -> Doc
     info
 }
 
+/// A Markdown heading: line, level, text, and its GitHub-style anchor
+/// (repeated headings get `-1`, `-2`, …).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    pub line: usize,
+    pub level: usize,
+    pub heading: String,
+    pub slug: String,
+}
+
+/// Headings outside fenced code, with GitHub duplicate suffixes.
+pub fn sections(text: &str) -> Vec<Section> {
+    let mut out = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut fence = false;
+    for (i, l) in text.lines().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = !fence;
+            continue;
+        }
+        if fence || !t.starts_with('#') {
+            continue;
+        }
+        let level = t.chars().take_while(|c| *c == '#').count();
+        let h = t[level..].trim();
+        if level > 6 || h.is_empty() || !t[level..].starts_with(' ') {
+            continue;
+        }
+        let base = crate::util::slug(h);
+        let n = seen.entry(base.clone()).or_insert(0);
+        let slug = if *n == 0 { base.clone() } else { format!("{base}-{n}") };
+        *n += 1;
+        out.push(Section { line: i + 1, level, heading: h.to_string(), slug });
+    }
+    out
+}
+
+/// Link candidates pointing outside the document's repository: web/Git URLs
+/// (`doc_url`) and absolute, home-relative or parent-relative paths (`doc_path`).
+/// Returns `(line, raw token, kind)`; resolution happens in the relation pass.
+pub fn outside_links(text: &str, cap: usize) -> Vec<(usize, String, &'static str)> {
+    let mut v: Vec<(usize, String, &'static str)> = Vec::new();
+    let mut seen = HashSet::new();
+    for (i, line) in text.lines().enumerate() {
+        for tok in line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '`' | '"' | '\'' | '|')) {
+            let t = tok.trim_end_matches(['.', ',', ';', ':', '!', '*']).trim_start_matches('*');
+            let kind = if t.contains("://") || (t.starts_with("git@") && t.contains(':')) {
+                if crate::util::url_parts(t).is_none() {
+                    continue;
+                }
+                "doc_url"
+            } else if (t.starts_with('/') && !t.starts_with("//") && t[1..].contains('/')) || t.starts_with("~/") || t.starts_with("../") {
+                if t.len() > 300 || t.contains(['$', '*', '{', '=']) {
+                    continue;
+                }
+                "doc_path"
+            } else {
+                continue;
+            };
+            if seen.insert(t.to_string()) {
+                v.push((i + 1, t.to_string(), kind));
+            }
+            if v.len() >= cap {
+                return v;
+            }
+        }
+    }
+    v
+}
+
 /// Index of a checkout's tracked files for resolving doc tokens.
 pub struct FileIndex {
     pub files: HashSet<String>,
@@ -276,6 +347,15 @@ mod tests {
         assert!(raws.contains(&("main.py", 5, "Key Files")));
         assert!(!raws.iter().any(|r| r.0.contains("x.y")));
         assert_eq!(d.excerpts[0].line, 2);
+    }
+
+    #[test]
+    fn sections_and_outside_links() {
+        let md = "# A\n```\n# not a heading\n```\n## B\n## B\nsee https://github.com/acme/tool/tree/main and ../sibling/README.md, `/opt/shared/lib`\nlocal docs/x.md\n";
+        let s = sections(md);
+        assert_eq!(s.iter().map(|x| (x.line, x.slug.as_str())).collect::<Vec<_>>(), vec![(1, "a"), (5, "b"), (6, "b-1")]);
+        let l = outside_links(md, 10);
+        assert_eq!(l, vec![(7, "https://github.com/acme/tool/tree/main".into(), "doc_url"), (7, "../sibling/README.md".into(), "doc_path"), (7, "/opt/shared/lib".into(), "doc_path")]);
     }
 
     #[test]

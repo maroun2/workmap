@@ -14,6 +14,25 @@ use std::path::{Path, PathBuf};
 
 pub const LINE_CAP: usize = 16 << 20; // bigger lines are skipped and counted
 pub const FILE_CAP: u64 = 512 << 20; // stop reading a transcript after this many bytes
+/// Searchable natural-language text kept per message (longer messages are cut).
+pub const MSG_CHARS: usize = 4800;
+/// Messages and total text kept per conversation; beyond that `messages_capped`.
+pub const MAX_MSGS: usize = 5000;
+pub const MAX_MSG_BYTES: usize = 2 << 20;
+
+/// One natural-language message (user input or assistant reply). Tool calls,
+/// tool results, reasoning and harness-injected context are never included.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Msg {
+    /// Transcript line (JSONL) or 0 for database rows.
+    pub line: usize,
+    /// Ordinal among kept messages of this conversation (1-based).
+    pub seq: usize,
+    pub ts: Option<i64>,
+    /// user | assistant
+    pub speaker: &'static str,
+    pub text: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEvent {
@@ -45,6 +64,11 @@ pub struct Session {
     pub events: Vec<FileEvent>,
     pub warnings: usize,
     pub truncated: bool,
+    pub messages: Vec<Msg>,
+    pub msg_bytes: usize,
+    /// Message text beyond MAX_MSGS / MAX_MSG_BYTES was not kept.
+    pub messages_capped: bool,
+    seen_msgs: std::collections::HashSet<u64>,
 }
 
 impl Session {
@@ -69,6 +93,40 @@ impl Session {
             self.first_prompt = Some(p.clone());
         }
         self.last_prompt = Some(p);
+    }
+
+    /// Keep one natural-language message (bounded, redacted, deduplicated per speaker).
+    pub fn message(&mut self, ts: Option<i64>, speaker: &'static str, text: &str, line: usize) {
+        let t = text.trim();
+        if t.is_empty() || (speaker == "user" && is_injected(t)) {
+            return;
+        }
+        if !self.seen_msgs.insert(crate::util::fnv64(&format!("{speaker}\0{t}"))) {
+            return; // Codex records the same text as event and as response item
+        }
+        if self.messages.len() >= MAX_MSGS || self.msg_bytes >= MAX_MSG_BYTES {
+            self.messages_capped = true;
+            return;
+        }
+        let kept: String = t.chars().take(MSG_CHARS).collect();
+        let kept = redact(&kept);
+        self.msg_bytes += kept.len();
+        let seq = self.messages.len() + 1;
+        self.messages.push(Msg { line, seq, ts, speaker, text: kept });
+    }
+}
+
+/// Concatenated `text` of content blocks whose type is one of `types`.
+fn block_text(content: Option<&Value>, types: &[&str]) -> String {
+    match content {
+        Some(Value::String(t)) => t.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|x| x.as_str()).map(|t| types.contains(&t)).unwrap_or(false))
+            .filter_map(|b| b.get("text").and_then(|x| x.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -198,13 +256,18 @@ pub fn parse_claude(path: &Path) -> std::io::Result<Session> {
                 return;
             }
             match content {
-                Some(Value::String(t)) => sess.prompt(ts, t, line),
+                Some(Value::String(t)) => {
+                    sess.prompt(ts, t, line);
+                    sess.message(ts, "user", t, line);
+                }
                 Some(Value::Array(blocks)) => {
                     for b in blocks {
                         match b.get("type").and_then(|x| x.as_str()) {
                             Some("text") => {
                                 if v.get("toolUseResult").is_none() {
-                                    sess.prompt(ts, b.get("text").and_then(|x| x.as_str()).unwrap_or(""), line)
+                                    let t = b.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                                    sess.prompt(ts, t, line);
+                                    sess.message(ts, "user", t, line);
                                 }
                             }
                             Some("tool_result") => {
@@ -221,6 +284,8 @@ pub fn parse_claude(path: &Path) -> std::io::Result<Session> {
             }
             return;
         }
+        let said = block_text(content, &["text"]);
+        sess.message(ts, "assistant", &said, line);
         let Some(Value::Array(blocks)) = content else { return };
         for b in blocks {
             if b.get("type").and_then(|x| x.as_str()) != Some("tool_use") {
@@ -324,7 +389,21 @@ pub fn parse_codex(path: &Path) -> std::io::Result<Session> {
             }
             ("event_msg", "user_message") => {
                 sess.touch(ts);
-                sess.prompt(ts, p.get("message").and_then(|x| x.as_str()).unwrap_or(""), line);
+                let t = p.get("message").and_then(|x| x.as_str()).unwrap_or("");
+                sess.prompt(ts, t, line);
+                sess.message(ts, "user", t, line);
+            }
+            ("event_msg", "agent_message") => {
+                sess.touch(ts);
+                sess.message(ts, "assistant", p.get("message").and_then(|x| x.as_str()).unwrap_or(""), line);
+            }
+            ("response_item", "message") => {
+                // `developer` items and injected user context are not conversation.
+                match p.get("role").and_then(|x| x.as_str()) {
+                    Some("assistant") => sess.message(ts, "assistant", &block_text(p.get("content"), &["output_text", "text"]), line),
+                    Some("user") => sess.message(ts, "user", &block_text(p.get("content"), &["input_text", "text"]), line),
+                    _ => {}
+                }
             }
             ("event_msg", "patch_apply_end") => {
                 let ok = p.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -345,6 +424,19 @@ pub fn parse_codex(path: &Path) -> std::io::Result<Session> {
             ("event_msg", "item_completed") => {
                 // Newer rollouts: {item: {type: "FileChange", status, changes: {<abs path>: {...}}}}
                 let item = p.get("item").cloned().unwrap_or(Value::Null);
+                match item.get("type").and_then(|x| x.as_str()) {
+                    Some("UserMessage") => {
+                        sess.touch(ts);
+                        let t = block_text(item.get("content"), &["text", "input_text"]);
+                        sess.prompt(ts, &t, line);
+                        sess.message(ts, "user", &t, line);
+                    }
+                    Some("AgentMessage") => {
+                        sess.touch(ts);
+                        sess.message(ts, "assistant", &block_text(item.get("content"), &["text", "output_text"]), line);
+                    }
+                    _ => {}
+                }
                 if item.get("type").and_then(|x| x.as_str()) == Some("FileChange") {
                     let strength = match item.get("status").and_then(|x| x.as_str()) {
                         Some("completed") => "observed",
@@ -528,8 +620,13 @@ pub fn parse_opencode_db(db: &Path, row: &OcSessionRow, max_parts: usize) -> rus
             sess.warnings += 1;
             continue;
         };
-        if role.as_deref() == Some("user") && v.get("type").and_then(|x| x.as_str()) == Some("text") && v.get("synthetic").and_then(|x| x.as_bool()) != Some(true) {
-            sess.prompt(ts, v.get("text").and_then(|x| x.as_str()).unwrap_or(""), 0);
+        let is_text = v.get("type").and_then(|x| x.as_str()) == Some("text") && v.get("synthetic").and_then(|x| x.as_bool()) != Some(true);
+        if role.as_deref() == Some("user") && is_text {
+            let t = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            sess.prompt(ts, t, 0);
+            sess.message(ts, "user", t, 0);
+        } else if role.as_deref() == Some("assistant") && is_text {
+            sess.message(ts, "assistant", v.get("text").and_then(|x| x.as_str()).unwrap_or(""), 0);
         } else {
             opencode_part(&mut sess, &v, ts, &pid);
         }
@@ -606,8 +703,13 @@ pub fn parse_opencode_legacy(storage: &Path, info_path: &Path, max_parts: usize)
                 continue;
             };
             let loc = part.display().to_string();
-            if role == "user" && v.get("type").and_then(|x| x.as_str()) == Some("text") {
-                sess.prompt(mts, v.get("text").and_then(|x| x.as_str()).unwrap_or(""), 0);
+            let is_text = v.get("type").and_then(|x| x.as_str()) == Some("text") && v.get("synthetic").and_then(|x| x.as_bool()) != Some(true);
+            if role == "user" && is_text {
+                let t = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                sess.prompt(mts, t, 0);
+                sess.message(mts, "user", t, 0);
+            } else if role == "assistant" && is_text {
+                sess.message(mts, "assistant", v.get("text").and_then(|x| x.as_str()).unwrap_or(""), 0);
             } else {
                 opencode_part(&mut sess, &v, mts, &loc);
             }

@@ -5,7 +5,7 @@ use crate::db::{self, EdgeRow, NodeRow};
 use crate::docs::{self, FileIndex};
 use crate::sessions::{self, Session};
 use crate::util::{clip, mtime_unix, now_unix, redact, stable_id};
-use crate::{discover, git};
+use crate::{discover, git, relations};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,11 +24,13 @@ pub struct ScanOpts {
     pub full: bool,
     /// Parse agent conversation stores (off: refresh repos/docs/history only).
     pub sessions: bool,
+    /// Remote catalog refresh through authenticated gh/glab.
+    pub remote: crate::remote::Mode,
 }
 
 impl Default for ScanOpts {
     fn default() -> Self {
-        ScanOpts { roots: vec![], include_home: true, max_dirs: 300_000, max_depth: 12, commits: 30, max_parts: 20_000, verbose: false, full: false, sessions: true }
+        ScanOpts { roots: vec![], include_home: true, max_dirs: 300_000, max_depth: 12, commits: 30, max_parts: 20_000, verbose: false, full: false, sessions: true, remote: crate::remote::Mode::Off }
     }
 }
 
@@ -46,6 +48,11 @@ pub struct Stats {
     pub parse_warnings: usize,
     pub dirs_visited: usize,
     pub ms: u128,
+    pub checkouts_pruned: usize,
+    pub messages: usize,
+    pub sessions_truncated: usize,
+    pub relations: usize,
+    pub remote: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -203,6 +210,30 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
             "branches": branches.iter().map(|b| json!({"name": b.0, "ts": b.1, "sha": &b.2[..b.2.len().min(10)]})).collect::<Vec<_>>(), "checkouts": tops.len()});
         let repo_ts = branches.iter().map(|b| b.1).max();
         db::upsert_node(&tx, &NodeRow { id: &repo_id, kind: "repo", label: &label, path: Some(&common.to_string_lossy()), repo_id: Some(&repo_id), checkout_id: None, ts: repo_ts, meta: &repo_meta })?;
+        // Project-level searchable text: name, remotes, main checkout path.
+        let porigin = format!("repo:{repo_id}");
+        db::clear_origin(&tx, &porigin)?;
+        let ids: Vec<String> = remotes.iter().filter_map(|r| crate::util::remote_identity(&r.1)).collect();
+        let ptext = format!("{label} {} {} {}", ids.join(" "), remotes.iter().map(|r| r.1.as_str()).collect::<Vec<_>>().join(" "), main_top.display());
+        db::add_passage(
+            &tx,
+            &db::Passage {
+                kind: "project",
+                node_id: &repo_id,
+                repo_id: Some(&repo_id),
+                checkout_id: None,
+                source_path: &main_top.to_string_lossy(),
+                line: 0,
+                loc: "",
+                part: 0,
+                speaker: "",
+                ts: repo_ts,
+                title: &label,
+                heading: "",
+                text: &ptext,
+                origin: &porigin,
+            },
+        )?;
         st.repos += 1;
         for (top, reported) in tops {
             let co_id = stable_id("checkout", &top.to_string_lossy());
@@ -238,13 +269,17 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
             )?;
             db::add_edge(&tx, &EdgeRow { src: &co_id, dst: &repo_id, kind: "worktree_of", strength: "structural", source_path: "", source_line: 0, ts: None, note: "", origin: &co_id })?;
 
-            let idx = FileIndex::new(git::ls_files(top, 50_000));
+            let staged = git::ls_files_stage(top, 50_000);
+            let idx = FileIndex::new(staged.iter().map(|x| x.2.clone()).collect());
             // A failed/timed-out git call must not be cached as "no history": warn and retry next scan.
             let git_ok = head.is_empty() || (!log.is_empty() && !idx.files.is_empty());
             if !git_ok {
                 st.warnings.push(format!("git log/ls-files returned nothing for {} (timeout or error); will retry next scan", top.display()));
             }
-            index_docs(&tx, env, top, reported.as_deref(), &repo_id, &co_id, &idx, &mut st)?;
+            index_docs(&tx, env, top, reported.as_deref(), &repo_id, &co_id, &idx, is_main, &mut st)?;
+            if is_main {
+                relations::extract_checkout(&tx, top, &repo_id, &co_id, &staged)?;
+            }
             for ep in docs::entry_points(top, &idx) {
                 let abs = top.join(&ep.rel).to_string_lossy().into_owned();
                 let fid = db::ensure_file_node(&tx, &abs, Some(&repo_id), Some(&co_id), &ep.rel)?;
@@ -260,6 +295,27 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
                 let meta = json!({"sha": cm.sha, "author": cm.author, "files": cm.files.len()});
                 db::upsert_node(&tx, &NodeRow { id: &cid, kind: "commit", label: &label, path: None, repo_id: Some(&repo_id), checkout_id: None, ts: Some(cm.ts), meta: &meta })?;
                 db::add_edge(&tx, &EdgeRow { src: &co_id, dst: &cid, kind: "history", strength: "structural", source_path: "", source_line: 0, ts: Some(cm.ts), note: "", origin: &co_id })?;
+                let files: Vec<&str> = cm.files.iter().take(20).map(|f| f.1.as_str()).collect();
+                let ctext = format!("{} {} {}", redact(&clip(&cm.subject, 300)), cm.author, files.join(" "));
+                db::add_passage(
+                    &tx,
+                    &db::Passage {
+                        kind: "commit",
+                        node_id: &cid,
+                        repo_id: Some(&repo_id),
+                        checkout_id: Some(&co_id),
+                        source_path: "",
+                        line: 0,
+                        loc: &cm.sha,
+                        part: 0,
+                        speaker: &cm.author,
+                        ts: Some(cm.ts),
+                        title: &label,
+                        heading: "",
+                        text: &ctext,
+                        origin: &co_id,
+                    },
+                )?;
                 for (status, rel) in &cm.files {
                     let abs = top.join(rel).to_string_lossy().into_owned();
                     let fid = db::ensure_file_node(&tx, &abs, Some(&repo_id), Some(&co_id), rel)?;
@@ -288,12 +344,38 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
         index_sessions(tx, env, &mut matcher, &mut indexes, opts, &mut st)?;
     }
 
-    // Drop file/commit nodes no edge points at any more.
+    // Checkouts indexed earlier whose directory is gone: drop them and what they produced.
+    let live: HashSet<String> = matcher.checkouts.iter().map(|c| c.id.clone()).collect();
+    for co in crate::overview::nodes(tx, "kind='checkout'", &[])? {
+        if live.contains(&co.id) || co.path.as_deref().map(|p| Path::new(p).exists()).unwrap_or(false) {
+            continue;
+        }
+        db::clear_origin(tx, &co.id)?;
+        tx.execute("DELETE FROM nodes WHERE id=?1 OR (kind IN ('doc','memory') AND checkout_id=?1)", [&co.id])?;
+        tx.execute("UPDATE nodes SET checkout_id=NULL WHERE kind='session' AND checkout_id=?1", [&co.id])?;
+        st.checkouts_pruned += 1;
+        st.warnings.push(format!("pruned checkout no longer on disk: {}", co.path.unwrap_or_default()));
+    }
+    tx.execute("DELETE FROM nodes WHERE kind='repo' AND id NOT IN (SELECT repo_id FROM nodes WHERE kind='checkout' AND repo_id IS NOT NULL)", [])?;
+
+    // Remote catalog (metadata only) before relations, so doc/manifest URLs can point at it.
+    crate::remote::sync(env, tx, opts.remote, &mut st)?;
+    st.relations = relations::resolve(tx, &mut matcher)?;
+
+    // Drop file/commit nodes no edge points at any more, then text whose node is gone.
     tx.execute("DELETE FROM nodes WHERE kind IN ('file','commit') AND id NOT IN (SELECT dst FROM edges) AND id NOT IN (SELECT src FROM edges)", [])?;
+    tx.execute("DELETE FROM passages WHERE node_id NOT IN (SELECT id FROM nodes)", [])?;
+    tx.execute("DELETE FROM raw_links WHERE checkout_id NOT IN (SELECT id FROM nodes)", [])?;
+    tx.execute("DELETE FROM file_hashes WHERE checkout_id NOT IN (SELECT id FROM nodes)", [])?;
+    st.messages = tx.query_row("SELECT count(DISTINCT node_id || ' ' || loc) FROM passages WHERE kind='message'", [], |r| r.get::<_, i64>(0))? as usize;
+    st.sessions_truncated =
+        tx.query_row("SELECT count(*) FROM nodes WHERE kind='session' AND (json_extract(meta,'$.truncated') OR json_extract(meta,'$.messages_capped'))", [], |r| r.get::<_, i64>(0))? as usize;
     st.ms = t0.elapsed().as_millis();
     let stats = json!({"ms": st.ms, "checkouts": st.checkouts, "repos": st.repos, "docs": st.docs, "sessions_parsed": st.sessions_parsed,
         "sessions_reused": st.sessions_reused, "sources_unrelated": st.sources_unrelated, "sources_missing": st.sources_missing,
-        "parse_warnings": st.parse_warnings, "dirs_visited": st.dirs_visited, "warnings": st.warnings});
+        "parse_warnings": st.parse_warnings, "dirs_visited": st.dirs_visited, "warnings": st.warnings, "commits_per_worktree": opts.commits,
+        "checkouts_pruned": st.checkouts_pruned, "messages": st.messages, "sessions_truncated": st.sessions_truncated, "relations": st.relations,
+        "remote": st.remote, "sessions_indexed": opts.sessions});
     tx.execute("UPDATE scans SET finished=?1, stats=?2 WHERE id=?3", params![now_unix(), stats.to_string(), scan_id])?;
     tx.execute_batch("COMMIT")?;
     Ok(st)
@@ -309,7 +391,19 @@ fn checkout_signature(tx: &Connection, co_id: &str, top: &Path, head: &str) -> r
     Ok(format!("v2|{head}|{}|{}|{docs}|{root_docs}", git::index_mtime(top), paths.len()))
 }
 
-fn index_doc_file(tx: &Connection, kind: &str, abs: &Path, label: &str, doc_dir_rel: &str, top: &Path, repo_id: &str, co_id: &str, idx: &FileIndex) -> rusqlite::Result<bool> {
+fn index_doc_file(
+    tx: &Connection,
+    env: &Env,
+    kind: &str,
+    abs: &Path,
+    label: &str,
+    doc_dir_rel: &str,
+    top: &Path,
+    repo_id: &str,
+    co_id: &str,
+    idx: &FileIndex,
+    is_main: bool,
+) -> rusqlite::Result<bool> {
     let Ok(bytes) = crate::util::read_head(abs, 256 << 10) else { return Ok(false) };
     let text = String::from_utf8_lossy(&bytes);
     let info = docs::analyze_markdown(&text, 40, 300);
@@ -326,6 +420,10 @@ fn index_doc_file(tx: &Connection, kind: &str, abs: &Path, label: &str, doc_dir_
         tx,
         &EdgeRow { src: co_id, dst: &id, kind: if kind == "memory" { "memory" } else { "doc" }, strength: "structural", source_path: "", source_line: 0, ts: mtime, note: "", origin: co_id },
     )?;
+    doc_passages(tx, &text, &id, label, &abs_s, repo_id, co_id, mtime)?;
+    if is_main && kind == "doc" {
+        relations::extract_doc_links(tx, &env.home, abs, &text, top, repo_id, co_id)?;
+    }
     for r in &info.refs {
         let Some((rel, how)) = idx.resolve(doc_dir_rel, &r.raw) else { continue };
         let tabs = top.join(&rel).to_string_lossy().into_owned();
@@ -347,7 +445,7 @@ fn index_doc_file(tx: &Connection, kind: &str, abs: &Path, label: &str, doc_dir_
 }
 
 #[allow(clippy::too_many_arguments)]
-fn index_docs(tx: &Connection, env: &Env, top: &Path, reported: Option<&Path>, repo_id: &str, co_id: &str, idx: &FileIndex, st: &mut Stats) -> rusqlite::Result<()> {
+fn index_docs(tx: &Connection, env: &Env, top: &Path, reported: Option<&Path>, repo_id: &str, co_id: &str, idx: &FileIndex, is_main: bool, st: &mut Stats) -> rusqlite::Result<()> {
     let mut docs: Vec<String> = idx
         .files
         .iter()
@@ -371,7 +469,7 @@ fn index_docs(tx: &Connection, env: &Env, top: &Path, reported: Option<&Path>, r
     docs.truncate(25);
     for rel in &docs {
         let dir = Path::new(rel).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        if index_doc_file(tx, "doc", &top.join(rel), rel, &dir, top, repo_id, co_id, idx)? {
+        if index_doc_file(tx, env, "doc", &top.join(rel), rel, &dir, top, repo_id, co_id, idx, is_main)? {
             st.docs += 1;
         }
     }
@@ -388,9 +486,54 @@ fn index_docs(tx: &Connection, env: &Env, top: &Path, reported: Option<&Path>, r
         files.sort();
         for f in files.into_iter().take(30) {
             let label = format!("claude-memory/{}", f.file_name().unwrap().to_string_lossy());
-            if index_doc_file(tx, "memory", &f, &label, "", top, repo_id, co_id, idx)? {
+            if index_doc_file(tx, env, "memory", &f, &label, "", top, repo_id, co_id, idx, false)? {
                 st.docs += 1;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Searchable doc sections: heading + body, chunked and capped per document.
+fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, abs: &str, repo_id: &str, co_id: &str, mtime: Option<i64>) -> rusqlite::Result<()> {
+    let secs = docs::sections(text);
+    let lines: Vec<&str> = text.lines().collect();
+    // (start line, heading, slug, end line exclusive); text before the first heading is its own part.
+    let mut parts: Vec<(usize, String, String, usize)> = Vec::new();
+    let first = secs.first().map(|s| s.line).unwrap_or(lines.len() + 1);
+    if first > 1 {
+        parts.push((1, String::new(), String::new(), first));
+    }
+    for (i, s) in secs.iter().enumerate() {
+        parts.push((s.line, s.heading.clone(), s.slug.clone(), secs.get(i + 1).map(|n| n.line).unwrap_or(lines.len() + 1)));
+    }
+    let mut n = 0;
+    for (start, heading, slug, end) in parts {
+        let body = lines[start.saturating_sub(1)..(end - 1).min(lines.len())].join("\n");
+        for (k, chunk) in crate::util::chunks(&body, 1500, 3).into_iter().enumerate() {
+            if n >= 80 {
+                return Ok(());
+            }
+            n += 1;
+            db::add_passage(
+                tx,
+                &db::Passage {
+                    kind: "doc",
+                    node_id: id,
+                    repo_id: Some(repo_id),
+                    checkout_id: Some(co_id),
+                    source_path: abs,
+                    line: start as i64,
+                    loc: &slug,
+                    part: k as i64,
+                    speaker: "",
+                    ts: mtime,
+                    title: label,
+                    heading: &heading,
+                    text: &redact(&chunk),
+                    origin: co_id,
+                },
+            )?;
         }
     }
     Ok(())
@@ -610,6 +753,7 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
         "first_prompt": s.first_prompt.as_ref().map(|p| json!({"ts": p.0, "text": p.1, "line": p.2})),
         "last_prompt": s.last_prompt.as_ref().map(|p| json!({"ts": p.0, "text": p.1, "line": p.2})),
         "started": s.started, "updated": s.updated, "warnings": s.warnings, "truncated": s.truncated, "files": counts,
+        "messages": s.messages.len(), "messages_capped": s.messages_capped,
     });
     db::upsert_node(
         tx,
@@ -624,6 +768,32 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
             meta: &meta,
         },
     )?;
+    let title = clip(&redact(&label), 120);
+    let src_file = s.source_path.split("#session=").next().unwrap_or(&s.source_path);
+    for m in &s.messages {
+        let loc = if m.line > 0 { format!("l{}", m.line) } else { format!("p{}", m.seq) };
+        for (k, chunk) in crate::util::chunks(&m.text, 1200, 4).into_iter().enumerate() {
+            db::add_passage(
+                tx,
+                &db::Passage {
+                    kind: "message",
+                    node_id: &sid,
+                    repo_id: repo_id.as_deref(),
+                    checkout_id: co_id.as_deref(),
+                    source_path: src_file,
+                    line: m.line as i64,
+                    loc: &loc,
+                    part: k as i64,
+                    speaker: m.speaker,
+                    ts: m.ts,
+                    title: &title,
+                    heading: s.provider,
+                    text: &chunk,
+                    origin: &origin,
+                },
+            )?;
+        }
+    }
     if let Some(co) = &co_id {
         db::add_edge(tx, &EdgeRow { src: &sid, dst: co, kind: "ran_in", strength: "inferred", source_path: &s.source_path, source_line: 0, ts: Some(s.started), note: "cwd", origin: &origin })?;
     }

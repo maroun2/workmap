@@ -14,6 +14,14 @@ pub struct Env {
     pub state_dir: PathBuf,
     /// Explicit provider store locations (`WORKMAP_CLAUDE_DIR` etc.), captured once.
     pub provider_dirs: Vec<(&'static str, PathBuf)>,
+    /// `gh` / `glab` executables for remote discovery (`WORKMAP_GH_BIN`, `WORKMAP_GLAB_BIN`).
+    pub gh_bin: PathBuf,
+    pub glab_bin: PathBuf,
+    /// Config dirs the CLIs are told to use; derived from home under `WORKMAP_HOME`.
+    pub gh_config: PathBuf,
+    pub glab_config: PathBuf,
+    /// Hosts with a token in the environment (presence only; values never read).
+    pub env_token_hosts: Vec<(&'static str, String)>,
 }
 
 pub const PROVIDER_VARS: &[&str] = &["WORKMAP_CLAUDE_DIR", "WORKMAP_CODEX_DIR", "WORKMAP_OPENCODE_DIR"];
@@ -26,12 +34,53 @@ impl Env {
         };
         let state_dir = std::env::var_os("WORKMAP_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".local/state/workmap"));
         let provider_dirs = PROVIDER_VARS.iter().filter_map(|k| std::env::var_os(k).map(|v| (*k, PathBuf::from(v)))).collect();
-        Env { home, overridden, state_dir, provider_dirs }
+        let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+        let config = match (overridden, var("XDG_CONFIG_HOME")) {
+            (false, Some(x)) => PathBuf::from(x),
+            _ => home.join(".config"),
+        };
+        let gh_config = var("GH_CONFIG_DIR").filter(|_| !overridden).map(PathBuf::from).unwrap_or_else(|| config.join("gh"));
+        let glab_config = var("GLAB_CONFIG_DIR").filter(|_| !overridden).map(PathBuf::from).unwrap_or_else(|| config.join("glab-cli"));
+        let mut env_token_hosts = Vec::new();
+        if !overridden {
+            let host = |k: &str, d: &str| std::env::var(k).ok().filter(|h| !h.is_empty()).unwrap_or_else(|| d.to_string());
+            if var("GH_TOKEN").or_else(|| var("GITHUB_TOKEN")).is_some() {
+                env_token_hosts.push(("gh", "github.com".to_string()));
+            }
+            if var("GH_ENTERPRISE_TOKEN").or_else(|| var("GITHUB_ENTERPRISE_TOKEN")).is_some() && var("GH_HOST").is_some() {
+                env_token_hosts.push(("gh", host("GH_HOST", "github.com")));
+            }
+            if var("GITLAB_TOKEN").or_else(|| var("GITLAB_ACCESS_TOKEN")).is_some() {
+                env_token_hosts.push(("glab", host("GITLAB_HOST", "gitlab.com")));
+            }
+        }
+        Env {
+            home,
+            overridden,
+            state_dir,
+            provider_dirs,
+            gh_bin: var("WORKMAP_GH_BIN").map(PathBuf::from).unwrap_or_else(|| "gh".into()),
+            glab_bin: var("WORKMAP_GLAB_BIN").map(PathBuf::from).unwrap_or_else(|| "glab".into()),
+            gh_config,
+            glab_config,
+            env_token_hosts,
+        }
     }
 
     #[cfg(test)]
     pub fn with_home(home: &Path) -> Env {
-        Env { home: home.to_path_buf(), overridden: true, state_dir: home.join(".local/state/workmap"), provider_dirs: vec![] }
+        Env {
+            home: home.to_path_buf(),
+            overridden: true,
+            state_dir: home.join(".local/state/workmap"),
+            provider_dirs: vec![],
+            // Tests never reach a real CLI unless they install a fake one here.
+            gh_bin: home.join("no-such-gh"),
+            glab_bin: home.join("no-such-glab"),
+            gh_config: home.join(".config/gh"),
+            glab_config: home.join(".config/glab-cli"),
+            env_token_hosts: vec![],
+        }
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -67,6 +116,11 @@ impl Env {
         }
         for (k, p) in &self.provider_dirs {
             v.push((k.to_string(), p.display().to_string()));
+        }
+        for (k, p) in [("WORKMAP_GH_BIN", &self.gh_bin), ("WORKMAP_GLAB_BIN", &self.glab_bin)] {
+            if std::env::var_os(k).is_some() {
+                v.push((k.to_string(), p.display().to_string()));
+            }
         }
         v
     }

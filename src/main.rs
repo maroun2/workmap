@@ -8,6 +8,8 @@ mod docs;
 mod git;
 mod install;
 mod overview;
+mod relations;
+mod remote;
 mod scan;
 mod sessions;
 #[cfg(test)]
