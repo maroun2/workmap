@@ -85,6 +85,19 @@ CREATE TRIGGER IF NOT EXISTS passages_au AFTER UPDATE ON passages BEGIN
   INSERT INTO passages_fts(passages_fts, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
   INSERT INTO passages_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
 END;
+-- Same passages under the porter stemmer: the `[stem]` search tier
+-- (charges/charged/charging). Rebuilt from `passages` on open when empty.
+CREATE VIRTUAL TABLE IF NOT EXISTS passages_stem USING fts5(title, text, content='passages', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS passages_stem_ai AFTER INSERT ON passages BEGIN
+  INSERT INTO passages_stem(rowid, title, text) VALUES (new.id, new.title, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS passages_stem_ad AFTER DELETE ON passages BEGIN
+  INSERT INTO passages_stem(passages_stem, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS passages_stem_au AFTER UPDATE ON passages BEGIN
+  INSERT INTO passages_stem(passages_stem, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
+  INSERT INTO passages_stem(rowid, title, text) VALUES (new.id, new.title, new.text);
+END;
 -- Raw cross-project link candidates found while indexing a checkout; resolved
 -- against the full project set by the relation pass on every scan.
 CREATE TABLE IF NOT EXISTS raw_links (
@@ -177,7 +190,21 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         c.execute_batch(&format!("PRAGMA user_version={PARSER_VERSION};"))?;
     }
     repair_trailing_slash_files(&c)?;
+    ensure_stem_index(&c)?;
     Ok(c)
+}
+
+/// Indexes written before the stemmed table existed have passages but no stem
+/// rows: fill it once from `passages` (one atomic FTS5 'rebuild' statement).
+/// The shadow `_docsize` table holds one row per indexed passage; counting the
+/// FTS table itself would read the external content table instead.
+fn ensure_stem_index(c: &Connection) -> rusqlite::Result<()> {
+    let indexed: i64 = c.query_row("SELECT count(*) FROM passages_stem_docsize", [], |r| r.get(0))?;
+    let rows: i64 = c.query_row("SELECT count(*) FROM passages", [], |r| r.get(0))?;
+    if indexed != rows {
+        c.execute("INSERT INTO passages_stem(passages_stem) VALUES('rebuild')", [])?;
+    }
+    Ok(())
 }
 
 /// Earlier builds could store session file paths with a trailing '/' (path alias
@@ -352,5 +379,40 @@ mod tests {
         assert_eq!(n(&c), 1);
         super::clear_origin(&c, "o").unwrap();
         assert_eq!(n(&c), 0, "deleted passages leave the FTS index");
+    }
+
+    #[test]
+    fn stem_index_follows_passages_and_is_rebuilt_for_old_indexes() {
+        let t = crate::testutil::TempDir::new("stem");
+        let path = t.path().join("i.db");
+        let c = super::open(&path).unwrap();
+        let p = super::Passage {
+            kind: "doc",
+            node_id: "n",
+            repo_id: None,
+            checkout_id: None,
+            source_path: "",
+            line: 1,
+            loc: "",
+            part: 0,
+            speaker: "",
+            ts: None,
+            title: "T",
+            heading: "",
+            text: "customers were charged twice",
+            origin: "o",
+        };
+        super::add_passage(&c, &p).unwrap();
+        let n = |c: &rusqlite::Connection| c.query_row("SELECT count(*) FROM passages_stem WHERE passages_stem MATCH 'charging'", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n(&c), 1, "porter: charging ~ charged");
+        // An index from before the stem table: passages present, stem table missing.
+        c.execute_batch("DROP TRIGGER passages_stem_ai; DROP TRIGGER passages_stem_ad; DROP TRIGGER passages_stem_au; DROP TABLE passages_stem;").unwrap();
+        drop(c);
+        let c = super::open(&path).unwrap();
+        assert_eq!(n(&c), 1, "stem table rebuilt from passages on open");
+        super::clear_origin(&c, "o").unwrap();
+        assert_eq!(n(&c), 0, "deleted passages leave the stem index");
+        let docs: i64 = c.query_row("SELECT count(*) FROM passages_stem_docsize", [], |r| r.get(0)).unwrap();
+        assert_eq!(docs, 0);
     }
 }

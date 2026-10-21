@@ -119,6 +119,12 @@ fn hit_ref(cache: &mut RefCache, scope: Option<&Project>, h: &Hit) -> (String, S
             let rest = format!("message:{}:{}", session_prefix(&all, s), h.loc);
             (scoped_ref(scope, &p, None, &rest), format!("{} {} message · {} · conversation \"{}\"{missing}", meta(s, "provider"), h.speaker, fmt_ts(h.ts), clip(&s.label, 50)))
         }
+        "file" => {
+            let top = co.as_ref().and_then(|c| c.path.clone()).unwrap_or_default();
+            let relp = rel(&h.source_path, &top).to_string();
+            let relp = if relp.is_empty() { h.title.clone() } else { relp };
+            (scoped_ref(scope, &p, co.as_ref(), &relp), format!("file {relp} (path contains the query; not its content)"))
+        }
         k => (h.node_id.clone(), k.to_string()),
     }
 }
@@ -131,43 +137,393 @@ pub struct SearchReq {
     pub this_worktree: bool,
 }
 
+/// How `search` was invoked, so printed follow-up commands reproduce it.
+#[derive(Default, Clone, Debug)]
+pub struct SearchOpts {
+    /// `--explain`: per-tier queries and counts, and why hits are not shown.
+    pub explain: bool,
+    /// The scope came from `WORKMAP_PROJECT`: widening needs `--project ''`.
+    pub env_project: bool,
+    /// `WORKMAP_WORKTREE` is set: scoped commands name the worktree explicitly.
+    pub env_worktree: bool,
+}
+
+#[allow(dead_code)] // tests and other views; the CLI uses search_view_opts
 pub fn search_view(v: &View, req: &Req, sr: &SearchReq) -> R<String> {
+    search_view_opts(v, req, sr, &SearchOpts::default())
+}
+
+/// A runnable `search` command for the same query with another scope and
+/// optional query changes. `project`: `None` = no scope (whole index).
+fn search_cmd(v: &View, q: &search::Query, project: Option<(&Project, &Node)>, here: bool, o: &SearchOpts) -> String {
+    let mut s = format!("{} search {}", v.cmd, sh_quote(&q.text));
+    match project {
+        Some((p, co)) => {
+            let _ = write!(s, " --project {}", q_(&p.handle));
+            if !p.is_default(co) || o.env_worktree {
+                let _ = write!(s, " --worktree {}", q_(&worktree_name(p, co)));
+            }
+            if here {
+                s.push_str(" --here");
+            }
+        }
+        None if o.env_project => s.push_str(" --project ''"),
+        None => {}
+    }
+    if !q.kinds.is_empty() {
+        let _ = write!(s, " --kind {}", q.kinds.join(","));
+    }
+    if let Some(p) = &q.provider {
+        let _ = write!(s, " --provider {}", q_(p));
+    }
+    if let Some(sp) = &q.speaker {
+        let _ = write!(s, " --speaker {}", q_(sp));
+    }
+    if let Some(t) = q.since {
+        let _ = write!(s, " --since {}", fmt_date(t));
+    }
+    if q.limit != 10 {
+        let _ = write!(s, " --limit {}", q.limit);
+    }
+    if q.any {
+        s.push_str(" --any");
+    }
+    if q.exact {
+        s.push_str(" --exact");
+    }
+    s
+}
+
+fn q_(s: &str) -> String {
+    sh_quote(s)
+}
+
+/// `[other worktree W]` / `[other project H]` for hits outside the focus checkout.
+fn provenance(c: &Connection, cache: &mut RefCache, scope: Option<&Project>, h: &Hit) -> String {
+    let (Some(sp), Some(repo)) = (scope, h.repo_id.as_deref()) else { return String::new() };
+    if repo != sp.repo.id {
+        let handle = cache.project(repo, None).map(|p| p.handle.clone()).unwrap_or_else(|| repo.to_string());
+        return format!(" [other project {handle}]");
+    }
+    match h.checkout_id.as_deref() {
+        Some(co) if co != sp.focus.id => {
+            let name = sp.checkouts.iter().find(|x| x.id == co).map(|x| worktree_name(sp, x)).unwrap_or_else(|| get_node(c, co).ok().flatten().and_then(|n| n.path).unwrap_or_default());
+            format!(" [other worktree {name}]")
+        }
+        _ => String::new(),
+    }
+}
+
+/// HEAD the checkout was indexed at vs. its HEAD now (one bounded git call).
+fn checkout_freshness(p: &Project, co: &Node) -> String {
+    let name = worktree_name(p, co);
+    let indexed = meta(co, "head").to_string();
+    let Some(path) = co.path.as_deref().filter(|x| Path::new(x).is_dir()) else {
+        return format!("worktree {name}: directory missing since the last scan (indexed at HEAD {indexed})");
+    };
+    let now = crate::util::run_cmd(std::process::Command::new("git").args(["-C", path, "rev-parse", "HEAD"]), std::time::Duration::from_secs(5)).map(|s| s.trim().to_string()).unwrap_or_default();
+    if now.is_empty() || indexed.is_empty() {
+        format!("worktree {name}: indexed at HEAD {}", if indexed.is_empty() { "?" } else { &indexed })
+    } else if now.starts_with(&indexed) {
+        format!("worktree {name}: indexed at its current HEAD {}", &indexed[..indexed.len().min(8)])
+    } else {
+        format!("worktree {name}: HEAD moved since indexing ({} → {}); run `workmap scan` for newer commits/docs", &indexed[..indexed.len().min(8)], &now[..now.len().min(8)])
+    }
+}
+
+pub fn search_view_opts(v: &View, req: &Req, sr: &SearchReq, opts: &SearchOpts) -> R<String> {
     let scope = match req.project.as_deref() {
         Some(_) => Some(scope_project(v, req)?),
         None => None,
     };
-    let (hits, total) = db(search::run_pref(
-        v.c,
-        &sr.query,
-        scope.as_ref().map(|p| p.repo.id.as_str()),
-        if sr.this_worktree { scope.as_ref().map(|p| p.focus.id.as_str()) } else { None },
-        scope.as_ref().map(|p| p.focus.id.as_str()),
-    ))?;
+    let q = &sr.query;
+    let s = search::Scope {
+        repo: scope.as_ref().map(|p| p.repo.id.as_str()),
+        checkout: if sr.this_worktree { scope.as_ref().map(|p| p.focus.id.as_str()) } else { None },
+        prefer: scope.as_ref().map(|p| p.focus.id.as_str()),
+    };
+    let res = db(search::search(v.c, q, &s))?;
+    let hits = &res.hits;
     let mut o = String::new();
-    let kinds = if sr.query.kinds.is_empty() { "all kinds".to_string() } else { sr.query.kinds.join(",") };
+    let kinds = if q.kinds.is_empty() { "all kinds".to_string() } else { q.kinds.join(",") };
     let where_ = match &scope {
-        Some(p) if sr.this_worktree => format!("{} @{}", p.handle, worktree_name(p, &p.focus)),
-        Some(p) => format!("{} (all worktrees)", p.handle),
+        Some(p) if sr.this_worktree => format!("{} @{} only", p.handle, worktree_name(p, &p.focus)),
+        Some(p) => format!("{} (all worktrees, @{} first)", p.handle, worktree_name(p, &p.focus)),
         None => "all projects".into(),
     };
-    let _ = writeln!(o, "# search {:?} — {} shown of {total} matching passage(s) · {where_} · {kinds}", sr.query.text, hits.len());
+    let _ = writeln!(o, "# search {:?} — {} shown of {} matching passage(s) · {where_} · {kinds}", q.text, hits.len(), res.total);
     o.push_str(&trust::index_line(v.c));
     if let Some(p) = &scope {
         o.push_str(&header(v, p, false));
     }
+    // Which tiers ran and what each found; how to get stricter / looser.
+    let tiers: Vec<String> = res.tiers.iter().map(|(t, n)| format!("{} {n}", t.label)).collect();
+    let mut knobs = Vec::new();
+    if !q.exact {
+        knobs.push("stricter: --exact (exact tokens only)");
+    }
+    if !q.any && res.tiers.iter().filter(|t| t.0.label != "substring").count() > 0 && search::fts_query(&q.text, false).map(|m| m.contains("\" \"")).unwrap_or(false) {
+        knobs.push("looser: --any (any word)");
+    }
+    let _ = writeln!(o, "Tiers: {} (each hit says which tier found it{}{})", tiers.join(" · "), if knobs.is_empty() { "" } else { "; " }, knobs.join("; "));
     if hits.is_empty() {
-        let _ = writeln!(o, "no matches{}", if sr.query.any { "" } else { " (all words required; try --any)" });
+        let _ = writeln!(o, "no matches{}", if q.any { "" } else { " (all words required; try --any)" });
     }
     let mut cache = RefCache::new(v.c);
+    let mut other_wt = 0;
     for (i, h) in hits.iter().enumerate() {
         let (r, d) = hit_ref(&mut cache, scope.as_ref(), h);
-        let _ = writeln!(o, "{}. {r} — {d}", i + 1);
+        let tag = provenance(v.c, &mut cache, scope.as_ref(), h);
+        if tag.starts_with(" [other worktree") {
+            other_wt += 1;
+        }
+        let _ = writeln!(o, "{}. {r} — {d} [{}]{tag}", i + 1, h.tier);
         let _ = writeln!(o, "   \"{}\"", clip(&h.snippet, 220));
     }
-    if (hits.len() as i64) < total && hits.len() >= sr.query.limit {
-        let _ = writeln!(o, "More: add --limit {} (ranked by bm25, then newest)", (sr.query.limit * 3).min(total as usize));
+    if (hits.len() as i64) < res.total && hits.len() >= q.limit.max(1) {
+        let more = search::Query { limit: (q.limit * 3).min(res.total as usize).max(q.limit + 1), ..q.clone() };
+        let focus = scope.as_ref().map(|p| (p, &p.focus));
+        let _ = writeln!(o, "More: {} more matching passage(s) not shown (tier order, then bm25, then newest): {}", res.total - hits.len() as i64, search_cmd(v, &more, focus, sr.this_worktree, opts));
+    }
+    if let (Some(p), true) = (&scope, other_wt > 0) {
+        let _ = writeln!(o, "{other_wt} hit(s) above are from other worktrees (tagged). Only @{}: {}", worktree_name(p, &p.focus), search_cmd(v, q, Some((p, &p.focus)), true, opts));
+    }
+    if hits.len() < q.limit.clamp(1, 3) || opts.explain {
+        o.push_str(&diagnose(v, scope.as_ref(), sr, opts, &res, &mut cache)?);
     }
     let _ = writeln!(o, "Messages are historical transcript text, not decisions. Expand a ref for the full message and its neighbours.");
+    Ok(o)
+}
+
+/// Bounded, actionable no-match / few-match report: what was searched, what
+/// the index holds there, matches outside the scope or behind filters (with
+/// commands that find them), and sources that were never indexed.
+fn diagnose(v: &View, scope: Option<&Project>, sr: &SearchReq, opts: &SearchOpts, res: &search::Outcome, cache: &mut RefCache) -> R<String> {
+    let c = v.c;
+    let q = &sr.query;
+    let mut o = String::new();
+    let plan: Vec<search::Tier> = res.tiers.iter().map(|t| t.0.clone()).collect();
+    let s = search::Scope { repo: scope.map(|p| p.repo.id.as_str()), checkout: if sr.this_worktree { scope.map(|p| p.focus.id.as_str()) } else { None }, prefer: scope.map(|p| p.focus.id.as_str()) };
+    let focus = scope.map(|p| (p, &p.focus));
+    // Few hits: only where more matches are (outside scope, filters, looser query).
+    // No hits or --explain: also what was searched and what the index holds there.
+    let full = res.hits.is_empty() || opts.explain;
+    let _ = writeln!(o, "## Why {} hit(s)", res.hits.len());
+    // 1. What was searched.
+    let mut filt = vec![format!("kinds: {}", if q.kinds.is_empty() { "all".into() } else { q.kinds.join(",") })];
+    if let Some(sp) = &q.speaker {
+        filt.push(format!("speaker: {sp}"));
+    }
+    if let Some(pv) = &q.provider {
+        filt.push(format!("provider: {pv}"));
+    }
+    if let Some(t) = q.since {
+        filt.push(format!("since: {}", fmt_date(t)));
+    }
+    let place = match scope {
+        Some(p) if sr.this_worktree => format!("project {} worktree {} only (--this-worktree/--here)", p.handle, worktree_name(p, &p.focus)),
+        Some(p) => format!("project {}, all {} worktree(s)", p.handle, p.checkouts.len()),
+        None => "every indexed project, remote catalog and snapshot".into(),
+    };
+    let _ = writeln!(o, "Searched: {place} · {} · limit {}", filt.join(" · "), q.limit);
+    let head_len = o.len();
+    if full {
+        // 2. What the index holds there.
+        let (cnt_where, cnt_args): (String, Vec<String>) = match scope {
+            Some(p) if sr.this_worktree => ("repo_id=?1 AND (checkout_id=?2 OR checkout_id IS NULL)".into(), vec![p.repo.id.clone(), p.focus.id.clone()]),
+            Some(p) => ("repo_id=?1".into(), vec![p.repo.id.clone()]),
+            None => ("1".into(), vec![]),
+        };
+        let one = |sql: &str| -> i64 { c.query_row(&sql.replace("{W}", &cnt_where), rusqlite::params_from_iter(cnt_args.iter()), |r| r.get(0)).unwrap_or(0) };
+        let convs = one("SELECT count(DISTINCT node_id) FROM passages WHERE kind='message' AND {W}");
+        let msgs = one("SELECT count(DISTINCT node_id || ' ' || loc) FROM passages WHERE kind='message' AND {W}");
+        let docs = one("SELECT count(DISTINCT node_id || ' ' || loc) FROM passages WHERE kind='doc' AND {W}");
+        let commits = one("SELECT count(DISTINCT node_id) FROM passages WHERE kind='commit' AND {W}");
+        let f = trust::freshness(c);
+        let _ = writeln!(
+            o,
+            "Indexed there: {convs} conversation(s) with {msgs} searchable message(s), {docs} doc section(s), {commits} commit(s) (newest {} per worktree) · last scan {}",
+            f.commits,
+            f.last.map(|t| trust::age(crate::util::now_unix() - t)).unwrap_or_else(|| "never".into())
+        );
+        if let Some(p) = scope {
+            let _ = writeln!(o, "Freshness: {}", checkout_freshness(p, &p.focus));
+        }
+    }
+    // 3. Matches outside the scope, per project/worktree, with the command that shows them.
+    if let Some(p) = scope {
+        let all = db(search::groups(c, q, &search::Scope::default(), &plan))?;
+        let mut lines: Vec<(i64, String)> = Vec::new();
+        let mut other_projects: BTreeMap<String, (i64, String)> = BTreeMap::new();
+        let mut unscoped = 0;
+        for (repo, co, n) in &all {
+            match repo.as_deref() {
+                Some(r) if r == p.repo.id => {
+                    let Some(co) = co.as_deref().filter(|co| sr.this_worktree && *co != p.focus.id) else { continue };
+                    let Some(node) = p.checkouts.iter().find(|x| x.id == co) else { continue };
+                    lines.push((*n, format!("{n} in other worktree {} → {}", worktree_name(p, node), search_cmd(v, q, Some((p, node)), true, opts))));
+                }
+                Some(r) => {
+                    let Some(op) = cache.project(r, None) else { continue };
+                    let e = other_projects.entry(op.handle.clone()).or_insert((0, search_cmd(v, q, Some((op, &op.focus)), false, opts)));
+                    e.0 += n;
+                }
+                None => unscoped += n,
+            }
+        }
+        for (h, (n, cmd)) in &other_projects {
+            lines.push((*n, format!("{n} in other project {h} → {cmd}")));
+        }
+        if unscoped > 0 {
+            lines.push((unscoped, format!("{unscoped} in the remote catalog/snapshots (no local project) → {}", search_cmd(v, q, None, false, opts))));
+        }
+        if !lines.is_empty() {
+            lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let n_out: i64 = lines.iter().map(|l| l.0).sum();
+            let _ = writeln!(o, "Outside this scope: {n_out} matching passage(s)");
+            for (_, l) in lines.iter().take(6) {
+                let _ = writeln!(o, "  {l}");
+            }
+            if lines.len() > 6 {
+                let _ = writeln!(o, "  … and {} more place(s)", lines.len() - 6);
+            }
+            let mut widen = Vec::new();
+            if sr.this_worktree {
+                widen.push(format!("drop --this-worktree/--here: {}", search_cmd(v, q, Some((p, &p.focus)), false, opts)));
+            }
+            if !other_projects.is_empty() || unscoped > 0 {
+                widen.push(format!("drop --project: {}", search_cmd(v, q, None, false, opts)));
+            }
+            for w in widen {
+                let _ = writeln!(o, "  widen — {w}");
+            }
+            if res.hits.is_empty() {
+                // Top matches from outside, tagged with where they live (fully qualified refs).
+                let sample = db(search::search(c, &search::Query { limit: 3, ..q.clone() }, &search::Scope::default()))?;
+                for h in &sample.hits {
+                    let (r, d) = hit_ref(cache, None, h);
+                    let tag = provenance(c, cache, Some(p), h);
+                    let _ = writeln!(o, "  - {r} — {d} [{}]{tag}", h.tier);
+                }
+            }
+        } else if full {
+            let _ = writeln!(o, "Outside this scope: no matches anywhere else in the index either");
+        }
+    }
+    // 4. Matches hidden by filters.
+    let has_filters = !q.kinds.is_empty() || q.speaker.is_some() || q.provider.is_some() || q.since.is_some();
+    if has_filters {
+        let nf = search::Query { kinds: vec![], speaker: None, provider: None, since: None, ..q.clone() };
+        let nplan = search::plan(&nf);
+        let n = db(search::count(c, &nf, &s, &nplan))?;
+        if n > res.total {
+            let _ = writeln!(o, "Filtered out: {} more in this scope without --kind/--speaker/--provider/--since → {}", n - res.total, search_cmd(v, &nf, focus, sr.this_worktree, opts));
+        }
+    }
+    // 5. Looser queries that would match (counted, never run implicitly).
+    let words: Vec<String> = q.text.split_whitespace().map(str::to_string).collect();
+    if q.exact {
+        let nq = search::Query { exact: false, ..q.clone() };
+        let n = db(search::count(c, &nq, &s, &search::plan(&nq)))?;
+        if n > res.total {
+            let _ = writeln!(o, "Looser: without --exact (prefix/stem tiers) {n} → {}", search_cmd(v, &nq, focus, sr.this_worktree, opts));
+        }
+    }
+    if words.len() > 1 {
+        if !q.any {
+            let nq = search::Query { any: true, ..q.clone() };
+            let n = db(search::count(c, &nq, &s, &search::plan(&nq)))?;
+            if n > res.total {
+                let _ = writeln!(o, "Looser: any word (--any) {n} → {}", search_cmd(v, &nq, focus, sr.this_worktree, opts));
+            }
+        }
+        let per: Vec<String> = words
+            .iter()
+            .map(|w| {
+                let wq = search::Query { text: w.clone(), any: false, ..q.clone() };
+                let n = search::count(c, &wq, &s, &search::plan(&wq)).unwrap_or(0);
+                format!("{w} {n}")
+            })
+            .collect();
+        let _ = writeln!(o, "Per word in this scope (prefix+stem): {} — words match literally, no synonyms: replace or drop a 0-hit word", per.join(" · "));
+    } else if res.total == 0 {
+        if let Some(w) = words.first().filter(|w| w.chars().count() >= 7) {
+            let short: String = w.chars().take(w.chars().count().div_ceil(2).max(4)).collect();
+            let wq = search::Query { text: short.clone(), ..q.clone() };
+            let n = db(search::count(c, &wq, &s, &search::plan(&wq)))?;
+            if n > 0 {
+                let _ = writeln!(o, "Shorter word: {short} (prefix) {n} → {}", search_cmd(v, &wq, focus, sr.this_worktree, opts));
+            }
+        }
+        let _ = writeln!(o, "Words match literally (prefix and Porter stem, no synonyms): try another word for the same thing");
+    }
+    // 6. What was never indexed or only partly.
+    if !full {
+        // Few hits and nothing actionable to add: print nothing.
+        return Ok(if o.len() == head_len { String::new() } else { o });
+    }
+    let src = |status: &str, under: Option<&[Node]>| -> i64 {
+        match under {
+            None => c.query_row("SELECT count(*) FROM source_files WHERE status=?1", [status], |r| r.get(0)).unwrap_or(0),
+            Some(cos) => cos
+                .iter()
+                .filter_map(|co| co.path.clone())
+                .map(|top| {
+                    c.query_row("SELECT count(*) FROM source_files WHERE status=?1 AND (cwd=?2 OR substr(cwd,1,length(?2)+1)=?2 || '/')", rusqlite::params![status, top], |r| r.get::<_, i64>(0))
+                        .unwrap_or(0)
+                })
+                .sum(),
+        }
+    };
+    let cos: Option<Vec<Node>> = scope.map(|p| if sr.this_worktree { vec![p.focus.clone()] } else { p.checkouts.clone() });
+    let (unrel, err, miss) = (src("unrelated", None), src("error", cos.as_deref()), src("missing", cos.as_deref()));
+    let mut gaps = Vec::new();
+    if unrel > 0 {
+        gaps.push(format!("{unrel} transcript(s) anywhere whose cwd is outside every indexed checkout (add its root: workmap roots add DIR; workmap scan)"));
+    }
+    if err > 0 {
+        gaps.push(format!("{err} unreadable transcript(s){}", if scope.is_some() { " here" } else { "" }));
+    }
+    if miss > 0 {
+        gaps.push(format!("{miss} transcript(s) deleted since indexing (text kept){}", if scope.is_some() { " here" } else { "" }));
+    }
+    if !trust::freshness(c).sessions_indexed {
+        gaps.push("last scan ran with --no-sessions (conversations not refreshed)".into());
+    }
+    let cov = trust::coverage(c, scope.map(|p| p.repo.id.as_str()));
+    if cov.truncated + cov.capped > 0 {
+        gaps.push(format!("{} conversation(s) truncated at the size cap and {} with message text capped (later text not searchable)", cov.truncated, cov.capped));
+    }
+    if cov.with_warnings > 0 {
+        gaps.push(format!("{} conversation(s) with unparseable lines", cov.with_warnings));
+    }
+    let _ = writeln!(o, "Not indexed: {}", if gaps.is_empty() { "nothing relevant (no unrelated, unreadable or truncated sources)".to_string() } else { gaps.join("; ") });
+    // 7. --explain: the exact queries per tier and where their matches went.
+    if opts.explain {
+        let _ = writeln!(o, "## Explain");
+        let nf = search::Query { kinds: vec![], speaker: None, provider: None, since: None, ..q.clone() };
+        for (t, n) in &res.tiers {
+            let one = std::slice::from_ref(t);
+            let whole = db(search::count(c, q, &search::Scope::default(), one))?;
+            let unfiltered = db(search::count(c, &nf, &s, one))?;
+            let shown = res.hits.iter().filter(|h| h.tier == t.label).count();
+            let _ = writeln!(
+                o,
+                "[{}] {} → {n} in scope ({shown} shown) · {whole} in the whole index with the same filters · {unfiltered} in scope without kind/speaker/provider/since filters",
+                t.label,
+                t.shown()
+            );
+        }
+        let dropped = res.total - res.hits.len() as i64;
+        let _ = writeln!(
+            o,
+            "Not shown: {dropped} matching passage(s) in scope are duplicates of a shown hit (same doc section in another worktree, earlier tier) or below --limit {}; a passage missing everywhere above is not indexed (see Not indexed) or uses other words",
+            q.limit
+        );
+        if scope.is_none() {
+            let _ = writeln!(o, "Scope: none (whole index); add --project P [--worktree W] [--here] to narrow");
+        }
+    }
     Ok(o)
 }
 
