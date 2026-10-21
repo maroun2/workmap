@@ -157,6 +157,7 @@ session bus. `--no-activate` writes the units without enabling them.
 | `workmap scan [--root DIR] [--full] [--no-sessions] [--no-remote] [--refresh-remote]` | Incremental re-index |
 | `workmap roots add DIR` / `roots list` | Extra roots to scan, persisted |
 | `workmap remote status\|list\|refresh\|enable\|disable` | The gh/glab catalog |
+| `workmap remote snapshots status\|enable\|disable\|set KEY VALUE` | Opt-in shallow snapshots of remote-only repositories |
 | `workmap status` | Counts, freshness, transcript coverage per provider, remote host status |
 
 ### References
@@ -177,7 +178,8 @@ shells and agents never affect each other.
 | `related:inkcore` | all relation evidence between the scope project and another |
 
 `remote:github.com/acme/tool` names a repository you can access but have not
-cloned. A project whose name is not unique is referred to by its checkout path.
+cloned; `remote:github.com/acme/tool:README.md#usage` names a doc section of
+its [snapshot](#remote-snapshots-opt-in) at the indexed commit. A project whose name is not unique is referred to by its checkout path.
 Ambiguous names fail with the candidates listed; nothing is fuzzy-picked.
 
 ## What gets indexed
@@ -256,9 +258,9 @@ GitLab hosts from their config files (`~/.config/gh/hosts.yml`,
 - **Scope.** GitHub: `user/repos?affiliation=owner,collaborator,organization_member`.
   GitLab: `projects?membership=true`. Repositories you own or are a member of,
   not every public repository.
-- **Metadata only.** Host, namespace, name, URL, description, visibility,
-  archived flag, default branch, last update. Nothing is cloned or fetched, and
-  no docs or transcripts are downloaded.
+- **Metadata only by default.** Host, namespace, name, URL, description,
+  visibility, archived flag, default branch, last update. Nothing is cloned or
+  fetched unless you opt in to [remote snapshots](#remote-snapshots-opt-in).
 - **No prompts, no secrets.** workmap runs `gh auth status --hostname H` and
   `gh api --hostname H --paginate …` (same for `glab`) with prompts disabled and
   stdin closed. It never asks for a token, never runs `gh auth token`, never
@@ -273,8 +275,8 @@ GitLab hosts from their config files (`~/.config/gh/hosts.yml`,
   metadata), `WORKMAP_REMOTE=0`, or `scan --no-remote` for one run.
   `workmap remote refresh` forces a refresh.
 
-Remote metadata, private repositories included, stays in your local index and
-your generated skill files. Nothing is sent anywhere.
+Remote metadata and snapshot text, private repositories included, stay in
+your local index and your generated skill files. Nothing is sent anywhere.
 
 The daily systemd timer runs with the unit's `PATH`, which may not contain
 `gh`/`glab`; it then reports them as "not installed" and keeps the cached
@@ -282,6 +284,63 @@ catalog. Set `WORKMAP_GH_BIN` / `WORKMAP_GLAB_BIN` before `workmap install` to
 pin the paths into the unit. Under `WORKMAP_HOME` the CLIs get the fake
 home's config dirs and no `GH_TOKEN`/`GITLAB_TOKEN`-style variables, so a test
 or demo run never reaches your real accounts.
+
+## Remote snapshots (opt-in)
+
+Metadata says a repository exists; a snapshot says what is in it. With
+snapshots enabled, `scan` takes a temporary shallow clone of each in-scope
+remote-only repository, indexes it like a local main checkout, and deletes
+the clone:
+
+```sh
+workmap remote snapshots enable                         # persisted in ~/.local/state/workmap/config
+workmap remote snapshots set snapshot_include 'acme/*'  # optional scope
+workmap scan                                            # or one run: scan --snapshots / --no-snapshots
+workmap search language server
+workmap expand remote:github.com/acme/inkwell-vscode:README.md#diagnostics
+```
+
+```
+1. remote:github.com/acme/inkwell-vscode:README.md#diagnostics — doc README.md § Diagnostics l.3 in REMOTE SNAPSHOT at 3873a6aa1e82 (not on local disk)
+```
+
+- **Cached per commit.** workmap resolves the branch HEAD with `gh api` /
+  `glab api` (falling back to `git ls-remote`) and stores one row per
+  repository: branch, commit, indexer version. Unchanged HEAD: nothing is
+  cloned. Moved HEAD or a newer workmap indexer: re-snapshot. Only one
+  branch is indexed (the default branch, or `snapshot_branch`), so work on
+  other branches is not seen.
+- **What is kept.** Doc sections, the head commit's subject, URL-based
+  manifest dependencies (Git deps, submodule URLs), declared package names,
+  doc links to other repositories, and Git blob ids for identical-file
+  detection. All of it is stored under virtual references tied to the commit
+  (`remote:<host/ns/repo>:<path>#<section>`), and `expand` returns the cached
+  text plus a browser link at that commit. No temp path and no working tree is
+  stored. Local `path = "../x"` dependencies and symlinks of a remote checkout
+  say nothing about your disk and are ignored.
+- **Passive.** `git clone --depth 1 --single-branch --no-checkout --no-tags
+  --no-recurse-submodules --template= --filter=blob:limit=512k` with
+  `core.hooksPath=/dev/null`; files are read with `git cat-file`, so nothing
+  from the repository is executed, installed or checked out, and no symlink is
+  followed. Lazy blob fetches are disabled (`GIT_NO_LAZY_FETCH=1`).
+- **Credentials.** The clone uses an `https://host/ns/repo.git` URL without
+  credentials. Authentication comes from your Git credential helpers, plus
+  `gh auth git-credential` for gh hosts. Tokens never appear in URLs,
+  arguments, logs or the index. For glab hosts, configure Git credentials
+  (for example via glab's own setup) or only public repositories can be read.
+- **Bounds and failures.** Per clone: `snapshot_max_kb` (default 200 MiB; the
+  clone is killed when its directory grows past it) and
+  `snapshot_timeout_secs` (default 120). At most `snapshot_max_repos` (default
+  10) new or changed snapshots per scan; the rest are deferred. A failed
+  snapshot records its error (`workmap remote snapshots status`) and keeps the
+  previously indexed commit's data. Temp clones live in
+  `<state>/snapshots-tmp/` and are removed on success, failure, or on the next
+  scan after an interrupted run.
+- **Off again.** `workmap remote snapshots disable` stops them and deletes
+  snapshot data; `workmap remote disable` turns off all remote access.
+
+Snapshots contain no conversations: `ask` only resumes conversations that
+exist as native transcripts on this machine.
 
 ## `ask`: read-only follow-up questions
 
@@ -353,6 +412,8 @@ Known limits:
 - Search is word-based (SQLite FTS5, `unicode61`, diacritics folded). It has
   no stemming and no fuzzy matching, and does not search code: use `rg` or your
   editor for that.
+- Remote snapshots cover one branch per repository and only docs,
+  manifests and blob ids, not code.
 - `ask` enforcement is verified from each CLI's documented flags. OpenCode is
   unsupported.
 - Identical-file detection stats at most 30,000 tracked files and records at

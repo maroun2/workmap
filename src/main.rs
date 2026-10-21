@@ -13,6 +13,7 @@ mod remote;
 mod scan;
 mod search;
 mod sessions;
+mod snapshot;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -38,10 +39,13 @@ USAGE:
   workmap related [<project>] [--depth N] [--limit N]  related projects with evidence
   workmap why <project> <other> [--depth N]            shortest evidence chain between two projects
   workmap ask REF <question> [--dry-run]               read-only continuation of a stored conversation
-  workmap scan [--root DIR]... [--no-home] [--full] [--no-sessions] [--no-remote] [--refresh-remote]
+  workmap scan [--root DIR]... [--no-home] [--full] [--no-sessions] [--no-remote] [--refresh-remote] [--[no-]snapshots]
                [--no-refresh] [--max-dirs N] [--commits N] [--quiet] [--verbose]
   workmap roots add <DIR> | roots list
   workmap remote status|list|refresh|enable|disable    gh/glab catalog of repos you can access (metadata only)
+  workmap remote snapshots status|enable|disable|set KEY VALUE
+                                                       opt-in: index docs/manifests of remote-only repos from
+                                                       temporary shallow clones (cached per commit)
   workmap install [--no-activate] | workmap uninstall
   workmap status
 
@@ -54,7 +58,8 @@ WORKMAP_WORKTREE=W picks a non-main worktree). <rest> is one of:
   session:<native-id-prefix>   the same, by the provider's session id
   message:<session-prefix>:<l<line>|p<n>>   one message with its neighbours (printed by search)
   related:<other project>      all relation evidence between the two projects
-Also: remote:<host/namespace/name> (a repository you can access but have not cloned), <project>,
+Also: remote:<host/namespace/name>[:<path>[#section]] (a repository you can access but have not cloned;
+paths come from an opt-in snapshot at a recorded commit), <project>,
 an absolute path, an internal id, <project> --conversation <title> [--provider P] [--date D] [--session ID].
 
 Scans $HOME plus persisted roots. State: ~/.local/state/workmap (WORKMAP_STATE_DIR; WORKMAP_HOME replaces
@@ -210,6 +215,13 @@ fn run() -> Result<(), String> {
                 full: a.has("--full"),
                 sessions: !a.has("--no-sessions"),
                 remote: remote::mode(&env, a.has("--no-remote"), a.has("--refresh-remote")),
+                snapshots: if a.has("--no-snapshots") || a.has("--no-remote") {
+                    Some(false)
+                } else if a.has("--snapshots") {
+                    Some(true)
+                } else {
+                    None
+                },
                 ..Default::default()
             };
             let st = scan::run(&env, &mut c, &opts).map_err(|e| e.to_string())?;
@@ -286,7 +298,31 @@ fn run() -> Result<(), String> {
             print!("{}", view::more::why_view(&v, &p, &to, a.num("--depth", 4).min(8))?);
         }
         "remote" => match a.pos.get(1).map(String::as_str).unwrap_or("status") {
-            "status" => print!("{}", remote::status(&env, &c).map_err(|e| e.to_string())?),
+            "status" => {
+                print!("{}", remote::status(&env, &c).map_err(|e| e.to_string())?);
+                print!("{}", snapshot::status(&env, &c));
+            }
+            "snapshots" => match a.pos.get(2).map(String::as_str).unwrap_or("status") {
+                "status" => print!("{}", snapshot::status(&env, &c)),
+                "enable" => {
+                    snapshot::set(&env, "snapshots", "on")?;
+                    println!("remote snapshots enabled: the next scan takes temporary shallow clones of in-scope remote-only repositories (see `workmap remote snapshots status`)");
+                }
+                "disable" => {
+                    snapshot::set(&env, "snapshots", "off")?;
+                    snapshot::clear_all(&c).map_err(|e| e.to_string())?;
+                    println!("remote snapshots disabled; snapshot data deleted from the index");
+                }
+                "set" => {
+                    let (Some(k), Some(v)) = (a.pos.get(3), a.pos.get(4)) else {
+                        let keys: Vec<String> = snapshot::KEYS.iter().map(|(k, d)| format!("  {k}: {d}")).collect();
+                        return Err(format!("usage: workmap remote snapshots set KEY VALUE\n{}", keys.join("\n")));
+                    };
+                    snapshot::set(&env, k, v)?;
+                    println!("{k} = {v}");
+                }
+                x => return Err(format!("unknown snapshots subcommand {x}; use status|enable|disable|set KEY VALUE")),
+            },
             "list" => {
                 let rows = remote::remote_only(&c, a.num("--limit", 200)).map_err(|e| e.to_string())?;
                 println!("{} remote-only repositories (not cloned; metadata from gh/glab):", rows.len());
@@ -317,7 +353,7 @@ fn run() -> Result<(), String> {
                 let _ = std::fs::remove_file(env.state_dir.join("no-remote"));
                 println!("remote discovery enabled (takes effect on the next scan; WORKMAP_REMOTE=0 still overrides)");
             }
-            x => return Err(format!("unknown remote subcommand {x}; use status|list|refresh|enable|disable")),
+            x => return Err(format!("unknown remote subcommand {x}; use status|list|refresh|enable|disable|snapshots")),
         },
         "uninstall" => {
             for l in install::uninstall(&env).map_err(|e| e.to_string())? {
@@ -340,6 +376,9 @@ fn run() -> Result<(), String> {
         },
         "ask" => {
             let req = a.req();
+            if a.pos.get(1).map(|t| t.starts_with("remote:")).unwrap_or(false) {
+                return Err("ask needs a conversation recorded in a local native transcript; remote snapshots contain no conversations".into());
+            }
             let target = a.pos.get(1).ok_or(
                 "usage: workmap ask REF <question> [--dry-run]   (REF = :conversation:<title> | :session:<id-prefix> with a project scope; or <project> --conversation <title>; or <session-id>)",
             )?;

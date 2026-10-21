@@ -22,6 +22,8 @@ pub struct Env {
     pub glab_config: PathBuf,
     /// Hosts with a token in the environment (presence only; values never read).
     pub env_token_hosts: Vec<(&'static str, String)>,
+    /// Extra `git -c key=value` for snapshot clones (tests: `url.<base>.insteadOf`).
+    pub snapshot_git_config: Vec<(String, String)>,
 }
 
 pub const PROVIDER_VARS: &[&str] = &["WORKMAP_CLAUDE_DIR", "WORKMAP_CODEX_DIR", "WORKMAP_OPENCODE_DIR"];
@@ -64,6 +66,7 @@ impl Env {
             gh_config,
             glab_config,
             env_token_hosts,
+            snapshot_git_config: vec![],
         }
     }
 
@@ -80,6 +83,7 @@ impl Env {
             gh_config: home.join(".config/gh"),
             glab_config: home.join(".config/glab-cli"),
             env_token_hosts: vec![],
+            snapshot_git_config: vec![],
         }
     }
 

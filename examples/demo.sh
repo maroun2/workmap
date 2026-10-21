@@ -113,6 +113,23 @@ EOF
 chmod +x $DEMO/bin/gh
 export WORKMAP_GH_BIN=$DEMO/bin/gh
 
+# The not-cloned acme/inkwell-vscode, served from a local bare repo through a
+# demo-only Git config (GIT_CONFIG_GLOBAL), for the opt-in snapshot step.
+R=$DEMO/remotes/acme/inkwell-vscode.git; W=$DEMO/work-vscode
+mk $W/README.md <<'EOF'
+# inkwell-vscode
+
+## Diagnostics
+Shows inkwell findings inline; the language server shells out to `inkwell check --json`.
+EOF
+mk $W/package.json <<'EOF'
+{ "name": "inkwell-vscode", "dependencies": { "inkcore": "github:acme/inkcore" } }
+EOF
+g $W init -q; g $W add -A; g $W commit -qm "diagnostics"
+git init -q --bare -b main "$R"; g $W push -q "$R" HEAD:main
+printf '[url "file://%s/remotes/"]\n\tinsteadOf = https://github.com/\n' "$DEMO" > $DEMO/gitconfig
+export GIT_CONFIG_GLOBAL=$DEMO/gitconfig
+
 run() { echo "\$ workmap $(printf '%q ' "$@")"; "$BIN" "$@" | sed "s|$DEMO|\$DEMO|g"; echo; }
 run scan --quiet
 run overview
@@ -122,5 +139,9 @@ run search retry deadline --project inkwell --kind message
 run expand inkwell:message:5f2c9a10:l5
 run related inkwell
 run why notes inkcore
+run remote snapshots enable
+run scan --quiet
+run search language server
+run expand remote:github.com/acme/inkwell-vscode:README.md#diagnostics
 run context inkwell --task 'parser timeout on huge files' --file src/check.rs --budget 2500
 run status

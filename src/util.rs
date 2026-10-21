@@ -258,6 +258,29 @@ pub fn run_cmd(cmd: &mut Command, timeout: Duration) -> Option<String> {
 /// Like [`run_cmd`] but reports why it failed with a fixed message (never the
 /// command's stderr, which may echo credentials).
 pub fn run_status(cmd: &mut Command, timeout: Duration) -> Result<String, String> {
+    run_bounded(cmd, timeout, None)
+}
+
+/// Total bytes of regular files under `dir` (no symlinks followed).
+pub fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// [`run_status`] that also kills the command when `watch.0` grows beyond `watch.1` bytes.
+pub fn run_bounded(cmd: &mut Command, timeout: Duration, watch: Option<(&Path, u64)>) -> Result<String, String> {
+    let mut last_check = Instant::now();
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "not installed".to_string()
@@ -283,7 +306,19 @@ pub fn run_status(cmd: &mut Command, timeout: Duration) -> Result<String, String
                 let _ = child.wait();
                 return Err(format!("timed out after {}s", timeout.as_secs()));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                if let Some((dir, max)) = watch {
+                    if last_check.elapsed() > Duration::from_millis(250) {
+                        last_check = Instant::now();
+                        if dir_bytes(dir) > max {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(format!("exceeded the size cap of {} KiB", max / 1024));
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10))
+            }
             Err(_) => return Err("wait failed".into()),
         }
     }

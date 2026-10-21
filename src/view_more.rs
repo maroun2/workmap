@@ -69,6 +69,18 @@ fn hit_ref(cache: &mut RefCache, scope: Option<&Project>, h: &Hit) -> (String, S
     if h.kind == "remote" {
         return (q(&format!("remote:{}", h.title)), "remote repository (not cloned)".into());
     }
+    if let Some(at) = h.source_path.strip_prefix("remote:") {
+        // Remote snapshot passage: virtual ref tied to the indexed commit.
+        let (identity, rest) = at.split_once('@').unwrap_or((at, ""));
+        let sha = rest.split('/').next().unwrap_or("");
+        return match h.kind.as_str() {
+            "doc" => (
+                q(&format!("remote:{identity}:{}{}", h.title, if h.loc.is_empty() { String::new() } else { format!("#{}", h.loc) })),
+                format!("doc {}{} l.{} in REMOTE SNAPSHOT at {sha} (not on local disk)", h.title, if h.heading.is_empty() { String::new() } else { format!(" § {}", h.heading) }, h.line),
+            ),
+            _ => (q(&format!("remote:{identity}")), format!("head commit of REMOTE SNAPSHOT {sha} by {}", h.speaker)),
+        };
+    }
     let Some(repo) = h.repo_id.clone() else {
         return (h.node_id.clone(), format!("{} without project", h.kind));
     };
@@ -379,8 +391,15 @@ fn class_rank(c: &str) -> u8 {
 
 // ------------------------------------------------------------------ remote
 
-pub fn remote_view(v: &View, identity: &str) -> R<Option<String>> {
+pub fn remote_view(v: &View, target: &str) -> R<Option<String>> {
+    let (identity, path) = match target.split_once(':') {
+        Some((i, p)) => (i, Some(p)),
+        None => (target, None),
+    };
     let Some(n) = db(get_node(v.c, &crate::util::stable_id("remote", identity)))? else { return Ok(None) };
+    if let Some(p) = path {
+        return remote_doc_view(v, &n, p).map(Some);
+    }
     let m = &n.meta;
     let s = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut o = String::new();
@@ -401,15 +420,78 @@ pub fn remote_view(v: &View, identity: &str) -> R<Option<String>> {
     if !s("description").is_empty() {
         let _ = writeln!(o, "description: {}", s("description"));
     }
+    match crate::snapshot::row(v.c, &n.label) {
+        Some((branch, sha, at, status, err, files, docs)) if !sha.is_empty() => {
+            let _ = writeln!(o, "\n## Remote snapshot (opt-in; derived text from a temporary shallow clone, already deleted)");
+            let _ = writeln!(
+                o,
+                "{branch} @ {sha} indexed {} · {files} files, {docs} docs · status {status}{}",
+                fmt_ts(at),
+                if err.is_empty() { String::new() } else { format!(" (last refresh failed: {err}; data above is from the indexed commit)") }
+            );
+            let _ = writeln!(o, "Only {branch} is indexed; other branches are not. This is the remote at that commit, not anything on local disk.");
+            let mut st = db(v.c.prepare("SELECT title, min(line), count(*) FROM passages WHERE node_id=?1 AND kind='doc' AND origin LIKE 'snap:%' GROUP BY title ORDER BY title"))?;
+            let ds: Vec<(String, i64, i64)> = db(db(st.query_map([&n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>())?;
+            for (t, _, k) in ds.iter().take(15) {
+                let _ = writeln!(o, "- {} ({k} passage(s)) {}", q(&format!("remote:{}:{t}", n.label)), crate::snapshot::blob_link(&s("provider"), &s("url"), &sha, t, 0));
+            }
+        }
+        Some((branch, _, _, _, err, _, _)) => {
+            let _ = writeln!(o, "\nRemote snapshot of {branch}: not available yet ({err})");
+        }
+        None => {}
+    }
     let ev = db(relations::neighbors(v.c, &n.id))?;
     if !ev.is_empty() {
-        let _ = writeln!(o, "\n## Local projects pointing at it ({})", ev.len());
+        let _ = writeln!(o, "\n## Projects related to it ({})", ev.len());
         for r in ev.iter().take(10) {
             let _ = writeln!(o, "- {} {}", relations::node_name(v.c, &r.to), relations::evidence_line(v.c, r));
         }
     }
     let _ = writeln!(o, "\nOnly metadata is indexed. To work on it: git clone {} && {} scan", s("url"), v.cmd);
     Ok(Some(o))
+}
+
+/// `remote:<identity>:<path>[#slug]`: cached snapshot text of one doc (section).
+fn remote_doc_view(v: &View, n: &Node, target: &str) -> R<String> {
+    let (path, slug) = match target.rsplit_once('#') {
+        Some((p, s)) if !s.is_empty() => (p, Some(s)),
+        _ => (target.trim_end_matches('#'), None),
+    };
+    let row = crate::snapshot::row(v.c, &n.label).filter(|r| !r.1.is_empty()).ok_or_else(|| format!("remote:{} has no snapshot; enable with `workmap remote snapshots enable` and scan", n.label))?;
+    let mut st = db(v.c.prepare("SELECT line, heading, loc, text FROM passages WHERE node_id=?1 AND kind='doc' AND origin LIKE 'snap:%' AND title=?2 AND (?3 IS NULL OR loc=?3) ORDER BY line, part"))?;
+    let rows: Vec<(i64, String, String, String)> = db(db(st.query_map(params![n.id, path, slug], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?.collect::<Result<_, _>>())?;
+    if rows.is_empty() {
+        let mut st = db(v.c.prepare("SELECT DISTINCT title FROM passages WHERE node_id=?1 AND kind='doc' AND origin LIKE 'snap:%' ORDER BY title LIMIT 20"))?;
+        let titles: Vec<String> = db(db(st.query_map([&n.id], |r| r.get(0)))?.collect::<Result<_, _>>())?;
+        return Err(format!("no indexed doc {target} in the snapshot of {}; indexed docs: {}", n.label, titles.join(", ")));
+    }
+    let m = &n.meta;
+    let g = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut o = String::new();
+    let _ = writeln!(o, "# {} — REMOTE SNAPSHOT of {} at {} ({}), not on local disk", q(&format!("remote:{}:{target}", n.label)), n.label, &row.1[..12], row.0);
+    let _ = writeln!(
+        o,
+        "indexed {} from a temporary shallow clone (deleted); the remote may have moved since. Browser: {}",
+        fmt_ts(row.2),
+        crate::snapshot::blob_link(&g("provider"), &g("url"), &row.1, path, rows[0].0)
+    );
+    let mut bytes = 0;
+    let mut last = String::new();
+    for (line, heading, loc, text) in &rows {
+        if *loc != last {
+            let _ =
+                writeln!(o, "\n## l.{line}{} {}", if heading.is_empty() { String::new() } else { format!(" {heading}") }, crate::snapshot::blob_link(&g("provider"), &g("url"), &row.1, path, *line));
+            last = loc.clone();
+        }
+        if bytes > 6000 {
+            let _ = writeln!(o, "… more in the browser link above");
+            break;
+        }
+        bytes += text.len();
+        let _ = writeln!(o, "{text}");
+    }
+    Ok(o)
 }
 
 // ------------------------------------------------------------------ task / file context

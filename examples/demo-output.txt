@@ -2,7 +2,7 @@ $ workmap scan --quiet
 
 $ workmap overview 
 (commands below assume: export WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home)
-workmap: 3 projects, 1 agent conversations; last scan 2026-10-21 06:44Z
+workmap: 3 projects, 1 agent conversations; last scan 2026-10-21 06:59Z
 - inkcore — 1 worktree(s), 0 conversation(s), last commit 2026-09-01
     workmap context inkcore
 - inkwell — 2 worktree(s), 1 conversation(s), last commit 2026-09-01, last conversation 2026-09-10
@@ -14,8 +14,8 @@ Remote-only, not cloned (1; metadata from authenticated gh/glab; expand remote:<
 
 $ workmap context inkwell 
 # inkwell — project map
-main @ $DEMO/home/src/inkwell · HEAD 36d628cc · 0 modified now · last commit 2026-09-01 · origin https://github.com/acme/inkwell.git
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
+main @ $DEMO/home/src/inkwell · HEAD 36d628cc · 0 modified now · last commit 2026-09-01 · origin file://$DEMO/remotes/acme/inkwell.git
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
 Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sources or parse warnings
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 Codes: r/w = read/written, tool result recorded · req = requested, no result · fail = failed · sh = only named in a shell command (not access)
@@ -41,20 +41,19 @@ Codes: r/w = read/written, tool result recorded · req = requested, no result ·
 ## Conversations (1; 1 with file reads/writes first) — expand REF reads it, ask REF 'question' continues it read-only
 - ':conversation:Parser timeout' 2026-09-10 claude@main r1 w1 — "Parser timeout on huge files"
 
-## Related projects (2; evidence, not interpretation) — expand REF lists all of it
+## Related projects (1; evidence, not interpretation) — expand REF lists all of it
 - :related:inkcore — → Cargo path dependency [declared] at $DEMO/home/src/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
-- :related:notes — ← doc names its URL or path [documented] at $DEMO/home/src/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
 
 $ workmap search timeout 
 # search "timeout" — 1 shown of 1 matching passage(s) · all projects · all kinds
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
 1. inkwell:message:5f2c9a10:l2 — claude user message · 2026-09-10 09:00Z · conversation "Parser timeout on huge files"
    "Parser [timeout] on huge files"
 Messages are historical transcript text, not decisions. Expand a ref for the full message and its neighbours.
 
 $ workmap search retry deadline --project inkwell --kind message 
 # search "retry deadline" — 1 shown of 1 matching passage(s) · inkwell (all worktrees) · message
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 1. :message:5f2c9a10:l5 — claude assistant message · 2026-09-10 09:01Z · conversation "Parser timeout on huge files"
    "The hang is the [retry] helper in inkcore: it retries a timed-out read…"
@@ -72,31 +71,42 @@ Next: :message:5f2c9a10:l7 user: "ship it after the release checklist"
 Conversation: ':conversation:Parser timeout'
 
 $ workmap related inkwell 
-# inkwell — related projects (depth 2; 2 found)
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
+# inkwell — related projects (depth 2; 1 found)
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 - :related:inkcore — Cargo path dependency
     → Cargo path dependency [declared] at $DEMO/home/src/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
     → doc names its URL or path [documented] at $DEMO/home/src/inkwell/README.md:3: "Command-line Markdown checker built on https://github.com/acme/inkcore."
     … 2 more
-- :related:notes — doc names its URL or path
-    ← doc names its URL or path [documented] at $DEMO/home/src/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
 
 $ workmap why notes inkcore 
 # why notes → inkcore (max 4 steps)
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
-1. notes → inkwell (1 piece(s) of evidence)
-   → doc names its URL or path [documented] at $DEMO/home/src/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
-2. inkwell → inkcore (4 piece(s) of evidence)
-   → Cargo path dependency [declared] at $DEMO/home/src/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
-   → doc names its URL or path [documented] at $DEMO/home/src/inkwell/README.md:3: "Command-line Markdown checker built on https://github.com/acme/inkcore."
-   ← doc names its URL or path [documented] at $DEMO/home/src/inkcore/README.md:9: "Used by ../inkwell/README.md."
-Each step is a recorded relation; a chain does not imply the first project depends on the last.
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
+no evidence chain within 4 steps
+
+$ workmap remote snapshots enable 
+remote snapshots enabled: the next scan takes temporary shallow clones of in-scope remote-only repositories (see `workmap remote snapshots status`)
+
+$ workmap scan --quiet 
+
+$ workmap search language server 
+# search "language server" — 1 shown of 1 matching passage(s) · all projects · all kinds
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
+1. remote:github.com/acme/inkwell-vscode:README.md#diagnostics — doc README.md § Diagnostics l.3 in REMOTE SNAPSHOT at 3873a6aa1e82 (not on local disk)
+   "## Diagnostics Shows inkwell findings inline; the [language] [server] shells out to `inkwell check --json`."
+Messages are historical transcript text, not decisions. Expand a ref for the full message and its neighbours.
+
+$ workmap expand remote:github.com/acme/inkwell-vscode:README.md#diagnostics 
+# remote:github.com/acme/inkwell-vscode:README.md#diagnostics — REMOTE SNAPSHOT of github.com/acme/inkwell-vscode at 3873a6aa1e82 (main), not on local disk
+indexed 2026-10-21 06:59Z from a temporary shallow clone (deleted); the remote may have moved since. Browser: https://github.com/acme/inkwell-vscode/blob/3873a6aa1e82f72d51b2439a3b5d7da5f97dc7cd/README.md#L3
+
+## l.3 Diagnostics https://github.com/acme/inkwell-vscode/blob/3873a6aa1e82f72d51b2439a3b5d7da5f97dc7cd/README.md#L3
+## Diagnostics Shows inkwell findings inline; the language server shells out to `inkwell check --json`.
 
 $ workmap context inkwell --task parser\ timeout\ on\ huge\ files --file src/check.rs --budget 2500 
 # inkwell — task context for "parser timeout on huge files"
 files: src/check.rs
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
 Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sources or parse warnings
 Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home (or add --project inkwell); then: workmap expand REF · workmap ask REF 'question' --dry-run
 
@@ -112,11 +122,10 @@ Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME
 - :docs/exit-codes.md#codes [19] — text matches 'parser' 'huge' in doc docs/exit-codes.md § Codes l.3 (same text in 1 other worktree(s))
     "## Codes 0 ok, 1 findings, 2 the [parser] timed out on a [huge] file."
 - :related:inkcore [12] — related project: → Cargo path dependency [declared] at $DEMO/home/src/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
-- :related:notes [8] — related project: ← doc names its URL or path [documented] at $DEMO/home/src/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
 
 $ workmap status 
-db: $DEMO/state/index.db (167936 bytes)
-Index: last scan 2026-10-21 06:44Z (0m ago) · history: newest 30 commits per worktree
+db: $DEMO/state/index.db (184320 bytes)
+Index: last scan 2026-10-21 06:59Z (0m ago) · history: newest 30 commits per worktree
 repo: 3
 checkout: 4
 doc: 6
@@ -126,10 +135,10 @@ commit: 3
 session: 1
 remote: 1
 edges: 45 (relation evidence: 5)
-searchable passages: 23
+searchable passages: 26
   project: 3
-  doc: 11
-  commit: 4
+  doc: 13
+  commit: 5
   message: 4
   remote: 1
 Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sources or parse warnings
@@ -137,7 +146,7 @@ Coverage: 1 conversation(s), 4 searchable message(s); no truncation, missing sou
   (unrelated = transcript cwd outside every indexed checkout; missing = deleted since indexed, evidence kept; error = could not be parsed)
 remote discovery: enabled (opt out: `workmap remote disable`, WORKMAP_REMOTE=0 or scan --no-remote); refresh after 24h
 gh: $DEMO/bin/gh (hosts from $DEMO/home/.config/gh/hosts.yml) · glab: glab (hosts from $DEMO/home/.config/glab-cli/config.yml)
-- gh github.com: ok; 2 repositories from 2026-10-21 06:44Z; last check 2026-10-21 06:44Z
+- gh github.com: ok; 2 repositories from 2026-10-21 06:59Z; last check 2026-10-21 06:59Z
 catalog: 1 remote-only (not cloned), 1 matched to local clones
-last scan stats: {"checkouts":4,"checkouts_pruned":0,"commits_per_worktree":30,"dirs_visited":11,"docs":6,"messages":4,"ms":833,"parse_warnings":0,"relations":5,"remote":["gh github.com: 2 repositories"],"repos":3,"sessions_indexed":true,"sessions_parsed":1,"sessions_reused":0,"sessions_truncated":0,"sources_missing":0,"sources_unrelated":0,"warnings":["codex: source not found: $DEMO/home/.codex/sessions","opencode: source not found: $DEMO/home/.local/share/opencode/opencode.db"]}
+last scan stats: {"checkouts":4,"checkouts_pruned":0,"commits_per_worktree":30,"dirs_visited":11,"docs":0,"messages":4,"ms":306,"parse_warnings":0,"relations":5,"remote":["gh github.com: cached (fetched 2026-10-21 06:59Z)","snapshot github.com/acme/inkwell-vscode: indexed 3873a6aa1e82 (main, 2 files, 1 docs)"],"repos":3,"sessions_indexed":true,"sessions_parsed":0,"sessions_reused":1,"sessions_truncated":0,"sources_missing":0,"sources_unrelated":0,"warnings":["codex: source not found: $DEMO/home/.codex/sessions","opencode: source not found: $DEMO/home/.local/share/opencode/opencode.db"]}
 

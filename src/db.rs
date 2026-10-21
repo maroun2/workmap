@@ -135,6 +135,20 @@ CREATE TABLE IF NOT EXISTS remote_hosts (
   message TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (provider, host)
 );
+-- Opt-in shallow snapshots of remote-only repositories: what was indexed, at
+-- which commit, by which indexer version. A failed refresh keeps the old data.
+CREATE TABLE IF NOT EXISTS remote_snapshots (
+  identity TEXT PRIMARY KEY,
+  branch TEXT NOT NULL,
+  sha TEXT NOT NULL DEFAULT '',          -- commit whose data is stored ('' = none yet)
+  version INTEGER NOT NULL DEFAULT 0,
+  indexed_at INTEGER NOT NULL DEFAULT 0,
+  checked_at INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,                  -- ok | failed
+  error TEXT NOT NULL DEFAULT '',
+  files INTEGER NOT NULL DEFAULT 0,
+  docs INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS scans (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started INTEGER NOT NULL,

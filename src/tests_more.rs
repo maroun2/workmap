@@ -369,7 +369,7 @@ fn remote_catalog_dedups_clones_isolates_failures_and_never_logs_secrets() {
     let rv = view::expand(&v(&c), "remote:github.com/acme/secret-tool", &view::Req::default()).unwrap();
     assert!(rv.contains("not cloned locally") && rv.contains("default branch dev"), "{rv}");
     assert!(
-        rv.contains("## Local projects pointing at it (1)") && rv.contains("app ← Cargo git dependency [declared]") && rv.contains("secret-tool.git"),
+        rv.contains("## Projects related to it (1)") && rv.contains("app ← Cargo git dependency [declared]") && rv.contains("secret-tool.git"),
         "git dependency on a non-cloned repo points at the remote entry:\n{rv}"
     );
     let map = view::context(&v(&c), "", &scoped("app")).unwrap();
@@ -502,4 +502,150 @@ fn deleted_checkouts_are_pruned_but_unmounted_parents_are_not() {
     assert_eq!(st.checkouts_pruned, 1);
     let orphans: i64 = c.query_row("SELECT count(*) FROM passages WHERE node_id NOT IN (SELECT id FROM nodes)", [], |r| r.get(0)).unwrap();
     assert_eq!(orphans, 0);
+}
+
+// ------------------------------------------------------------------ remote snapshots
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=T", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A bare "GitHub" repository acme/secret-tool on branch dev, reachable through
+/// `url.<file>.insteadOf=https://github.com/`, plus a work clone to push from.
+fn snapshot_env(fx: &Rels) -> (Env, PathBuf, PathBuf) {
+    // Outside the scanned home, so neither is indexed as a local project.
+    let remotes = fx._t.path().join("remotes");
+    let bare = remotes.join("acme/secret-tool.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    git_out(&bare, &["init", "-q", "--bare", "-b", "dev"]);
+    let work = fx._t.path().join("work-secret-tool");
+    write(&work.join("README.md"), "# Secret tool\n\nInternal.\n\n## Usage\nThe pelican deploy runbook lives here.\nSee https://github.com/acme/app for the app.\n");
+    write(&work.join("Cargo.toml"), "[package]\nname = \"secret-tool\"\n\n[dependencies]\napp = { git = \"https://github.com/acme/app\" }\nlocal = { path = \"../somewhere\" }\n");
+    std::os::unix::fs::symlink("/etc/passwd", work.join("escape")).unwrap();
+    git_out(&work, &["init", "-q", "-b", "dev"]);
+    git_out(&work, &["add", "-A"]);
+    git_out(&work, &["commit", "-qm", "first"]);
+    git_out(&work, &["push", "-q", bare.to_str().unwrap(), "dev"]);
+    let mut env = remote_env(fx, true);
+    // The catalog's gh: same listing; the branches endpoint answers from a file when present.
+    let log = fx.home.join("gh.log");
+    let page1 = r#"[{"full_name":"acme/lib","html_url":"https://github.com/acme/lib","private":false,"archived":false,"default_branch":"main","updated_at":"2026-05-01T00:00:00Z","description":"the parser library"}]"#;
+    let page2 = r#"[{"full_name":"acme/secret-tool","html_url":"https://github.com/acme/secret-tool","visibility":"private","archived":false,"default_branch":"dev","updated_at":"2026-05-02T00:00:00Z","description":"internal ops tool"}]"#;
+    env.gh_bin = fake_cli(&fx.home.join("bin"), "gh2", &format!(
+        "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  auth) exit 0;;\n  api) case \"$4\" in\n    */branches/*) [ -f '{sha}' ] || exit 1; printf '{{\"commit\":{{\"sha\":\"%s\"}}}}' \"$(cat '{sha}')\";;\n    *) printf '%s\\n' '{page1}'; printf '%s\\n' '{page2}';;\n  esac;;\nesac\n",
+        log = log.display(), sha = fx.home.join("head-sha").display()
+    ));
+    env.snapshot_git_config = vec![(format!("url.file://{}/.insteadOf", remotes.display()), "https://github.com/".into())];
+    (env, bare, work)
+}
+
+fn snap_scan(env: &Env) -> (Connection, scan::Stats) {
+    scan_with(env, scan::ScanOpts { remote: remote::Mode::Force, snapshots: None, ..Default::default() })
+}
+
+fn tmp_entries(env: &Env) -> usize {
+    std::fs::read_dir(crate::snapshot::tmp_root(env)).map(|r| r.count()).unwrap_or(0)
+}
+
+#[test]
+fn remote_snapshots_are_opt_in_cached_per_commit_and_survive_failures() {
+    use crate::snapshot;
+    let fx = relations_fixture();
+    let (env, bare, work) = snapshot_env(&fx);
+    // Off by default: metadata only, no clone.
+    let (c, st) = snap_scan(&env);
+    assert!(!st.remote.iter().any(|l| l.starts_with("snapshot")), "{:?}", st.remote);
+    assert!(global(&c, "pelican").contains("no matches"));
+    drop(c);
+
+    snapshot::set(&env, "snapshots", "on").unwrap();
+    let (c, st) = snap_scan(&env);
+    let sha1 = git_out(&bare, &["rev-parse", "dev"]);
+    assert!(st.remote.iter().any(|l| l.starts_with(&format!("snapshot github.com/acme/secret-tool: indexed {}", &sha1[..12]))), "{:?}", st.remote);
+    assert_eq!(tmp_entries(&env), 0, "temp clone removed after success");
+    let out = global(&c, "pelican runbook");
+    assert!(out.contains("remote:github.com/acme/secret-tool:README.md#usage") && out.contains("REMOTE SNAPSHOT at") && out.contains("not on local disk"), "{out}");
+    // The ref resolves from the index alone (the clone is gone) to cached text and a browser link at the indexed commit.
+    let doc = view::expand(&v(&c), "remote:github.com/acme/secret-tool:README.md#usage", &view::Req::default()).unwrap();
+    assert!(doc.contains("REMOTE SNAPSHOT of github.com/acme/secret-tool at") && doc.contains("The pelican deploy runbook lives here."), "{doc}");
+    assert!(doc.contains(&format!("https://github.com/acme/secret-tool/blob/{sha1}/README.md#L5")), "{doc}");
+    assert!(!dump(&c).contains("snapshots-tmp"), "no temp paths stored");
+    // Relations from the snapshot: git dependency and doc URL point at the local app; the local path dep and the symlink are ignored.
+    let app = view::resolve_project(&c, "app").unwrap();
+    let rid = crate::util::stable_id("remote", "github.com/acme/secret-tool");
+    let ev = relations::between(&c, &rid, &app.repo.id).unwrap();
+    assert!(ev.iter().any(|r| r.kind == "cargo_git" && r.source_path.starts_with("remote:github.com/acme/secret-tool@") && r.note.contains("app = { git")), "{ev:?}");
+    assert!(ev.iter().any(|r| r.kind == "doc_link"));
+    let raws: i64 = c.query_row("SELECT count(*) FROM raw_links WHERE origin='snap:github.com/acme/secret-tool' AND (kind LIKE '%_path' OR kind='symlink')", [], |r| r.get(0)).unwrap();
+    assert_eq!(raws, 0);
+    let rv = view::expand(&v(&c), "remote:github.com/acme/secret-tool", &view::Req::default()).unwrap();
+    assert!(rv.contains("## Remote snapshot (opt-in") && rv.contains("Only dev is indexed; other branches are not."), "{rv}");
+    let at: i64 = c.query_row("SELECT indexed_at FROM remote_snapshots", [], |r| r.get(0)).unwrap();
+    drop(c);
+
+    // Unchanged HEAD (resolved via ls-remote, then via the API): reused, no new clone.
+    let (c, st) = snap_scan(&env);
+    assert!(st.remote.iter().any(|l| l.contains("unchanged at")), "{:?}", st.remote);
+    drop(c);
+    std::fs::write(fx.home.join("head-sha"), &sha1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (c, st) = snap_scan(&env);
+    assert!(st.remote.iter().any(|l| l.contains("unchanged at")), "{:?}", st.remote);
+    assert_eq!(c.query_row("SELECT indexed_at FROM remote_snapshots", [], |r| r.get::<_, i64>(0)).unwrap(), at);
+    assert!(std::fs::read_to_string(fx.home.join("gh.log")).unwrap().contains("repos/acme/secret-tool/branches/dev"));
+    drop(c);
+
+    // HEAD moves: re-snapshot, old text gone, new text searchable.
+    write(&work.join("README.md"), "# Secret tool\n\n## Usage\nThe albatross deploy runbook lives here.\n");
+    git_out(&work, &["commit", "-qam", "second"]);
+    git_out(&work, &["push", "-q", bare.to_str().unwrap(), "dev"]);
+    let sha2 = git_out(&bare, &["rev-parse", "dev"]);
+    std::fs::write(fx.home.join("head-sha"), &sha2).unwrap();
+    let (c, st) = snap_scan(&env);
+    assert!(st.remote.iter().any(|l| l.contains(&format!("indexed {}", &sha2[..12]))), "{:?}", st.remote);
+    assert!(global(&c, "pelican").contains("no matches") && global(&c, "albatross").contains("README.md#usage"));
+    drop(c);
+
+    // A failing refresh (size cap) keeps the last good snapshot and leaves no temp files.
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    let big: Vec<u8> = (0..400_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(work.join("data.bin"), big).unwrap();
+    write(&work.join("README.md"), "# Secret tool\n\n## Usage\nThe condor runbook.\n");
+    git_out(&work, &["add", "-A"]);
+    git_out(&work, &["commit", "-qm", "third"]);
+    git_out(&work, &["push", "-q", bare.to_str().unwrap(), "dev"]);
+    std::fs::remove_file(fx.home.join("head-sha")).unwrap();
+    snapshot::set(&env, "snapshot_max_kb", "120").unwrap();
+    let (c, st) = snap_scan(&env);
+    assert!(st.remote.iter().any(|l| l.contains("failed (git clone exceeded the size cap of 120 KiB); previous snapshot kept")), "{:?}", st.remote);
+    assert_eq!(tmp_entries(&env), 0, "temp clone removed after failure");
+    assert!(global(&c, "albatross").contains("README.md#usage") && global(&c, "condor").contains("no matches"));
+    let status = snapshot::status(&env, &c);
+    assert!(status.contains(&format!("failed; {} indexed", &sha2[..12])) && status.contains("last error: git clone exceeded"), "{status}");
+    drop(c);
+
+    // An unreachable remote: same, error recorded, data kept.
+    std::fs::rename(&bare, fx._t.path().join("moved.git")).unwrap();
+    snapshot::set(&env, "snapshot_max_kb", "204800").unwrap();
+    let (c, st) = snap_scan(&env);
+    assert!(st.remote.iter().any(|l| l.contains("cannot resolve dev HEAD") && l.contains("previous snapshot kept")), "{:?}", st.remote);
+    assert!(global(&c, "albatross").contains("README.md#usage"));
+    drop(c);
+
+    // Leftovers of an interrupted run (owner process gone) are removed; opting out deletes snapshot data.
+    std::fs::create_dir_all(crate::snapshot::tmp_root(&env).join("snap-999999999-1-0/repo")).unwrap();
+    let (c, st) = snap_scan(&env);
+    assert!(st.remote.iter().any(|l| l.contains("removed 1 leftover temp clone")), "{:?}", st.remote);
+    assert_eq!(tmp_entries(&env), 0);
+    snapshot::clear_all(&c).unwrap();
+    assert!(global(&c, "albatross").contains("no matches"));
 }

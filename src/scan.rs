@@ -26,11 +26,25 @@ pub struct ScanOpts {
     pub sessions: bool,
     /// Remote catalog refresh through authenticated gh/glab.
     pub remote: crate::remote::Mode,
+    /// Remote snapshots: Some(on/off) for this run, None = persisted setting.
+    pub snapshots: Option<bool>,
 }
 
 impl Default for ScanOpts {
     fn default() -> Self {
-        ScanOpts { roots: vec![], include_home: true, max_dirs: 300_000, max_depth: 12, commits: 30, max_parts: 20_000, verbose: false, full: false, sessions: true, remote: crate::remote::Mode::Off }
+        ScanOpts {
+            roots: vec![],
+            include_home: true,
+            max_dirs: 300_000,
+            max_depth: 12,
+            commits: 30,
+            max_parts: 20_000,
+            verbose: false,
+            full: false,
+            sessions: true,
+            remote: crate::remote::Mode::Off,
+            snapshots: Some(false),
+        }
     }
 }
 
@@ -364,6 +378,7 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
 
     // Remote catalog (metadata only) before relations, so doc/manifest URLs can point at it.
     crate::remote::sync(env, tx, opts.remote, &mut st)?;
+    crate::snapshot::run(env, tx, if opts.remote == crate::remote::Mode::Off && opts.snapshots.is_none() { Some(false) } else { opts.snapshots }, &mut st)?;
     st.relations = relations::resolve(tx, &mut matcher)?;
 
     // Drop file/commit nodes no edge points at any more, then text whose node is gone.
@@ -424,7 +439,7 @@ fn index_doc_file(
         tx,
         &EdgeRow { src: co_id, dst: &id, kind: if kind == "memory" { "memory" } else { "doc" }, strength: "structural", source_path: "", source_line: 0, ts: mtime, note: "", origin: co_id },
     )?;
-    doc_passages(tx, &text, &id, label, &abs_s, repo_id, co_id, mtime)?;
+    doc_passages(tx, &text, &id, label, &abs_s, repo_id, Some(co_id), co_id, mtime)?;
     if is_main && kind == "doc" {
         relations::extract_doc_links(tx, &env.home, abs, &text, top, repo_id, co_id)?;
     }
@@ -499,7 +514,7 @@ fn index_docs(tx: &Connection, env: &Env, top: &Path, reported: Option<&Path>, r
 }
 
 /// Searchable doc sections: heading + body, chunked and capped per document.
-fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, abs: &str, repo_id: &str, co_id: &str, mtime: Option<i64>) -> rusqlite::Result<()> {
+pub(crate) fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, abs: &str, repo_id: &str, checkout: Option<&str>, origin: &str, mtime: Option<i64>) -> rusqlite::Result<()> {
     let secs = docs::sections(text);
     let lines: Vec<&str> = text.lines().collect();
     // (start line, heading, slug, end line exclusive); text before the first heading is its own part.
@@ -525,7 +540,7 @@ fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, abs: &str, r
                     kind: "doc",
                     node_id: id,
                     repo_id: Some(repo_id),
-                    checkout_id: Some(co_id),
+                    checkout_id: checkout,
                     source_path: abs,
                     line: start as i64,
                     loc: &slug,
@@ -535,7 +550,7 @@ fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, abs: &str, r
                     title: label,
                     heading: &heading,
                     text: &redact(&chunk),
-                    origin: co_id,
+                    origin,
                 },
             )?;
         }

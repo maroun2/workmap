@@ -264,6 +264,18 @@ fn parse_gitmodules(text: &str) -> Vec<(&'static str, String, usize)> {
         .collect()
 }
 
+/// Declarations of a manifest by file name (`Cargo.toml`, `package.json`,
+/// `pyproject.toml`, `.gitmodules`): `(kind, raw, line)`.
+pub fn parse_manifest(name: &str, text: &str) -> Option<Vec<(&'static str, String, usize)>> {
+    Some(match name {
+        "Cargo.toml" => parse_cargo(text),
+        "package.json" => parse_package_json(text),
+        "pyproject.toml" => parse_pyproject(text),
+        ".gitmodules" => parse_gitmodules(text),
+        _ => return None,
+    })
+}
+
 /// Build output, lockfiles and licence boilerplate never count as shared content.
 pub fn hash_excluded(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -449,7 +461,8 @@ pub fn resolve(tx: &Connection, matcher: &mut Matcher) -> rusqlite::Result<usize
             pkg.entry(rawv.to_lowercase()).or_default().push((repo.clone(), sp.clone(), *line));
         }
     }
-    for (repo, kind, rawv, resolved, sp, line, _) in &raw {
+    for (repo, kind, rawv, resolved, sp, line, rnote) in &raw {
+        let snap_line = sp.starts_with("remote:").then(|| format!(" — line: \"{}\"", clip(rnote, 140))).unwrap_or_default();
         let k: &'static str = match kind.as_str() {
             "cargo_path" => "cargo_path",
             "cargo_git" => "cargo_git",
@@ -463,7 +476,11 @@ pub fn resolve(tx: &Connection, matcher: &mut Matcher) -> rusqlite::Result<usize
             "dep_name" => "name_match",
             _ => continue,
         };
-        let mut push = |dst: String, note: String| evs.push(Ev { src: repo.clone(), dst, kind: k, source_path: sp.clone(), line: *line, note });
+        let mut push = |dst: String, note: String| {
+            if &dst != repo {
+                evs.push(Ev { src: repo.clone(), dst, kind: k, source_path: sp.clone(), line: *line, note: format!("{note}{snap_line}") })
+            }
+        };
         if !resolved.is_empty() {
             if let Some((i, _)) = matcher.locate(Path::new(resolved)) {
                 let dst = matcher.checkouts[i].repo_id.clone();
@@ -521,7 +538,7 @@ pub fn resolve(tx: &Connection, matcher: &mut Matcher) -> rusqlite::Result<usize
     {
         let mut st = tx.prepare(
             "WITH shared AS (SELECT blob FROM file_hashes GROUP BY blob HAVING count(DISTINCT repo_id) BETWEEN 2 AND ?1)
-             SELECT a.repo_id, b.repo_id, count(DISTINCT a.blob), min(ca.path || '/' || a.rel), min(b.rel), max(a.size)
+             SELECT a.repo_id, b.repo_id, count(DISTINCT a.blob), min(coalesce(ca.path, 'remote:' || ca.label) || '/' || a.rel), min(b.rel), max(a.size)
              FROM file_hashes a JOIN file_hashes b ON a.blob=b.blob AND a.repo_id < b.repo_id
              JOIN nodes ca ON ca.id=a.checkout_id
              WHERE a.blob IN (SELECT blob FROM shared) GROUP BY a.repo_id, b.repo_id ORDER BY a.repo_id, b.repo_id",

@@ -1,7 +1,8 @@
 //! Remote catalog: repositories you can access on GitHub/GitLab hosts where the
 //! `gh` / `glab` CLI is already authenticated, including self-hosted hosts in
 //! their config. Metadata only (name, URL, description, visibility, archived,
-//! default branch, last update). Nothing is cloned or fetched, no login is
+//! default branch, last update). Nothing is cloned here (opt-in snapshots live
+//! in `snapshot.rs`), no login is
 //! attempted, and the CLIs' stderr (which can echo tokens) is never read.
 //!
 //! Scope: GitHub `user/repos` with owner, collaborator and organization-member
@@ -325,6 +326,7 @@ pub fn rebuild(tx: &Connection) -> rusqlite::Result<()> {
 
 /// Delete every cached remote row and node (used when opting out).
 pub fn clear(tx: &Connection) -> rusqlite::Result<()> {
+    crate::snapshot::clear_all(tx)?;
     tx.execute("DELETE FROM remote_repos", [])?;
     tx.execute("DELETE FROM remote_hosts", [])?;
     rebuild(tx)?;
