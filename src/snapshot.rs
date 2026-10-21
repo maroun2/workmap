@@ -476,7 +476,8 @@ fn take(env: &Env, tx: &Connection, s: &Settings, r: &Remote, branch: &str) -> R
                     checkout_id: None,
                     source_path: &vpath(&e.3),
                     line: 1,
-                    loc: "",
+                    // Distinct per file: search collapses passages by (node, loc).
+                    loc: &e.3,
                     part: k as i64,
                     speaker: SPEAKER_MANIFEST,
                     ts: None,

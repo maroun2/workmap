@@ -586,7 +586,7 @@ fn parse_remote_ref(target: &str) -> RemoteRef<'_> {
 /// Cached snapshot files of a remote node: (path, speaker, passages, sections).
 fn snapshot_files(c: &Connection, n: &Node) -> R<Vec<(String, String, i64, Vec<(String, String)>)>> {
     let mut st = db(c.prepare(
-        "SELECT title, CASE WHEN kind='doc' THEN ?2 ELSE speaker END AS sp, count(*), group_concat(CASE WHEN loc<>'' AND part=0 THEN loc || char(31) || heading END, char(30)) FROM passages
+        "SELECT title, CASE WHEN kind='doc' THEN ?2 ELSE speaker END AS sp, count(*), group_concat(CASE WHEN loc<>'' AND loc<>title AND part=0 THEN loc || char(31) || heading END, char(30)) FROM passages
          WHERE origin=?1 AND (speaker IN (?2,?3) OR kind='doc') GROUP BY title, sp ORDER BY sp, title",
     ))?;
     let rows: Vec<(String, String, i64, Option<String>)> =
@@ -762,7 +762,7 @@ fn remote_doc_view(v: &View, n: &Node, rr: &RemoteRef) -> R<String> {
     let mut last: Option<String> = None;
     for (line, heading, loc, text, _) in &rows {
         if last.as_deref() != Some(loc.as_str()) {
-            let r = if loc.is_empty() { String::new() } else { format!(" {}", q(&format!("remote:{}:{path}#{loc}", n.label))) };
+            let r = if loc.is_empty() || loc == path { String::new() } else { format!(" {}", q(&format!("remote:{}:{path}#{loc}", n.label))) };
             let _ = writeln!(
                 o,
                 "\n## l.{line}{}{r} {}",

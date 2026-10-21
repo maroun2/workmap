@@ -241,7 +241,9 @@ fn remote_endpoints_in_related_why_and_expand_from_the_cache() {
         &work.join("README.md"),
         "# Secret tool\n\nInternal.\n\n## Usage\nThe pelican deploy runbook lives here.\nSee https://github.com/acme/app for the app.\nOn-call steps: https://github.com/ops/runbooks\n",
     );
-    git_out(&work, &["commit", "-qam", "link runbooks"]);
+    write(&work.join("web/package.json"), "{\n  \"name\": \"secret-tool-web\",\n  \"version\": \"1.0.0\"\n}\n");
+    git_out(&work, &["add", "-A"]);
+    git_out(&work, &["commit", "-qm", "link runbooks"]);
     git_out(&work, &["push", "-q", bare.to_str().unwrap(), "dev"]);
 
     // Metadata only: expand says so, and the remote is already a graph endpoint.
@@ -261,7 +263,7 @@ fn remote_endpoints_in_related_why_and_expand_from_the_cache() {
     // expand remote:<id>: catalog metadata vs cached snapshot, with expandable doc/manifest refs.
     let rv = ev_expand(&c, &rref).unwrap();
     assert!(rv.contains("## Catalog metadata (from gh on github.com, fetched") && rv.contains("## Cached snapshot (opt-in"), "{rv}");
-    assert!(rv.contains(&format!("dev @ {sha} · indexed ")) && rv.contains("1 docs, 1 manifests cached"), "{rv}");
+    assert!(rv.contains(&format!("dev @ {sha} · indexed ")) && rv.contains("1 docs, 2 manifests cached"), "{rv}");
     assert!(!rv.contains("Only metadata is indexed"), "{rv}");
     for want in [format!("{rref}:README.md"), format!("{rref}:README.md#usage"), format!("{rref}:Cargo.toml")] {
         assert!(rv.contains(&format!("{want} ")), "{want} listed:\n{rv}");
@@ -287,6 +289,15 @@ fn remote_endpoints_in_related_why_and_expand_from_the_cache() {
     )
     .unwrap();
     assert!(hits.contains(&format!("{rref}:README.md#usage")), "{hits}");
+    assert_remote_refs_expand(&c, &hits);
+    // Every cached manifest is its own hit (not collapsed into one per repository).
+    let hits = more::search_view(
+        &v(&c),
+        &view::Req::default(),
+        &more::SearchReq { query: search::Query { text: "secret".into(), kinds: vec!["remote".into()], limit: 10, ..Default::default() }, this_worktree: false },
+    )
+    .unwrap();
+    assert!(hits.contains(&format!("{rref}:Cargo.toml — manifest")) && hits.contains(&format!("{rref}:web/package.json — manifest")), "{hits}");
     assert_remote_refs_expand(&c, &hits);
 
     // related remote:<id>: one hop (app, runbooks) and two hops via app.
