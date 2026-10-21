@@ -154,7 +154,7 @@ session bus. `--no-activate` writes the units without enabling them.
 | `workmap overview` | Every project by name, plus remote-only repositories |
 | `workmap context [P]` | Project map: worktrees, docs, key files, commits, conversations, related projects, index freshness and coverage |
 | `workmap context [P] --task '…' --file PATH… [--budget BYTES]` | Ranked, budget-bounded context; every item has a reason |
-| `workmap search WORDS… [--project P] [--kind K] [--speaker user\|assistant] [--provider claude\|codex\|opencode] [--since DATE] [--any]` | Full-text search over project metadata, doc sections, commits, conversation messages and remote catalog entries |
+| `workmap search WORDS… [--project P [--worktree W] [--here]] [--kind K] [--speaker user\|assistant] [--provider claude\|codex\|opencode] [--since DATE] [--any] [--exact] [--explain]` | Full-text search over project metadata, doc sections, commits, conversation messages and remote catalog/snapshot entries. Tiers, each hit labelled: `[exact]` tokens, then `[prefix]`, then `[stem]` (Porter), `[substring]` for sha/path/identifier-shaped queries; `[any]` only with `--any`. No synonyms. Zero/few hits print what was searched, coverage and runnable commands that widen the scope |
 | `workmap expand REF` | One file, doc section, commit, conversation, message or relation, with everything linked to it |
 | `workmap related [P] [--depth N]` | Related projects (breadth-first, bounded, cycle-safe) with evidence |
 | `workmap why P OTHER [--depth N]` | Shortest evidence chain between two projects, each step quoted |
@@ -167,6 +167,8 @@ session bus. `--no-activate` writes the units without enabling them.
 | `workmap remote status\|list\|refresh\|enable\|disable` | The gh/glab catalog |
 | `workmap remote snapshots status\|enable\|disable\|set KEY VALUE` | Opt-in shallow snapshots of remote-only repositories |
 | `workmap status` | Counts, freshness, transcript coverage per provider, remote host status |
+| `workmap hook EVENT --harness claude\|codex` | Used by installed hooks: reads the host's event JSON on stdin, prints bounded context or nothing, always exits 0 |
+| `workmap --version` | Version, git revision (or `WORKMAP_BUILD_REV`, else `unknown`) and build profile |
 
 ### References
 
@@ -187,8 +189,17 @@ shells and agents never affect each other.
 
 `remote:github.com/acme/tool` names a repository you can access but have not
 cloned; `remote:github.com/acme/tool:README.md#usage` names a doc section of
-its [snapshot](#remote-snapshots-opt-in) at the indexed commit. A project whose name is not unique is referred to by its checkout path.
-Ambiguous names fail with the candidates listed; nothing is fuzzy-picked.
+its [snapshot](#remote-snapshots-opt-in) at the indexed commit.
+
+A project whose name is not unique (e.g. two clones of one remote) gets a
+stable compact handle `<name>~<hex>` derived from its git directory, e.g.
+`ledger-api~67ba`; its checkout path works too. Bare ambiguous names fail with
+the handles listed; nothing is fuzzy-picked.
+
+References that point into another worktree or project are printed fully
+qualified, `<handle>[@<worktree>]:<rest>` (e.g.
+`ledger-api~67ba@fix/webhook-retry:ledger/webhooks.py`), and resolve without
+any scope or environment.
 
 ## What gets indexed
 
@@ -502,6 +513,14 @@ Known limits:
 - The scan skips dependency, cache and build directories (`node_modules`,
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
+
+## Upgrading to 0.3
+
+0.3 re-parses every transcript once (subagent transcripts, Codex `parsed_cmd`
+reads and recorded checkout snapshots are new) and builds the stemmed search
+table from existing passages on first open. Projects with duplicate names are
+now printed as `<name>~<hex>` instead of their checkout path; the path still
+resolves. Hooks are never installed implicitly: run `workmap hooks install`.
 
 ## Upgrading from 0.1
 
