@@ -183,3 +183,15 @@ pub fn ls_files_stage(dir: &Path, cap: usize) -> Vec<(String, String, String)> {
 pub fn dirty_count(dir: &Path) -> Option<usize> {
     run_cmd(git(dir).args(["status", "--porcelain", "--untracked-files=no"]), T).map(|o| o.lines().count())
 }
+
+/// Staged blob id of one tracked path (`git ls-files -s -- <rel>`), if tracked.
+pub fn index_blob(dir: &Path, rel: &str) -> Option<String> {
+    let out = run_cmd(git(dir).args(["ls-files", "-s", "-z", "--", rel]), T)?;
+    let rec = out.split('\0').find(|r| r.ends_with(&format!("\t{rel}")))?;
+    rec.split(' ').nth(1).map(str::to_string)
+}
+
+/// Blob id of the file as it is on disk now (`git hash-object`), without writing it.
+pub fn disk_blob(dir: &Path, rel: &str) -> Option<String> {
+    run_cmd(git(dir).args(["hash-object", "--", rel]), T).map(|o| o.trim().to_string()).filter(|s| !s.is_empty())
+}

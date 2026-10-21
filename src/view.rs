@@ -357,6 +357,66 @@ pub fn conv_ref_raw(all: &[Node], s: &Node) -> String {
     format!(":session:{native}")
 }
 
+/// Projects (with their conversations) looked up by repository id, for printing
+/// references to things that live outside the scope project.
+pub(crate) struct ProjectCache<'a> {
+    c: &'a Connection,
+    map: HashMap<String, Option<(Project, Vec<Node>)>>,
+}
+
+impl<'a> ProjectCache<'a> {
+    pub(crate) fn new(c: &'a Connection) -> Self {
+        ProjectCache { c, map: HashMap::new() }
+    }
+    /// The project (main checkout focused) and all its conversations.
+    pub(crate) fn get(&mut self, repo_id: &str) -> Option<&(Project, Vec<Node>)> {
+        let c = self.c;
+        self.map
+            .entry(repo_id.to_string())
+            .or_insert_with(|| {
+                let repo = get_node(c, repo_id).ok()??;
+                if repo.kind != "repo" {
+                    return None;
+                }
+                let p = build_project(c, repo, None).ok()?;
+                let s = sessions_of(c, &p).ok()?;
+                Some((p, s))
+            })
+            .as_ref()
+    }
+}
+
+/// A conversation as printed from some scope: its reference (None when its
+/// project is no longer indexed), where it ran, and whether it is in another project.
+pub(crate) struct ConvLink {
+    pub r: Option<String>,
+    /// `claude@main` for the scope project; `claude [cwd <handle> @<worktree>]` otherwise.
+    pub prov: String,
+    pub other: bool,
+}
+
+/// Reference to any conversation, resolved globally. Conversations of the scope
+/// project print the short `:conversation:…` form (unless `qualify`); others the
+/// fully qualified `<handle>[@<worktree>]:conversation:…`, unique within THEIR project.
+pub(crate) fn conv_link(pc: &mut ProjectCache, scope: &Project, scope_all: &[Node], s: &Node, qualify: bool) -> ConvLink {
+    let provider = meta(s, "provider").to_string();
+    if s.repo_id.as_deref() == Some(scope.repo.id.as_str()) && scope_all.iter().any(|x| x.id == s.id) {
+        let co = co_of(scope, s.checkout_id.as_deref());
+        let wt = co.map(|x| worktree_name(scope, x)).unwrap_or_else(|| "?".into());
+        let raw = conv_ref_raw(scope_all, s);
+        let r = if qualify { q(&qualified_raw(scope, co.or(scope.checkouts.first()).unwrap_or(&scope.focus), &raw[1..])) } else { q(&raw) };
+        return ConvLink { r: Some(r), prov: format!("{provider}@{wt}"), other: false };
+    }
+    let Some((op, all)) = s.repo_id.as_deref().and_then(|rid| pc.get(rid)) else {
+        return ConvLink { r: None, prov: format!("{provider} [cwd {}, project no longer indexed]", meta(s, "cwd")), other: true };
+    };
+    let co = co_of(op, s.checkout_id.as_deref());
+    let wt = co.map(|x| worktree_name(op, x)).unwrap_or_else(|| "?".into());
+    let raw = conv_ref_raw(all, s);
+    let r = q(&qualified_raw(op, co.or(op.checkouts.first()).unwrap_or(&op.focus), &raw[1..]));
+    ConvLink { r: Some(r), prov: format!("{provider} [cwd {} @{wt}]", op.handle), other: true }
+}
+
 /// Scope line printed once per output, plus the status legend when `codes`.
 fn header(v: &View, p: &Project, codes: bool) -> String {
     let mut vars = vec![format!("WORKMAP_PROJECT={}", q(&p.handle))];
@@ -670,6 +730,219 @@ fn file_ref(v: &View, p: &Project, coid: Option<&str>, path: Option<&str>, memor
     Some(format!("{} (other project)", q(&qualified_raw(&other, &co, &r))))
 }
 
+/// One conversation's recorded access to one file node.
+pub(crate) struct ConvRow {
+    pub session: Node,
+    pub link: ConvLink,
+    /// Read/write evidence (not only a shell mention).
+    pub structured: bool,
+    /// `(code, tool, transcript line)` per edge, strongest first.
+    pub evs: Vec<(String, String, i64)>,
+    /// Printed list line (`- REF day provider…: evidence — "title"`).
+    pub line: String,
+}
+
+/// Every conversation with an access/mention edge to `file_id`, resolved
+/// globally (never dropped because it ran in another project), structured
+/// access first, then newest. `qualify` prints fully qualified refs throughout.
+pub(crate) fn file_conversations(c: &Connection, pc: &mut ProjectCache, p: &Project, all: &[Node], file_id: &str, qualify: bool) -> R<Vec<ConvRow>> {
+    let mut st = db(c.prepare(
+        "SELECT e.src, e.kind, e.strength, e.source_line, e.note FROM edges e JOIN nodes s ON s.id=e.src
+         WHERE e.dst=?1 AND s.kind='session' AND e.kind IN ('read','write','mentioned') ORDER BY s.ts DESC, s.id, e.kind DESC, e.source_line",
+    ))?;
+    let rows: Vec<(String, String, String, i64, String)> = db(db(st.query_map([file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?.collect::<Result<_, _>>())?;
+    let mut out: Vec<ConvRow> = Vec::new();
+    for (sid, kind, strength, line, note) in rows {
+        let tool = note.split(" @").next().unwrap_or(&note).to_string();
+        let ev = (edge_code(&kind, &strength).to_string(), tool, line);
+        let structured = kind != "mentioned";
+        if let Some(x) = out.iter_mut().find(|x| x.session.id == sid) {
+            x.evs.push(ev);
+            x.structured |= structured;
+            continue;
+        }
+        let Some(s) = db(get_node(c, &sid))? else { continue };
+        let link = conv_link(pc, p, all, &s, qualify);
+        out.push(ConvRow { session: s, link, structured, evs: vec![ev], line: String::new() });
+    }
+    out.sort_by_key(|x| !x.structured);
+    for x in &mut out {
+        let evs: Vec<String> = x.evs.iter().take(3).map(|(code, tool, l)| format!("{code} {tool}{}", if *l > 0 { format!(" l.{l}") } else { String::new() })).collect();
+        let s = &x.session;
+        x.line = match &x.link.r {
+            Some(r) => format!("- {r} {} {}: {} — \"{}\"", day(s.ts), x.link.prov, evs.join("; "), clip(&s.label, 50)),
+            None => format!("- conversation \"{}\" {} {} (not expandable; transcript {}): {}", clip(&s.label, 50), day(s.ts), x.link.prov, s.path.clone().unwrap_or_default(), evs.join("; ")),
+        };
+    }
+    Ok(out)
+}
+
+/// Most sibling checkouts examined per view (each costs up to three `git` calls).
+const MAX_SIBLINGS: usize = 8;
+
+/// The same repository-relative path in one other checkout of the same repository.
+pub(crate) struct Sibling {
+    pub wt: String,
+    /// Fully qualified ref to the path in that checkout (expandable without scope).
+    pub file_ref: String,
+    pub exists: bool,
+    pub differs: bool,
+    pub dirty: bool,
+    /// `DIFFERS from main (…)` / `same blob as main (…)` / `absent` …
+    pub state: String,
+    pub convs: Vec<ConvRow>,
+    /// `(fully qualified commit ref, printed line)`; only commits not in the focus's indexed history.
+    pub commits: Vec<(String, String)>,
+    /// All indexed commits touching the path there (the `--limit` that lists every one).
+    pub touched: usize,
+}
+
+/// Blob id per (checkout, rel) as recorded at scan time.
+fn hashed_blob(c: &Connection, co: &Node, relp: &str) -> Option<String> {
+    c.query_row("SELECT blob FROM file_hashes WHERE checkout_id=?1 AND rel=?2", params![co.id, relp], |r| r.get(0)).ok()
+}
+
+fn short(b: &str) -> &str {
+    &b[..b.len().min(8)]
+}
+
+/// Committed/staged version of `relp` in a checkout plus whether the on-disk
+/// file differs from it: `(blob, dirty, how)`. Git is asked only when the
+/// checkout directory exists; on-disk hashing is bounded by size.
+fn blob_now(co: &Node, relp: &str) -> (Option<String>, bool) {
+    let Some(top) = co.path.as_deref().filter(|t| Path::new(t).is_dir()) else { return (None, false) };
+    let idx = crate::git::index_blob(Path::new(top), relp);
+    let small = std::fs::metadata(Path::new(top).join(relp)).map(|m| m.is_file() && m.len() <= crate::relations::HASH_MAX).unwrap_or(false);
+    let dirty = match (&idx, small) {
+        (Some(b), true) => crate::git::disk_blob(Path::new(top), relp).map(|d| &d != b).unwrap_or(false),
+        _ => false,
+    };
+    (idx, dirty)
+}
+
+/// `relp` in every other checkout of the scope's repository (never other
+/// repositories that happen to share the path): existence, whether its content
+/// differs (git blob ids; never merged), conversations that touched it there and
+/// commits indexed in that checkout's history but not in the focus checkout's.
+/// Second value: on-disk change of the focus checkout's own copy.
+pub(crate) fn same_path_elsewhere(c: &Connection, pc: &mut ProjectCache, p: &Project, all: &[Node], relp: &str) -> R<(Vec<Sibling>, bool, usize)> {
+    let focus = &p.focus;
+    let fwt = worktree_name(p, focus);
+    let others: Vec<&Node> = p.checkouts.iter().filter(|x| x.id != focus.id).collect();
+    if others.is_empty() {
+        return Ok((vec![], false, 0));
+    }
+    let (f_idx, f_dirty) = blob_now(focus, relp);
+    let f_hash = hashed_blob(c, focus, relp);
+    let mut out = Vec::new();
+    for x in others.iter().take(MAX_SIBLINGS) {
+        let wt = worktree_name(p, x);
+        let top = p.top(x);
+        let on_disk = Path::new(&format!("{top}/{relp}")).is_file();
+        let node = find_file(c, p, x, relp)?.filter(|n| n.kind != "memory");
+        let (x_idx, dirty) = blob_now(x, relp);
+        // Scan-time blob ids when both sides have them, else git's index now.
+        let (fb, xb, how) = match (&f_hash, hashed_blob(c, x, relp)) {
+            (Some(a), Some(b)) => (Some(a.clone()), Some(b), "indexed git blob ids"),
+            _ => (f_idx.clone(), x_idx.clone(), "git index blob ids now"),
+        };
+        let checkout_gone = !Path::new(&top).is_dir();
+        let (state, differs) = match (&fb, &xb) {
+            _ if checkout_gone => (format!("checkout directory missing ({top}); evidence below is historical"), false),
+            (_, None) if !on_disk => ("absent (not on disk, not tracked)".to_string(), false),
+            (_, None) => ("on disk but untracked there (not compared)".to_string(), false),
+            (None, Some(b)) => (format!("tracked there (blob {}), not tracked in {fwt}", short(b)), true),
+            (Some(a), Some(b)) if a == b => (format!("same blob as {fwt} ({}, {how})", short(a)), false),
+            (Some(a), Some(b)) => (format!("DIFFERS from {fwt} (blob {}≠{}, {how})", short(b), short(a)), true),
+        };
+        let state = if dirty { format!("{state}; uncommitted change (dirty): on-disk file differs from its index blob") } else { state };
+        let mut convs = Vec::new();
+        let mut commits = Vec::new();
+        if let Some(n) = &node {
+            convs = file_conversations(c, pc, p, all, &n.id, true)?;
+            let mut st = db(c.prepare(
+                "SELECT json_extract(n.meta,'$.sha'), n.label, n.ts, e.note FROM edges e JOIN nodes n ON n.id=e.src WHERE e.dst=?1 AND e.kind='touched'
+                 AND EXISTS(SELECT 1 FROM edges h WHERE h.src=?2 AND h.dst=n.id AND h.kind='history')
+                 AND NOT EXISTS(SELECT 1 FROM edges h WHERE h.src=?3 AND h.dst=n.id AND h.kind='history') ORDER BY n.ts DESC, n.id",
+            ))?;
+            let rows: Vec<(String, String, Option<i64>, String)> =
+                db(db(st.query_map(params![n.id, x.id, focus.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?.collect::<Result<_, _>>())?;
+            for (sha, label, ts, status) in rows {
+                let r = q(&qualified_raw(p, x, &commit_ref(&sha)[1..]));
+                let subject = label.split_once(' ').map(|x| x.1).unwrap_or(&label);
+                let line = format!("{r} {} {status} \"{}\"", day(ts.unwrap_or(0)), clip(subject, 70));
+                commits.push((r, line));
+            }
+        }
+        let touched: usize = match &node {
+            Some(n) => db(c.query_row("SELECT count(*) FROM edges WHERE dst=?1 AND kind='touched'", [&n.id], |r| r.get::<_, i64>(0)))? as usize,
+            None => 0,
+        };
+        out.push(Sibling { wt, file_ref: q(&qualified_raw(p, x, relp)), exists: on_disk || node.is_some(), differs, dirty, state, convs, commits, touched });
+    }
+    Ok((out, f_dirty, others.len().saturating_sub(MAX_SIBLINGS)))
+}
+
+/// "## Same path in other checkouts" as blocks of whole lines (one block per
+/// checkout, so budgets can drop whole blocks). Empty when there are no siblings.
+pub(crate) fn same_path_blocks(c: &Connection, pc: &mut ProjectCache, p: &Project, all: &[Node], relp: &str, per: usize) -> R<(String, Vec<String>)> {
+    let (sibs, f_dirty, unexamined) = same_path_elsewhere(c, pc, p, all, relp)?;
+    if sibs.is_empty() {
+        return Ok((String::new(), vec![]));
+    }
+    let fwt = worktree_name(p, &p.focus);
+    let mut head = format!("\n## Same path in other checkouts of {} ({} other; same repository only, versions compared by git blob id and never merged)\n", p.handle, sibs.len() + unexamined);
+    if f_dirty {
+        let _ = writeln!(head, "- this checkout ({fwt}): uncommitted change (dirty): on-disk {relp} differs from its index blob");
+    }
+    let mut blocks = Vec::new();
+    let mut absent = Vec::new();
+    for s in &sibs {
+        if !s.exists && s.convs.is_empty() && s.commits.is_empty() {
+            absent.push(s.wt.clone());
+            continue;
+        }
+        let mut b = format!("- {} — {}\n", s.file_ref, s.state);
+        if !s.convs.is_empty() {
+            let n_struct = s.convs.iter().filter(|x| x.structured).count();
+            let _ = writeln!(b, "    conversations there ({n_struct} read/wrote it, {} only named it in shell):", s.convs.len() - n_struct);
+            for x in s.convs.iter().take(per) {
+                let _ = writeln!(b, "    {}", x.line);
+            }
+            if s.convs.len() > per {
+                let _ = writeln!(b, "      … {} more (expand {} --limit {})", s.convs.len() - per, s.file_ref, s.convs.len());
+            }
+        }
+        if !s.commits.is_empty() {
+            let _ = writeln!(b, "    commits indexed in {} history, not in {fwt}'s indexed history ({}):", s.wt, s.commits.len());
+            for (_, l) in s.commits.iter().take(per) {
+                let _ = writeln!(b, "    - {l}");
+            }
+            if s.commits.len() > per {
+                let _ = writeln!(b, "      … {} more (expand {} --limit {})", s.commits.len() - per, s.file_ref, s.touched);
+            }
+        }
+        if s.convs.is_empty() && s.commits.is_empty() && !s.differs && !s.dirty {
+            b.pop();
+            b.push_str("; no conversations or commits of its own\n");
+        }
+        blocks.push(b);
+    }
+    if !absent.is_empty() {
+        blocks.push(format!("- absent in {} other checkout(s): {}\n", absent.len(), absent.join(", ")));
+    }
+    if unexamined > 0 {
+        blocks.push(format!("- {unexamined} more checkout(s) not examined (limit {MAX_SIBLINGS}); select one with --worktree <name>\n"));
+    }
+    Ok((head, blocks))
+}
+
+/// [`file_ref`], or the recorded absolute path, plainly labelled, when the file's
+/// worktree is no longer indexed (moved/deleted): listed, never silently dropped.
+fn file_ref_or_path(v: &View, p: &Project, coid: Option<&str>, path: Option<&str>, memory_label: Option<&str>) -> String {
+    file_ref(v, p, coid, path, memory_label).unwrap_or_else(|| format!("{} (worktree no longer indexed; not expandable)", path.or(memory_label).unwrap_or("?")))
+}
+
 fn more_line(o: &mut String, v: &View, this: &str, shown: usize, total: usize) {
     if total > shown {
         let _ = writeln!(o, "  … {} more (expand {this} --limit {total})", total - shown);
@@ -684,17 +957,31 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
     let n = match find_file(c, p, co, relp)? {
         Some(n) => n,
         None => {
+            // Not here, but maybe in a sibling worktree: say so instead of failing.
+            let all = sessions_of(c, p)?;
+            let (head, blocks) = if section.is_none() { same_path_blocks(c, &mut ProjectCache::new(c), p, &all, relp, lim.per_category)? } else { (String::new(), vec![]) };
+            let elsewhere = blocks.iter().any(|b| !b.starts_with("- absent") && !b.contains("not examined"));
             let exists = Path::new(&format!("{top}/{relp}")).exists();
-            return if exists {
-                Ok(format!(
-                    "# {} — in {} @{}\nexists on disk but has no recorded relationships (not linked from docs, not in recent commits, not touched by an indexed conversation)\n",
-                    fref(p, co, relp),
-                    p.handle,
-                    branch(co)
-                ))
-            } else {
-                Err(format!("{relp} is neither indexed nor on disk in worktree {} ({top}){}", branch(co), if p.checkouts.len() > 1 { "; try another --worktree" } else { "" }))
-            };
+            if !exists && !elsewhere {
+                return Err(format!("{relp} is neither indexed nor on disk in worktree {} ({top}){}", branch(co), if p.checkouts.len() > 1 { "; try another --worktree" } else { "" }));
+            }
+            let mut o = format!(
+                "# {} — in {} @{}\n{}\n",
+                fref(p, co, relp),
+                p.handle,
+                branch(co),
+                if exists {
+                    "exists on disk but has no recorded relationships (not linked from docs, not in recent commits, not touched by an indexed conversation)"
+                } else {
+                    "NOT in this checkout (neither indexed nor on disk); other checkouts of the same repository have it"
+                }
+            );
+            if elsewhere || exists {
+                o.push_str(&header(v, p, false));
+            }
+            o.push_str(&head);
+            o.extend(blocks);
+            return Ok(o);
         }
     };
     let path = n.path.clone().unwrap_or_default();
@@ -758,37 +1045,20 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
     o.push_str(&header(v, p, true));
 
     // Conversations first: they are what is easily lost under commit noise.
+    // Resolved globally: a conversation that ran in another project (its cwd)
+    // still read/wrote this file and is listed with a fully qualified ref.
     let all = sessions_of(c, p)?;
-    let mut st = db(c.prepare(
-        "SELECT e.src, e.kind, e.strength, e.source_line, e.note FROM edges e JOIN nodes s ON s.id=e.src
-         WHERE e.dst=?1 AND s.kind='session' AND e.kind IN ('read','write','mentioned') ORDER BY s.ts DESC, e.kind DESC, e.source_line",
-    ))?;
-    let rows: Vec<(String, String, String, i64, String)> = db(db(st.query_map([&n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?.collect::<Result<_, _>>())?;
-    let mut by_session: Vec<(String, Vec<String>, bool)> = Vec::new();
-    for (sid, kind, strength, line, note) in rows {
-        let tool = note.split(" @").next().unwrap_or(&note).to_string();
-        let ev = format!("{} {tool}{}", edge_code(&kind, &strength), if line > 0 { format!(" l.{line}") } else { String::new() });
-        let structured = kind != "mentioned";
-        match by_session.iter_mut().find(|x| x.0 == sid) {
-            Some(x) => {
-                x.1.push(ev);
-                x.2 |= structured;
-            }
-            None => by_session.push((sid, vec![ev], structured)),
-        }
-    }
-    by_session.sort_by_key(|x| !x.2);
-    let n_struct = by_session.iter().filter(|x| x.2).count();
-    let _ = writeln!(o, "\n## Conversations ({} read/wrote it, {} only named it in shell) — evidence: code tool transcript-line", n_struct, by_session.len() - n_struct);
-    if by_session.is_empty() {
+    let mut pc = ProjectCache::new(c);
+    let convs = file_conversations(c, &mut pc, p, &all, &n.id, false)?;
+    let n_struct = convs.iter().filter(|x| x.structured).count();
+    let _ = writeln!(o, "\n## Conversations ({} read/wrote it, {} only named it in shell) — evidence: code tool transcript-line; [cwd …] = ran in another project", n_struct, convs.len() - n_struct);
+    if convs.is_empty() {
         let _ = writeln!(o, "- none recorded");
     }
-    for (sid, evs, _) in by_session.iter().take(lim.per_category) {
-        let Some(s) = all.iter().find(|x| &x.id == sid) else { continue };
-        let wt = co_of(p, s.checkout_id.as_deref()).map(|x| worktree_name(p, x)).unwrap_or_else(|| "?".into());
-        let _ = writeln!(o, "- {} {} {}@{wt}: {} — \"{}\"", conv_ref(&all, s), day(s.ts), meta(s, "provider"), evs.iter().take(3).cloned().collect::<Vec<_>>().join("; "), clip(&s.label, 50));
+    for x in convs.iter().take(lim.per_category) {
+        let _ = writeln!(o, "{}", x.line);
     }
-    more_line(&mut o, v, &this, lim.per_category.min(by_session.len()), by_session.len());
+    more_line(&mut o, v, &this, lim.per_category.min(convs.len()), convs.len());
 
     let mut hcache: HashMap<String, Vec<(usize, usize, String, String)>> = HashMap::new();
     for (kind, title) in [("references", "Docs naming it (exact path)"), ("reference_candidate", "Unverified mentions (bare filename matched only because it is unique; may be a different file)")] {
@@ -839,7 +1109,7 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
         let _ = writeln!(o, "\nEntry point: declared by {}:{line} ({note})", rel(&sp, &top));
     }
 
-    let mut st = db(c.prepare("SELECT n.id, e.note FROM edges e JOIN nodes n ON n.id=e.src WHERE e.dst=?1 AND e.kind='touched' ORDER BY n.ts DESC"))?;
+    let mut st = db(c.prepare("SELECT n.id, e.note FROM edges e JOIN nodes n ON n.id=e.src WHERE e.dst=?1 AND e.kind='touched' ORDER BY n.ts DESC, n.id"))?;
     let cms: Vec<(String, String)> = db(db(st.query_map([&n.id], |r| Ok((r.get(0)?, r.get(1)?))))?.collect::<Result<_, _>>())?;
     let _ = writeln!(o, "\n## Commits changing it ({} in indexed history)", cms.len());
     for (cid, status) in cms.iter().take(lim.per_category) {
@@ -848,6 +1118,11 @@ pub fn file_view(v: &View, p: &Project, relp: &str, section: Option<&str>, lim: 
         let _ = writeln!(o, "- {} {} {status} \"{}\"", commit_ref(meta(&cm, "sha")), day(cm.ts), clip(subject, 70));
     }
     more_line(&mut o, v, &this, lim.per_category.min(cms.len()), cms.len());
+    if n.kind != "memory" {
+        let (head, blocks) = same_path_blocks(c, &mut pc, p, &all, relp, lim.per_category)?;
+        o.push_str(&head);
+        o.extend(blocks);
+    }
     Ok(o)
 }
 
@@ -888,7 +1163,7 @@ pub fn commit_view(v: &View, p: &Project, prefix: &str, lim: &FileLimits) -> R<S
         .into_iter()
         .filter(|f| {
             let co = co_of(p, f.1.as_deref());
-            let r = co.map(|x| rel(f.0.as_deref().unwrap_or(""), x.path.as_deref().unwrap_or("")).to_string()).unwrap_or_default();
+            let r = co.map(|x| rel(f.0.as_deref().unwrap_or(""), x.path.as_deref().unwrap_or("")).to_string()).unwrap_or_else(|| f.0.clone().unwrap_or_default());
             seen.insert(r)
         })
         .collect();
@@ -896,7 +1171,7 @@ pub fn commit_view(v: &View, p: &Project, prefix: &str, lim: &FileLimits) -> R<S
     let _ = writeln!(o, "\n## Files changed ({}{}; A added, M modified, D deleted)", uniq.len(), if capped { ", list capped at index time" } else { "" });
     let shown = (lim.per_category * 3).min(uniq.len());
     for (path, coid, status) in uniq.iter().take(shown) {
-        let Some(r) = file_ref(v, p, coid.as_deref(), path.as_deref(), None) else { continue };
+        let r = file_ref_or_path(v, p, coid.as_deref(), path.as_deref(), None);
         let _ = writeln!(o, "- {status} {r}");
     }
     if uniq.len() > shown {
@@ -972,7 +1247,7 @@ pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R
         let _ = writeln!(o, "\n## {title} ({})", rows.len());
         for (path, coid, nk, nl, line, note) in rows.iter().take(lim.per_category) {
             let mem = if nk == "memory" { Some(nl.as_str()) } else { None };
-            let Some(r) = file_ref(v, p, coid.as_deref(), path.as_deref(), mem) else { continue };
+            let r = file_ref_or_path(v, p, coid.as_deref(), path.as_deref(), mem);
             let tool = clip(note.split(" @").next().unwrap_or(note), 30);
             let _ = writeln!(o, "- {r}{}{}", if *line > 0 { format!(" l.{line}") } else { String::new() }, if tool.is_empty() { String::new() } else { format!(" {tool}") });
         }

@@ -500,16 +500,27 @@ fn remote_doc_view(v: &View, n: &Node, target: &str) -> R<String> {
 // ------------------------------------------------------------------ task / file context
 
 struct Item {
+    /// Direct evidence (summed) plus the best graph route (max: many weak routes
+    /// to one commit must not outrank direct evidence).
     score: i64,
+    hop: i64,
     ts: i64,
     r: String,
     why: Vec<String>,
     detail: Option<String>,
 }
 
+/// Reasons kept per item; more routes to the same item only add to its score.
+const MAX_WHY: usize = 3;
+
 fn add_item(items: &mut BTreeMap<String, Item>, score: i64, ts: i64, r: String, why: String, detail: Option<String>) {
-    let e = items.entry(r.clone()).or_insert(Item { score: 0, ts, r, why: vec![], detail: None });
-    e.score += score;
+    let e = items.entry(r.clone()).or_insert(Item { score: 0, hop: 0, ts, r, why: vec![], detail: None });
+    if why.starts_with("[hop1]") || why.starts_with("[hop2]") {
+        e.score += (score - e.hop).max(0);
+        e.hop = e.hop.max(score);
+    } else {
+        e.score += score;
+    }
     e.ts = e.ts.max(ts);
     if !e.why.contains(&why) {
         e.why.push(why);
@@ -529,16 +540,89 @@ fn strength_score(kind: &str, strength: &str) -> i64 {
     }
 }
 
+/// Score of a file reached through a conversation (hop 1): structured access
+/// dominates; shell mentions are candidates and rank far lower.
+fn hop_edge_score(kind: &str, strength: &str) -> i64 {
+    match (kind, strength) {
+        ("write", "observed") => 40,
+        ("read", "observed") => 30,
+        (_, "requested") => 15,
+        ("mentioned", _) => 3,
+        _ => 5,
+    }
+}
+
+fn hop_verb(kind: &str, strength: &str) -> &'static str {
+    match (kind, strength) {
+        ("mentioned", _) => "only named in a shell command (mention, not access) by",
+        ("write", "observed") => "written by",
+        ("read", "observed") => "read by",
+        ("write", "requested") => "write requested (no result) by",
+        ("read", "requested") => "read requested (no result) by",
+        _ => "failed access by",
+    }
+}
+
 pub struct TaskReq<'a> {
     pub task: Option<&'a str>,
     pub files: &'a [String],
     pub budget: usize,
 }
 
+/// Graph expansion bounds for `context --task`: lexical matches (hop 0) →
+/// their conversations' observed file access, and files changed by matched
+/// commits (hop 1) → commits touching those files (hop 2). Fixed, no recursion.
+const HOP_CONVS: usize = 5;
+const HOP_FILES_PER_CONV: usize = 8;
+const HOP_FILES_PER_COMMIT: usize = 5;
+const HOP_COMMIT_SEEDS: usize = 3;
+const HOP_COMMITS_PER_FILE: usize = 4;
+/// Files whose version is compared against the focus checkout (git calls).
+const HOP_COMPARE: usize = 6;
+
+/// A file reached at hop 1, carried to hop 2.
+struct HopFile {
+    id: String,
+    r: String,
+    score: i64,
+    chain: String,
+    co: Option<String>,
+    repo: Option<String>,
+}
+
+/// Commit reference for `sha` seen from `scope`: the focus checkout's short form
+/// when it is in the focus's indexed history, otherwise qualified with the
+/// checkout (`handle@wt:commit:…`) whose history has it, plus that provenance.
+fn commit_link(c: &Connection, pc: &mut ProjectCache, scope: &Project, repo: Option<&str>, file_co: Option<&str>, cid: &str, sha: &str) -> (String, String) {
+    let rest = &commit_ref(sha)[1..];
+    let in_hist = |co: &str| c.query_row("SELECT 1 FROM edges WHERE src=?1 AND dst=?2 AND kind='history'", params![co, cid], |_| Ok(())).is_ok();
+    if repo == Some(scope.repo.id.as_str()) {
+        if in_hist(&scope.focus.id) {
+            return (fref(scope, &scope.focus, rest), String::new());
+        }
+        let co = scope.checkouts.iter().find(|x| Some(x.id.as_str()) == file_co && in_hist(&x.id)).or_else(|| scope.checkouts.iter().find(|x| in_hist(&x.id)));
+        return match co {
+            Some(co) => {
+                let wt = worktree_name(scope, co);
+                (q(&qualified_raw(scope, co, rest)), format!("indexed in {wt} history, not in {}'s indexed history", worktree_name(scope, &scope.focus)))
+            }
+            None => (q(&qualified_raw(scope, &scope.focus, rest)), String::new()),
+        };
+    }
+    match repo.and_then(|r| pc.get(r)) {
+        Some((op, _)) => {
+            let co = op.checkouts.iter().find(|x| Some(x.id.as_str()) == file_co && in_hist(&x.id)).or_else(|| op.checkouts.iter().find(|x| in_hist(&x.id))).unwrap_or(&op.focus);
+            (format!("{} (other project)", q(&qualified_raw(op, co, rest))), String::new())
+        }
+        None => (cid.to_string(), String::new()),
+    }
+}
+
 /// Ranked, budget-bounded context for a task and/or specific files. Every
 /// item says why it is included. Ranking: observed file access > doc lines
 /// naming the file > commits > text matches > related projects; ties by
-/// newest, then reference.
+/// newest, then reference. With a task, matches expand through a fixed
+/// number of hops (see HOP_*), each item carrying its reason chain.
 pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
     let c = v.c;
     let co = &p.focus;
@@ -547,35 +631,50 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
     let mut items: BTreeMap<String, Item> = BTreeMap::new();
     let mut uncertain: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut sib_blocks: Vec<String> = Vec::new();
     let mut cache = RefCache::new(c);
+    let mut pc = ProjectCache::new(c);
     for f in t.files {
         let relp = rel(f, &top).trim_start_matches("./").to_string();
+        let (head, blocks) = same_path_blocks(c, &mut pc, p, &all, &relp, 3)?;
+        if !blocks.is_empty() {
+            // The heading travels with its first block: never printed alone.
+            let mut it = blocks.into_iter();
+            let first = it.next().unwrap_or_default();
+            sib_blocks.push(format!("{}{first}", head.trim_start_matches('\n').replace("## Same path", &format!("## {relp}: same path"))));
+            sib_blocks.extend(it);
+        }
         let Some(n) = find_file(c, p, co, &relp)? else {
             notes.push(format!(
-                "{relp}: no indexed evidence (not linked from docs, not in recent commits, not touched by an indexed conversation){}",
+                "{relp}: no indexed evidence in this checkout (not linked from docs, not in recent commits, not touched by an indexed conversation){}",
                 if Path::new(&format!("{top}/{relp}")).exists() { "" } else { "; not on disk in this worktree" }
             ));
             continue;
         };
-        let mut st =
-            db(c.prepare("SELECT e.src, e.kind, e.strength, e.source_line, e.note FROM edges e JOIN nodes s ON s.id=e.src WHERE e.dst=?1 AND s.kind='session' ORDER BY s.ts DESC, e.source_line"))?;
-        let rows: Vec<(String, String, String, i64, String)> = db(db(st.query_map([&n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?.collect::<Result<_, _>>())?;
-        for (sid, kind, strength, line, note) in rows {
-            let Some(s) = db(get_node(c, &sid))? else { continue };
-            let (r, title) = match all.iter().find(|x| x.id == s.id) {
-                Some(_) => (conv_ref(&all, &s), s.label.clone()),
-                None => {
-                    let Some(op) = s.repo_id.as_deref().and_then(|rid| cache.project(rid, None).map(|p| (p.handle.clone(), p.repo.id.clone()))) else { continue };
-                    let ap = project_by_repo(c, &op.1, None);
-                    let osess = ap.as_ref().map(|ap| sessions_of(c, ap).unwrap_or_default()).unwrap_or_default();
-                    (format!("{} (other project)", q(&format!("{}{}", op.0, conv_ref_raw(&osess, &s)))), s.label.clone())
-                }
+        for row in file_conversations(c, &mut pc, p, &all, &n.id, false)? {
+            let s = &row.session;
+            let Some(r) = row.link.r.clone() else {
+                uncertain.push(format!("conversation \"{}\" ({}) touched {relp} but its project is no longer indexed", clip(&s.label, 60), row.link.prov));
+                continue;
             };
-            let what = match kind.as_str() {
-                "mentioned" => format!("only named {relp} in a shell command"),
-                _ => format!("{} {relp} ({strength}, {})", if kind == "write" { "wrote" } else { "read" }, note.split(" @").next().unwrap_or("")),
-            };
-            add_item(&mut items, strength_score(&kind, &strength), s.ts, r, format!("{what} at transcript l.{line}, {}", day(s.ts)), Some(format!("conversation \"{}\"", clip(&title, 70))));
+            let r = if row.link.other { format!("{r} (other project)") } else { r };
+            let mut st = db(c.prepare("SELECT kind, strength, source_line, note FROM edges WHERE src=?1 AND dst=?2 AND kind IN ('read','write','mentioned') ORDER BY kind DESC, source_line"))?;
+            let edges: Vec<(String, String, i64, String)> = db(db(st.query_map(params![s.id, n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?.collect::<Result<_, _>>())?;
+            for (kind, strength, line, note) in edges {
+                let what = match kind.as_str() {
+                    "mentioned" => format!("only named {relp} in a shell command"),
+                    _ => format!("{} {relp} ({strength}, {})", if kind == "write" { "wrote" } else { "read" }, note.split(" @").next().unwrap_or("")),
+                };
+                let at = if row.link.other { format!(", {}", row.link.prov) } else { String::new() };
+                add_item(
+                    &mut items,
+                    strength_score(&kind, &strength),
+                    s.ts,
+                    r.clone(),
+                    format!("{what} at transcript l.{line}, {}{at}", day(s.ts)),
+                    Some(format!("conversation \"{}\"", clip(&s.label, 70))),
+                );
+            }
         }
         let mut st = db(c.prepare("SELECT d.path, d.label, d.kind, e.kind, e.source_line, d.ts FROM edges e JOIN nodes d ON d.id=e.src WHERE e.dst=?1 AND e.kind IN ('references','reference_candidate') ORDER BY d.label, e.source_line"))?;
         let rows: Vec<(Option<String>, String, String, String, i64, i64)> =
@@ -609,6 +708,9 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
         let words: Vec<String> = task.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).filter(|w| w.chars().count() > 2).map(|w| w.to_lowercase()).collect();
         let query = search::Query { text: words.join(" "), any: true, limit: 15, ..Default::default() };
         let (hits, _) = db(search::run_pref(c, &query, Some(&p.repo.id), None, Some(&co.id)))?;
+        // Hop seeds: (session or commit node id, hit score, "which matched … in REF").
+        let mut conv_seeds: Vec<(String, i64, String)> = Vec::new();
+        let mut commit_seeds: Vec<(String, i64, String)> = Vec::new();
         for (i, h) in hits.iter().enumerate() {
             let low = h.snippet.to_lowercase();
             let matched: Vec<&String> = words.iter().filter(|w| low.contains(&format!("[{w}"))).collect();
@@ -616,14 +718,135 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
             if r == "(this project)" {
                 continue;
             }
+            let score = 10 + 5 * matched.len() as i64 - i as i64;
+            let mw = matched.iter().map(|w| format!("'{w}'")).collect::<Vec<_>>().join(" ");
+            let origin = format!("which matched {} in {r}", if mw.is_empty() { "the task words".to_string() } else { mw.clone() });
+            match h.kind.as_str() {
+                "message" if !conv_seeds.iter().any(|x| x.0 == h.node_id) => conv_seeds.push((h.node_id.clone(), score, origin)),
+                "commit" if !commit_seeds.iter().any(|x| x.0 == h.node_id) => commit_seeds.push((h.node_id.clone(), score, origin)),
+                _ => {}
+            }
             add_item(
                 &mut items,
-                10 + 5 * matched.len() as i64 - i as i64,
+                score,
                 h.ts,
                 r,
-                format!("text matches {}in {d}", matched.iter().map(|w| format!("'{w}' ")).collect::<String>()),
+                format!("[hop0] text matches {}in {d}", matched.iter().map(|w| format!("'{w}' ")).collect::<String>()),
                 Some(format!("\"{}\"", clip(&h.snippet, 150))),
             );
+        }
+        // Hop 1: files the matched conversations observably read/wrote (structured
+        // edges; shell mentions kept but labelled and ranked low), and files
+        // changed by matched commits.
+        let mut hop_files: Vec<HopFile> = Vec::new();
+        let mut compared = 0usize;
+        for (sid, parent, origin) in conv_seeds.iter().take(HOP_CONVS) {
+            let Some(s) = db(get_node(c, sid))? else { continue };
+            let link = conv_link(&mut pc, p, &all, &s, false);
+            let conv = match &link.r {
+                Some(r) if link.other => format!("{r} (other project)"),
+                Some(r) => r.clone(),
+                None => format!("conversation \"{}\"", clip(&s.label, 40)),
+            };
+            let mut st = db(c.prepare(
+                "SELECT e.dst, e.kind, e.strength, e.source_line, e.note, n.path, n.checkout_id, n.repo_id, n.kind, n.label FROM edges e JOIN nodes n ON n.id=e.dst
+                 WHERE e.src=?1 AND e.kind IN ('read','write','mentioned') AND n.kind IN ('file','doc')
+                 ORDER BY CASE e.kind WHEN 'write' THEN 0 WHEN 'read' THEN 1 ELSE 2 END, CASE e.strength WHEN 'observed' THEN 0 WHEN 'requested' THEN 1 ELSE 2 END, e.source_line, n.path",
+            ))?;
+            type Row = (String, String, String, i64, String, Option<String>, Option<String>, Option<String>, String, String);
+            let rows: Vec<Row> =
+                db(db(st.query_map([&s.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))))?.collect::<Result<_, _>>())?;
+            let mut seen: Vec<String> = Vec::new();
+            for (dst, kind, strength, line, note, path, coid, repo, nk, nl) in rows {
+                if seen.contains(&dst) {
+                    continue;
+                }
+                if seen.len() >= HOP_FILES_PER_CONV {
+                    break;
+                }
+                seen.push(dst.clone());
+                let mem = if nk == "memory" { Some(nl.as_str()) } else { None };
+                let r = file_ref_or_path(v, p, coid.as_deref(), path.as_deref(), mem);
+                let tool = note.split(" @").next().unwrap_or("").to_string();
+                let at = if line > 0 { format!(" l.{line}") } else { String::new() };
+                let chain = format!("{} {conv} ({} {tool}{at}) {origin}", hop_verb(&kind, &strength), edge_code(&kind, &strength));
+                let score = hop_edge_score(&kind, &strength) + parent / 2;
+                let mut detail = None;
+                // Same path, other version: compare with the focus checkout's copy.
+                if repo.as_deref() == Some(p.repo.id.as_str()) && coid.as_deref() != Some(co.id.as_str()) && compared < HOP_COMPARE {
+                    if let Some(fco) = co_of(p, coid.as_deref()) {
+                        compared += 1;
+                        let relp = rel(path.as_deref().unwrap_or(""), &p.top(fco)).to_string();
+                        let (a, _) = blob_now(co, &relp);
+                        let (b, dirty) = blob_now(fco, &relp);
+                        let fwt = worktree_name(p, co);
+                        let mut d = match (a, b) {
+                            (Some(a), Some(b)) if a == b => format!("same blob as {fwt}'s {}", fref(p, co, &relp)),
+                            (Some(a), Some(b)) => format!("DIFFERS from {fwt}'s {} (blob {}≠{}, git index now)", fref(p, co, &relp), short(&b), short(&a)),
+                            (None, Some(_)) => format!("not tracked in {fwt}"),
+                            _ => "not compared (not tracked there now)".to_string(),
+                        };
+                        if dirty {
+                            d.push_str("; uncommitted change (dirty) there");
+                        }
+                        detail = Some(d);
+                    }
+                }
+                add_item(&mut items, score, s.ts, r.clone(), format!("[hop1] {chain}"), detail);
+                if kind != "mentioned" {
+                    hop_files.push(HopFile { id: dst, r, score, chain, co: coid, repo });
+                }
+            }
+        }
+        for (cid, parent, origin) in commit_seeds.iter().take(HOP_COMMIT_SEEDS) {
+            let Some(cm) = db(get_node(c, cid))? else { continue };
+            let (cr, _) = commit_link(c, &mut pc, p, cm.repo_id.as_deref(), None, cid, meta(&cm, "sha"));
+            let mut st = db(c.prepare(
+                "SELECT n.id, n.path, n.checkout_id, n.repo_id, e.note FROM edges e JOIN nodes n ON n.id=e.dst WHERE e.src=?1 AND e.kind='touched'
+                 ORDER BY CASE WHEN n.checkout_id=?2 THEN 0 ELSE 1 END, n.path LIMIT 40",
+            ))?;
+            let rows: Vec<(String, Option<String>, Option<String>, Option<String>, String)> =
+                db(db(st.query_map(params![cid, co.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?.collect::<Result<_, _>>())?;
+            let mut seen_rel: Vec<String> = Vec::new();
+            for (fid, path, coid, repo, status) in rows {
+                let top_f = coid.as_deref().and_then(|id| co_of(p, Some(id))).map(|x| p.top(x)).unwrap_or_default();
+                let key = rel(path.as_deref().unwrap_or(""), &top_f).to_string();
+                if seen_rel.contains(&key) {
+                    continue;
+                }
+                if seen_rel.len() >= HOP_FILES_PER_COMMIT {
+                    break;
+                }
+                seen_rel.push(key);
+                let r = file_ref_or_path(v, p, coid.as_deref(), path.as_deref(), None);
+                let chain = format!("changed ({status}) by {cr} {origin}");
+                let score = 12 + parent / 2;
+                add_item(&mut items, score, cm.ts, r.clone(), format!("[hop1] {chain}"), None);
+                hop_files.push(HopFile { id: fid, r, score, chain, co: coid, repo });
+            }
+        }
+        // Hop 2: commits touching the hop-1 files, in any checkout of their repository.
+        for f in &hop_files {
+            let mut st = db(c.prepare(
+                "SELECT n.id, json_extract(n.meta,'$.sha'), n.label, n.ts, e.note FROM edges e JOIN nodes n ON n.id=e.src WHERE e.dst=?1 AND e.kind='touched' ORDER BY n.ts DESC, n.id LIMIT ?2",
+            ))?;
+            let rows: Vec<(String, String, String, Option<i64>, String)> =
+                db(db(st.query_map(params![f.id, HOP_COMMITS_PER_FILE as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?.collect::<Result<_, _>>())?;
+            for (j, (cid, sha, label, ts, status)) in rows.into_iter().enumerate() {
+                let (r, prov) = commit_link(c, &mut pc, p, f.repo.as_deref(), f.co.as_deref(), &cid, &sha);
+                let subject = label.split_once(' ').map(|x| x.1.to_string()).unwrap_or(label);
+                // A commit the focus checkout does not have is what a sibling adds: rank it up.
+                let bonus = if prov.is_empty() { 0 } else { 5 };
+                let prov = if prov.is_empty() { String::new() } else { format!(" [{prov}]") };
+                add_item(
+                    &mut items,
+                    (8 + bonus + f.score / 4 - j as i64).max(1),
+                    ts.unwrap_or(0),
+                    r,
+                    format!("[hop2] changed {} ({status}){prov}; that file was {}", f.r, f.chain),
+                    Some(format!("\"{}\"", clip(&subject, 70))),
+                );
+            }
         }
         // Related projects: the relation is the reason; a text match there adds to it.
         for (other, rels) in group_related(c, &p.repo.id)?.into_iter().take(5) {
@@ -656,30 +879,80 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
     for n in &notes {
         let _ = writeln!(o, "note: {n}");
     }
-    let _ = writeln!(o, "\n## Ranked (score; why it matters) — budget {} bytes", t.budget);
+    let _ = writeln!(o, "\n## Ranked (score; why it matters) — budget {} bytes{}", t.budget, if t.task.is_some() { "; [hopN] = N steps from a text match, each with its reason chain" } else { "" });
+    // Whole items only: an item that does not fit is dropped, never cut. The
+    // final line (reserved up front) says what was left out and how to get it;
+    // reasons are joined with ` · ` so a trailing ref is never glued to punctuation.
+    const RESERVE: usize = 200;
+    let lines: Vec<String> = ranked
+        .iter()
+        .map(|it| {
+            let extra = it.why.len().saturating_sub(MAX_WHY);
+            let mut line = format!(
+                "- {} [{}] — {}{}\n",
+                it.r,
+                it.score,
+                it.why.iter().take(MAX_WHY).cloned().collect::<Vec<_>>().join(" · "),
+                if extra > 0 { format!(" (+{extra} more route(s))") } else { String::new() }
+            );
+            if let Some(d) = &it.detail {
+                let _ = writeln!(line, "    {d}");
+            }
+            line
+        })
+        .collect();
+    let mut needed = o.len();
     let mut shown = 0;
-    for it in &ranked {
-        let mut line = format!("- {} [{}] — {}\n", it.r, it.score, it.why.join("; "));
-        if let Some(d) = &it.detail {
-            let _ = writeln!(line, "    {d}");
+    let mut first_omitted: Option<&str> = None;
+    for (it, line) in ranked.iter().zip(&lines) {
+        needed += line.len();
+        if first_omitted.is_none() && o.len() + line.len() + RESERVE <= t.budget {
+            o.push_str(line);
+            shown += 1;
+        } else if first_omitted.is_none() {
+            first_omitted = Some(it.r.as_str());
         }
-        if o.len() + line.len() > t.budget {
-            break;
-        }
-        o.push_str(&line);
-        shown += 1;
     }
     if ranked.is_empty() {
         let _ = writeln!(o, "- nothing recorded for this task/file in {}", p.handle);
     }
-    if !uncertain.is_empty() {
-        let block = format!("\n## Uncertain (not ranked)\n{}\n", uncertain.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n"));
-        if o.len() + block.len() <= t.budget {
-            o.push_str(&block);
+    let mut blocks_omitted = 0;
+    for (i, b) in sib_blocks.iter().enumerate() {
+        let b = if i == 0 || b.starts_with("## ") { format!("\n{b}") } else { b.clone() };
+        needed += b.len();
+        if blocks_omitted == 0 && o.len() + b.len() + RESERVE <= t.budget {
+            o.push_str(&b);
+        } else {
+            blocks_omitted += 1;
         }
     }
-    if shown < ranked.len() {
-        let _ = writeln!(o, "… {} more item(s) omitted to stay within --budget {} (raise it, or expand a ref)", ranked.len() - shown, t.budget);
+    let mut uncertain_omitted = 0;
+    if !uncertain.is_empty() {
+        let block = format!("\n## Uncertain (not ranked)\n{}\n", uncertain.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n"));
+        needed += block.len();
+        if o.len() + block.len() + RESERVE <= t.budget {
+            o.push_str(&block);
+        } else {
+            uncertain_omitted = uncertain.len();
+        }
+    }
+    let omitted = ranked.len() - shown;
+    if omitted + blocks_omitted + uncertain_omitted > 0 {
+        let mut parts = Vec::new();
+        if omitted > 0 {
+            parts.push(format!("{omitted} ranked item(s)"));
+        }
+        if blocks_omitted > 0 {
+            parts.push(format!("{blocks_omitted} other-checkout block(s)"));
+        }
+        if uncertain_omitted > 0 {
+            parts.push(format!("{uncertain_omitted} uncertain mention(s)"));
+        }
+        let mut footer = format!("… omitted to stay within --budget {}: {}; rerun with --budget {}", t.budget, parts.join(", "), needed + RESERVE + 20);
+        if let Some(r) = first_omitted.filter(|r| footer.len() + r.len() + 14 < RESERVE) {
+            let _ = write!(footer, ", or expand {r}");
+        }
+        let _ = writeln!(o, "{footer}");
     }
     Ok(o)
 }

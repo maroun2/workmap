@@ -681,10 +681,15 @@ fn worktree_scope_selects_exact_checkout_for_same_path() {
     feat.worktree = Some("feature".into());
     let fe = std::fs::canonicalize(&fx.feature).unwrap();
     let f = view::expand(&v(&c), ":main.py", &feat).unwrap();
-    assert!(f.contains(&format!("{}/main.py", fe.display())) && f.contains("\"Feature work\"") && !f.contains("Investigate backend"), "{f}");
+    let f_own = f.split("\n## Same path in other checkouts").next().unwrap();
+    assert!(f.contains(&format!("{}/main.py", fe.display())) && f_own.contains("\"Feature work\"") && !f_own.contains("Investigate backend"), "{f}");
     assert!(f.contains("--worktree feature"), "scope keeps the worktree:\n{f}");
     let main = view::expand(&v(&c), ":main.py", &scoped("proj")).unwrap();
-    assert!(main.contains("Investigate backend") && !main.contains("Feature work"), "{main}");
+    // main's own sections never list the feature conversation; the separate
+    // "Same path in other checkouts" section may (fully qualified, labelled).
+    let (own, others) = main.split_once("\n## Same path in other checkouts").unwrap_or((&main, ""));
+    assert!(own.contains("Investigate backend") && !own.contains("Feature work"), "{main}");
+    assert!(others.contains("proj@feature:main.py") && others.contains("\"Feature work\""), "{main}");
     let mf = view::context(&v(&c), "", &feat).unwrap();
     assert!(mf.contains("WORKMAP_WORKTREE=feature") && mf.contains("* feature @"), "{mf}");
     let e = view::expand(&v(&c), "proj:main.py", &view::Req { worktree: Some("nope".into()), ..Default::default() }).unwrap_err();
