@@ -159,6 +159,8 @@ session bus. `--no-activate` writes the units without enabling them.
 | `workmap related [P] [--depth N]` | Related projects (breadth-first, bounded, cycle-safe) with evidence |
 | `workmap why P OTHER [--depth N]` | Shortest evidence chain between two projects, each step quoted |
 | `workmap ask REF 'question' [--dry-run]` | Read-only follow-up in a stored Claude Code or Codex conversation |
+| `workmap resume REF [--cwd DIR] [--dry-run]` | Reopen the original conversation interactively in its own CLI and recorded directory |
+| `workmap hooks status\|install\|uninstall [--harness claude\|codex] [--scope user\|project] [--dry-run]` | Opt-in host hooks: context at session start and per prompt, ingest when a session stops |
 | `workmap scan [--root DIR] [--full] [--no-sessions] [--no-remote] [--refresh-remote]` | Incremental re-index |
 | `workmap roots add DIR` / `roots list` | Extra roots to scan, persisted |
 | `workmap remote status\|list\|refresh\|enable\|disable` | The gh/glab catalog |
@@ -364,6 +366,68 @@ how many commits landed since the conversation ended, how many of the files it
 wrote have changed or vanished since, and how many tracked files are modified
 now.
 
+## `resume`: continue the original session
+
+`resume` is the writable counterpart of `ask`, and only you start it. It
+reopens the recorded session interactively with the provider's own resume
+command, in the directory the session ran in. That appends to the original
+transcript. The syntax is checked against the installed CLI's `--help` before
+anything runs, and the command is executed as argv, never through a shell.
+`--dry-run` prints the exact command.
+
+- **Claude Code:** `claude --resume ID`. Claude Code ties sessions to the
+  directory they ran in, so this runs in the recorded cwd.
+- **Codex:** `codex resume ID`.
+- **OpenCode:** `opencode DIR --session ID`. Conversations indexed from
+  OpenCode's legacy JSON storage are refused, because their ids can't be
+  verified against the current database.
+- **Subagent transcripts** are refused, and the error names the parent
+  session to resume instead.
+
+If the recorded directory is gone, `resume` refuses. It lists the indexed
+worktrees still on the recorded branch (`--cwd <path>`) and the `git worktree
+add <old path> <branch>` command that recreates the original. If `--cwd`
+differs from the recorded directory, it first prints the recorded and current
+cwd, branch and HEAD side by side.
+
+## Host hooks (opt-in)
+
+`workmap hooks install` adds four hooks to a host's settings. They run only
+local, indexed SQLite queries: no scan, network or model. They always exit 0,
+print nothing when they have nothing relevant, and keep output within
+`WORKMAP_HOOK_BUDGET` bytes (default 1500). Output is fully qualified
+references with source excerpts, and never a summary.
+
+- **SessionStart:** if the session's cwd is inside an indexed checkout, the
+  hook adds the project handle, worktree and branch, the index age, recent
+  conversations in this checkout, and sibling worktrees with their latest
+  activity, all as `workmap expand` references. In an unrelated directory it
+  adds nothing.
+- **UserPromptSubmit:** searches the prompt's words (stop-words removed)
+  within that project. It adds only passages that contain at least two
+  distinct prompt words (more for long prompts), or a file whose path the
+  prompt names, along with the matched words. A reference already sent in a
+  session is not sent again; the per-session state lives in
+  `<state>/hook-seen/`, is pruned after 7 days, and is capped at 200 sessions.
+- **Stop, SessionEnd:** start a detached `workmap ingest --transcript <path>
+  --quiet`, so the next session sees this one without waiting for a full scan.
+
+Installed entries are marked with `WORKMAP_HOOK=1` in the command.
+`install` is idempotent. It keeps every other key and every foreign hook,
+copies the previous file to `<file>.workmap-backup`, replaces the file
+atomically, and refuses invalid JSON or a symlinked settings file.
+`hooks uninstall` and `workmap uninstall` remove only workmap's own entries.
+Rewritten files keep their content, but JSON key order and whitespace are
+normalized. `--scope project` writes `.claude/settings.local.json` (personal;
+Claude Code keeps it out of git) or `.codex/hooks.json` in the current
+directory.
+
+| Host | Version checked | Status | Settings |
+|---|---|---|---|
+| Claude Code | 2.1.302 | supported ([hooks docs](https://code.claude.com/docs/en/hooks)) | `~/.claude/settings.json`, `.claude/settings.local.json` |
+| Codex CLI | 0.163.0 (`hooks` feature stable, on by default) | supported, same events and JSON output ([hooks docs](https://learn.chatgpt.com/docs/hooks)); hooks run only after you trust them with `/hooks` in Codex | `~/.codex/hooks.json`, `.codex/hooks.json` |
+| OpenCode | 1.19.3 | unsupported: the installed package documents no hook or context-injection interface | — |
+
 ## Data and privacy
 
 - The index lives in `~/.local/state/workmap/index.db` (`WORKMAP_STATE_DIR`).
@@ -421,6 +485,8 @@ Known limits:
   manifests and blob ids, not code.
 - `ask` enforcement is verified from each CLI's documented flags. OpenCode is
   unsupported.
+- Host hooks match prompts lexically, without stemming. A prompt that words a
+  problem differently from the transcripts gets no context.
 - Identical-file detection stats at most 30,000 tracked files and records at
   most 20,000 per main checkout; very large repositories are only partly
   compared.
