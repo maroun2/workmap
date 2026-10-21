@@ -462,7 +462,7 @@ pub fn resolve(tx: &Connection, matcher: &mut Matcher) -> rusqlite::Result<usize
         }
     }
     for (repo, kind, rawv, resolved, sp, line, rnote) in &raw {
-        let snap_line = sp.starts_with("remote:").then(|| format!(" — line: \"{}\"", clip(rnote, 140))).unwrap_or_default();
+        let snap_line = if sp.starts_with("remote:") { format!(" — line: \"{}\"", clip(rnote, 140)) } else { String::new() };
         let k: &'static str = match kind.as_str() {
             "cargo_path" => "cargo_path",
             "cargo_git" => "cargo_git",
