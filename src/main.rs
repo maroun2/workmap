@@ -35,8 +35,12 @@ USAGE:
   workmap context [<project>] --task 'words' [--file PATH]... [--budget BYTES]
                                                        ranked context for a task/files; each item says why
   workmap search WORDS... [--project P [--worktree W --this-worktree]] [--kind K[,K]] [--provider P]
-                 [--speaker user|assistant] [--since YYYY-MM-DD] [--limit N] [--any]
-                                                       full-text search: project, doc, commit, message, remote
+                 [--speaker user|assistant] [--since YYYY-MM-DD] [--limit N] [--any|--exact] [--here] [--explain]
+                                                       full-text search: project, doc, commit, message, remote;
+                                                       tiers exact → prefix → stem (→ any with --any; substring
+                                                       for sha/path/identifier queries), each hit labeled;
+                                                       --here (= --this-worktree): only the current worktree;
+                                                       --explain: per-tier queries/counts, why hits are missing
   workmap expand REF [--limit N]                       one item and everything related to it (alias: explore)
   workmap related [<project>] [--depth N] [--limit N]  related projects with evidence
   workmap why <project> <other> [--depth N]            shortest evidence chain between two projects
@@ -281,21 +285,8 @@ fn run() -> Result<(), String> {
             }
         }
         "search" | "find" => {
-            let words = a.pos[1..].join(" ");
-            if words.trim().is_empty() {
-                return Err("usage: workmap search WORDS... [--project P] [--kind doc,message,commit,project,remote] [--any]".into());
-            }
-            let kinds: Vec<String> = a.all("--kind").iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
-            if let Some(bad) = kinds.iter().find(|k| !search::KINDS.contains(&k.as_str())) {
-                return Err(format!("unknown --kind {bad}; kinds: {}", search::KINDS.join(", ")));
-            }
-            let since = match a.get("--since") {
-                Some(d) => Some(search::date_to_ts(&d).ok_or_else(|| format!("--since {d}: expected YYYY-MM-DD"))?),
-                None => None,
-            };
-            let query = search::Query { text: words, kinds, provider: a.get("--provider"), speaker: a.get("--speaker"), since, limit: a.num("--limit", 10), any: a.has("--any") };
             let v = view::View { c: &c, cmd: cli_cmd(), state: state_vars() };
-            print!("{}", view::more::search_view(&v, &a.req(), &view::more::SearchReq { query, this_worktree: a.has("--this-worktree") })?);
+            print!("{}", search_cmd(&v, &a)?);
         }
         "related" => {
             let req = a.req();
@@ -474,6 +465,37 @@ fn version() -> String {
 }
 
 /// How printed follow-up commands invoke this binary.
+/// `workmap search …` (kept out of `run` so tests can execute printed commands).
+fn search_cmd(v: &view::View, a: &Args) -> Result<String, String> {
+    let words = a.pos[1..].join(" ");
+    if words.trim().is_empty() {
+        return Err("usage: workmap search WORDS... [--project P [--worktree W] [--here]] [--kind doc,message,commit,project,remote,file] [--any|--exact] [--explain]".into());
+    }
+    let kinds: Vec<String> = a.all("--kind").iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+    if let Some(bad) = kinds.iter().find(|k| !search::SEARCH_KINDS.contains(&k.as_str())) {
+        return Err(format!("unknown --kind {bad}; kinds: {}", search::SEARCH_KINDS.join(", ")));
+    }
+    let since = match a.get("--since") {
+        Some(d) => Some(search::date_to_ts(&d).ok_or_else(|| format!("--since {d}: expected YYYY-MM-DD"))?),
+        None => None,
+    };
+    let query = search::Query { text: words, kinds, provider: a.get("--provider"), speaker: a.get("--speaker"), since, limit: a.num("--limit", 10), any: a.has("--any"), exact: a.has("--exact") };
+    let here = a.has("--this-worktree") || a.has("--here");
+    let mut req = a.req();
+    let env_project = a.get("--project").is_none() && req.project.is_some();
+    if here && req.project.is_none() && a.get("--project").is_none() {
+        // `--here` without a scope: the checkout containing the current directory.
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let p = view::resolve_project(v.c, &cwd.to_string_lossy()).map_err(|e| format!("--here: {e}"))?;
+        req.project = Some(p.focus.path.clone().unwrap_or(p.handle));
+    }
+    if here && req.project.is_none() {
+        return Err("--this-worktree/--here needs a project: add --project P or run inside an indexed checkout".into());
+    }
+    let opts = view::more::SearchOpts { explain: a.has("--explain"), env_project, env_worktree: a.get("--worktree").is_none() && req.scope_worktree.is_some() };
+    view::more::search_view_opts(v, &req, &view::more::SearchReq { query, this_worktree: here }, &opts)
+}
+
 fn cli_cmd() -> String {
     if let Ok(c) = std::env::var("WORKMAP_CMD") {
         return c;
