@@ -395,7 +395,7 @@ fn index_repo(
         };
         let git_dir = git::git_dir(top).map(|g| std::fs::canonicalize(&g).unwrap_or(g).to_string_lossy().into_owned());
         let proposed_id = stable_id("checkout", &top.to_string_lossy());
-        let co_id = reconnect_checkout_id(tx, &repo_id, git_dir.as_deref(), &head, branch.as_deref(), &proposed_id)?;
+        let co_id = reconnect_checkout_id(tx, &repo_id, git_dir.as_deref(), &head, branch.as_deref(), top, &proposed_id)?;
         let mut aliases: Vec<PathBuf> = reported.iter().filter(|r| *r != top).cloned().collect();
         if let Some(w) = wt {
             if &w.path != top && !aliases.contains(&w.path) {
@@ -548,20 +548,21 @@ fn clone_moved_file_edges(tx: &Connection, co_id: &str, repo_id: &str, top: &Pat
 /// Reuse the recorded checkout identity after a move only when Git's admin dir
 /// matches and either branch or full HEAD also matches. This keeps historical
 /// refs and conversation attribution attached to the live checkout.
-fn reconnect_checkout_id(tx: &Connection, repo_id: &str, git_dir: Option<&str>, head: &str, branch: Option<&str>, proposed: &str) -> rusqlite::Result<String> {
+fn reconnect_checkout_id(tx: &Connection, repo_id: &str, git_dir: Option<&str>, head: &str, branch: Option<&str>, current_path: &Path, proposed: &str) -> rusqlite::Result<String> {
     let Some(git_dir) = git_dir.filter(|x| !x.is_empty()) else { return Ok(proposed.to_string()) };
     // `mark_missing` runs after checkout indexing, so a moved checkout may not
-    // carry `missing=true` yet. An absent recorded path is sufficient to
-    // consider it, while identity still requires the admin dir plus branch/HEAD.
+    // carry `missing=true` yet. After first reconnection, recorded path already
+    // equals current path; continue reusing its old identity on every scan.
     let candidates = crate::overview::nodes(tx, "kind='checkout' AND repo_id=?1 AND id<>?2", &[&repo_id, &proposed])?;
     let matching: Vec<_> = candidates
         .into_iter()
         .filter(|co| {
+            let recorded_path_matches = co.path.as_deref().is_some_and(|p| p == current_path.to_string_lossy());
             let recorded_path_absent = co.path.as_deref().map(|p| !Path::new(p).is_dir()).unwrap_or(false);
             let same_dir = co.meta.get("git_dir").and_then(|v| v.as_str()) == Some(git_dir);
             let same_branch = branch.filter(|b| !b.is_empty()).is_some_and(|b| co.meta.get("branch").and_then(|v| v.as_str()) == Some(b));
             let same_head = !head.is_empty() && co.meta.get("head_full").and_then(|v| v.as_str()) == Some(head);
-            recorded_path_absent && same_dir && (same_branch || same_head)
+            (recorded_path_absent || recorded_path_matches) && same_dir && (same_branch || same_head)
         })
         .collect();
     Ok(if matching.len() == 1 { matching[0].id.clone() } else { proposed.to_string() })

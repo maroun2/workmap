@@ -403,6 +403,15 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
     let moved_id = crate::util::stable_id("checkout", &moved.to_string_lossy());
     assert!(overview::get_node(&c, &moved_id).unwrap().is_none(), "move must reuse prior checkout identity without a duplicate");
 
+    // A repeated full scan must retain historical identity after path has been
+    // updated to the moved location; otherwise it would create a second node.
+    let (c, st) = scan_once(&env);
+    assert_eq!((st.checkouts_missing, st.checkouts_pruned), (0, 0), "{:?}", st.warnings);
+    assert!(overview::get_node(&c, &moved_id).unwrap().is_none(), "second full scan must not create a duplicate checkout");
+    let (path, meta): (String, String) = c.query_row("SELECT path,meta FROM nodes WHERE id=?1", [&old_co], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(path, moved.to_string_lossy());
+    assert!(serde_json::from_str::<serde_json::Value>(&meta).unwrap()["moved_paths"].as_array().is_some());
+
     let api = handle_of(&c, &fx.api);
     let cv = view::expand(&v(&c), ":conversation:Batch charges spike", &scoped(&api)).unwrap();
     assert!(!cv.contains("@?"), "{cv}");
