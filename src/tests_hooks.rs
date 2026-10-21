@@ -53,7 +53,8 @@ fn session_start_in_an_indexed_checkout_lists_expandable_conversations_within_bu
         // The conversation that ran in this worktree, pinned to it, and the sibling's.
         let refs = printed_refs(&text);
         let fix = refs.iter().find(|r| r.contains("@fix/webhook-retry:conversation:Double charge")).unwrap_or_else(|| panic!("{text}"));
-        assert!(expand_ref(&c, "ledger-sdk", fix).unwrap().contains("Root cause") || text.contains("Double charge on webhook retry"));
+        let got = expand_ref(&c, "ledger-sdk", fix).unwrap();
+        assert!(got.starts_with("# ':conversation:Double charge'") && got.contains("session aaaa1111-fix"), "expands to that conversation: {got}");
         assert!(refs.iter().any(|r| r.contains(":conversation:Port retry") && !r.contains('@')), "main worktree's latest conversation: {text}");
         assert!(text.contains("Other worktrees of this project:") && text.contains(&fx.api.display().to_string()));
         assert!(assert_refs_roundtrip(&c, "ledger-sdk", &text) >= 2);

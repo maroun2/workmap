@@ -667,6 +667,9 @@ fn unsupported_note(h: &str) -> &'static str {
 pub fn hook_command(env: &Env, bin: &Path, harness: &str, ev: Event) -> String {
     let mut parts = vec!["env".to_string(), MARKER.to_string()];
     for (k, v) in env.exports() {
+        if k == "WORKMAP_GH_BIN" || k == "WORKMAP_GLAB_BIN" {
+            continue; // hooks never run remote discovery
+        }
         if k == "WORKMAP_STATE_DIR" && Path::new(&v) == env.home.join(".local/state/workmap") && !env.overridden {
             continue;
         }

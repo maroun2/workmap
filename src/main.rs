@@ -475,6 +475,9 @@ fn run() -> Result<(), String> {
                     // Prefer the stable copy `workmap install` maintains over a build directory.
                     let canonical = env.home.join(".local/share/workmap/bin/workmap");
                     let bin = if canonical.is_file() { canonical } else { std::env::current_exe().map_err(|e| e.to_string())? };
+                    if !bin.starts_with(env.home.join(".local/share/workmap")) {
+                        eprintln!("note: hooks will run {} (no `workmap install` copy found); run `workmap install` first if this is a build directory", bin.display());
+                    }
                     for l in hook::install(&env, &hook::HooksOpts { harness: &harness, scope, cwd: &cwd, bin: &bin, dry_run: a.has("--dry-run") })? {
                         println!("{l}");
                     }
