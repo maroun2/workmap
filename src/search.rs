@@ -60,7 +60,13 @@ pub fn date_to_ts(d: &str) -> Option<i64> {
 
 /// Run a query, optionally limited to one project (repo id) or one checkout.
 /// Returns (hits after collapsing duplicates, total matching passages).
+/// Among identical passages (the same doc in several worktrees) the one in
+/// `prefer` wins, then the one in a main checkout.
 pub fn run(c: &Connection, q: &Query, repo: Option<&str>, checkout: Option<&str>) -> rusqlite::Result<(Vec<Hit>, i64)> {
+    run_pref(c, q, repo, checkout, None)
+}
+
+pub fn run_pref(c: &Connection, q: &Query, repo: Option<&str>, checkout: Option<&str>, prefer: Option<&str>) -> rusqlite::Result<(Vec<Hit>, i64)> {
     let Some(m) = fts_query(&q.text, q.any) else { return Ok((vec![], 0)) };
     let mut wh = vec!["passages_fts MATCH ?".to_string()];
     let mut args: Vec<SqlValue> = vec![SqlValue::Text(m)];
@@ -93,9 +99,11 @@ pub fn run(c: &Connection, q: &Query, repo: Option<&str>, checkout: Option<&str>
     let fetch = (q.limit.max(1) * 6 + 50) as i64;
     let sql = format!(
         "SELECT p.kind, p.node_id, p.repo_id, p.checkout_id, p.source_path, p.line, p.loc, p.speaker, coalesce(p.ts,0), p.title, p.heading,
-                snippet(passages_fts, 1, '[', ']', '…', 14), round(bm25(passages_fts, 3.0, 1.0), 6) AS score, p.id
+                snippet(passages_fts, -1, '[', ']', '…', 14), round(bm25(passages_fts, 3.0, 1.0), 6) AS score, p.id
          FROM passages_fts JOIN passages p ON p.id=passages_fts.rowid WHERE {wsql}
-         ORDER BY score, coalesce(p.ts,0) DESC, p.node_id, p.loc, p.part LIMIT {fetch}"
+         ORDER BY score, CASE WHEN p.checkout_id = {pref} THEN 0 WHEN (SELECT json_extract(meta,'$.main') FROM nodes WHERE id=p.checkout_id) THEN 1 ELSE 2 END,
+                  coalesce(p.ts,0) DESC, p.node_id, p.loc, p.part LIMIT {fetch}",
+        pref = prefer.map(|p| format!("'{}'", p.replace('\'', "''"))).unwrap_or_else(|| "NULL".into())
     );
     let mut st = c.prepare(&sql)?;
     let rows = st.query_map(rusqlite::params_from_iter(args.iter()), |r| {

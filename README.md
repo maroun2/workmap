@@ -1,43 +1,364 @@
 # workmap
 
-A local, offline map of your Git repositories, worktrees, docs, commits and
-coding-agent conversations (Claude Code, Codex, OpenCode).
+**A local, offline map of everything you and your coding agents have already
+done: Git repositories, worktrees, docs, commits, and Claude Code / Codex /
+OpenCode conversations, linked by evidence.**
 
-Point it at a project and it lists what you would otherwise have to remember:
-the README line that names a file, the sibling worktree with the same file,
-the commit that last touched it, and the earlier agent conversation that
-already read or wrote it. Every line of output carries its evidence (path,
-line number, timestamp). workmap never summarises or interprets.
+You open a project and an agent starts from zero. Yet somewhere on your disk is
+the README line that names the file you are about to change, a sibling worktree
+where the same file already looks different, the commit that last touched it,
+the conversation from two weeks ago that read it and found the bug, and the
+library next door that this project depends on by path. workmap finds those
+and shows each one with the exact file, line and timestamp it came from.
 
-> Status: 0.1 baseline. See the repository history for the feature roadmap.
+- **Deterministic.** No LLM indexing, no embeddings, no summaries. Every line of
+  output is a fact with a source (`path:line`, transcript line, commit).
+- **Local and offline.** One SQLite file on your machine. The only network
+  access is optional: listing repositories you can reach through an
+  already-authenticated `gh` or `glab`, and you can turn that off.
+- **Agent-friendly.** Short, copy-pasteable references (`:src/lib.rs`,
+  `:commit:5ae2bbc7`, `:message:5f2c9a10:l5`) and a bounded `--budget` mode for
+  feeding context to an agent.
 
-## Build
+## A walk through it
 
-```sh
-cargo build --release          # needs a C compiler (SQLite is bundled) and git at runtime
-cargo test
+The output below is real, from [`examples/demo.sh`](examples/demo.sh), which
+builds three synthetic projects (`inkwell`, a CLI; `inkcore`, its library;
+`notes`, a docs repo), one Claude Code conversation and a fake `gh`. The full
+run is in [`examples/demo-output.txt`](examples/demo-output.txt).
+
+**1. What exists?**
+
+```
+$ workmap overview
+workmap: 3 projects, 1 agent conversations; last scan 2026-10-21 06:26Z
+- inkcore — 1 worktree(s), 0 conversation(s), last commit 2026-09-01
+- inkwell — 2 worktree(s), 1 conversation(s), last commit 2026-09-01, last conversation 2026-09-10
+- notes — 1 worktree(s), 0 conversation(s), last commit 2026-09-01
+Remote-only, not cloned (1; metadata from authenticated gh/glab; expand remote:<name>):
+- remote:github.com/acme/inkwell-vscode — public — Editor extension for inkwell
 ```
 
-With Nix: `nix-build -I nixpkgs=flake:nixpkgs` (see `default.nix`).
+**2. One project at a glance.** Docs quoted with line numbers, key files with
+the reason they rank, commits, conversations, and related projects with
+evidence:
 
-## Use
-
-```sh
-workmap scan                        # index $HOME (plus `workmap roots add DIR` roots)
-workmap overview                    # every indexed project by name
-workmap context myproject           # docs, key files, commits, conversations
-workmap expand myproject:src/lib.rs # who read/wrote it, docs naming it, commits
-workmap ask 'myproject:conversation:Fix the parser' 'What did you change?' --dry-run
+```
+$ workmap context inkwell
+## Key files (5 with evidence; why: doc links, entry points, commits, conversation writes/reads)
+- :src/check.rs — named in README.md:6 (Commands); 1 commit(s), last 2026-09-01; conversations r1
+## Conversations (1; 1 with file reads/writes first)
+- ':conversation:Parser timeout' 2026-09-10 claude@main r1 w1 — "Parser timeout on huge files"
+## Related projects (2; evidence, not interpretation)
+- :related:inkcore — → Cargo path dependency [declared] at …/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
+- :related:notes — ← doc names its URL or path [documented] at …/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
 ```
 
-`workmap --help` lists every command.
+**3. Search what was said, not just what was committed.** Individual messages
+from agent transcripts are searchable, with speaker, time and transcript line:
+
+```
+$ workmap search retry deadline --project inkwell --kind message
+1. :message:5f2c9a10:l5 — claude assistant message · 2026-09-10 09:01Z · conversation "Parser timeout on huge files"
+   "The hang is the [retry] helper in inkcore: it retries a timed-out read…"
+
+$ workmap expand inkwell:message:5f2c9a10:l5
+# :message:5f2c9a10:l5 — assistant message in claude conversation ':conversation:Parser timeout'
+2026-09-10 09:01Z · transcript …/5f2c9a10-demo.jsonl line 5 · historical text, not a decision record
+The hang is the retry helper in inkcore: it retries a timed-out read three times without a deadline. I capped the total wait.
+Previous: :message:5f2c9a10:l3 assistant: "Let me read the check command first."
+Next: :message:5f2c9a10:l7 user: "ship it after the release checklist"
+```
+
+**4. Why are two projects connected?**
+
+```
+$ workmap why notes inkcore
+1. notes → inkwell (1 piece(s) of evidence)
+   → doc names its URL or path [documented] at …/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
+2. inkwell → inkcore (4 piece(s) of evidence)
+   → Cargo path dependency [declared] at …/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
+```
+
+**5. Context for a task, bounded.** Give the task and the files you will touch;
+get a ranked list where every item says why it is there, cut at a byte budget:
+
+```
+$ workmap context inkwell --task 'parser timeout on huge files' --file src/check.rs --budget 2500
+- ':conversation:Parser timeout' [90] — read src/check.rs (observed, Read) at transcript l.3, 2026-09-10
+- :README.md#commands [40] — names src/check.rs at README.md:6
+- :commit:36d628cc [30] — changed src/check.rs (A) on 2026-09-01
+- :docs/exit-codes.md#codes [19] — text matches 'parser' 'huge' in doc docs/exit-codes.md § Codes l.3
+- :related:inkcore [12] — related project: → Cargo path dependency [declared] at …/Cargo.toml:6
+```
+
+**6. Ask the conversation that already did the work** (read-only; see
+[ask](#ask-read-only-follow-up-questions)):
+
+```
+$ workmap ask --project inkwell ':conversation:Parser timeout' 'Which deadline did you pick?' --dry-run
+```
+
+## Quick start
+
+```sh
+git clone https://github.com/maroun2/workmap && cd workmap
+cargo build --release                 # Rust 1.80+, a C compiler (SQLite is bundled)
+./target/release/workmap scan         # index $HOME; first run on a large home takes minutes
+./target/release/workmap overview
+```
+
+Projects outside `$HOME`, or under skipped directories such as `~/.config` or
+`tmp`: `workmap roots add /path/to/projects && workmap scan`.
+
+Try it without touching your own data: `examples/demo.sh target/release/workmap`
+(writes only under `/tmp/workmap-demo`).
+
+### Nix / NixOS
+
+```sh
+nix-build -I nixpkgs=flake:nixpkgs      # result/bin/workmap; runs the test suite in the sandbox
+```
+
+In a NixOS or home-manager configuration, `import /path/to/workmap { inherit pkgs; }`
+gives you the package (`default.nix` is a plain `rustPlatform.buildRustPackage`),
+e.g. `home.packages = [ (import ./workmap { inherit pkgs; }) ];`.
+
+### Install for agents (optional)
+
+```sh
+workmap install          # copies the binary, writes skills and a daily systemd --user timer
+workmap uninstall        # removes them again; the index is kept until you delete it
+```
+
+`install` copies the binary to `~/.local/share/workmap/bin/workmap` and writes a
+`workmap` skill (binary + `SKILL.md`) into `~/.claude/skills`,
+`~/.codex/skills` and `~/.config/opencode/skills`. The skill text is generated
+from your index: commands, registered roots, and a bounded project overview
+(≈24 KiB) that includes remote-only repositories by name. Every `workmap scan`
+refreshes skill files that workmap generated (marked with an HTML comment) and
+nothing else. It refuses to write through a symlinked skills directory or into
+a Git checkout, and never uses sudo. The timer runs `workmap scan --quiet`
+daily (`Persistent=true`). It is enabled only for your real home with a user
+session bus. `--no-activate` writes the units without enabling them.
+
+## Commands
+
+| Command | What it shows |
+|---|---|
+| `workmap overview` | Every project by name, plus remote-only repositories |
+| `workmap context [P]` | Project map: worktrees, docs, key files, commits, conversations, related projects, index freshness and coverage |
+| `workmap context [P] --task '…' --file PATH… [--budget BYTES]` | Ranked, budget-bounded context; every item has a reason |
+| `workmap search WORDS… [--project P] [--kind K] [--speaker user\|assistant] [--provider claude\|codex\|opencode] [--since DATE] [--any]` | Full-text search over project metadata, doc sections, commits, conversation messages and remote catalog entries |
+| `workmap expand REF` | One file, doc section, commit, conversation, message or relation, with everything linked to it |
+| `workmap related [P] [--depth N]` | Related projects (breadth-first, bounded, cycle-safe) with evidence |
+| `workmap why P OTHER [--depth N]` | Shortest evidence chain between two projects, each step quoted |
+| `workmap ask REF 'question' [--dry-run]` | Read-only follow-up in a stored Claude Code or Codex conversation |
+| `workmap scan [--root DIR] [--full] [--no-sessions] [--no-remote] [--refresh-remote]` | Incremental re-index |
+| `workmap roots add DIR` / `roots list` | Extra roots to scan, persisted |
+| `workmap remote status\|list\|refresh\|enable\|disable` | The gh/glab catalog |
+| `workmap status` | Counts, freshness, transcript coverage per provider, remote host status |
+
+### References
+
+A reference is `<project>:<rest>`, or `:<rest>` once a scope is set with
+`--project P` or `export WORKMAP_PROJECT=P` (`WORKMAP_WORKTREE` / `--worktree`
+picks a non-main worktree). There is no saved "current project": concurrent
+shells and agents never affect each other.
+
+| `<rest>` | Names |
+|---|---|
+| `src/lib.rs` | a file or doc |
+| `README.md#install` | one doc section (GitHub-style heading slug) |
+| `commit:5ae2bbc7` | a commit (≥ 4 hex chars) |
+| `conversation:Fix the parser` | a conversation by exact title or unique title prefix |
+| `session:019ff26f` | a conversation by the provider's session id prefix |
+| `message:5f2c9a10:l5` | one message: session id prefix + transcript line (`l…`) or part number (`p…`, OpenCode) |
+| `related:inkcore` | all relation evidence between the scope project and another |
+
+`remote:github.com/acme/tool` names a repository you can access but have not
+cloned. A project whose name is not unique is referred to by its checkout path.
+Ambiguous names fail with the candidates listed; nothing is fuzzy-picked.
+
+## What gets indexed
+
+| Source | What is kept |
+|---|---|
+| Git checkouts under `$HOME` and your roots | repository identity (Git common dir), all worktrees, remotes (credentials stripped), branches, the newest 30 commits per worktree (`scan --commits N`) with changed files |
+| Docs: `README*`, `CLAUDE.md`, `AGENTS.md`, `docs/*.md`, top-level `*.md`, Claude Code project memory | headings, short excerpts with line numbers, links to files, doc sections as searchable text (≤ 80 passages per doc) |
+| Manifests: `Cargo.toml`, `package.json`, `pyproject.toml`, `.gitmodules` | local path and Git dependencies, declared package names |
+| Claude Code `~/.claude/projects/*/*.jsonl` | file reads/writes from structured tool calls with their results, user and assistant text messages |
+| Codex `~/.codex/sessions/**/rollout-*.jsonl` | `apply_patch` writes, shell mentions, user and assistant messages (both rollout formats) |
+| OpenCode `opencode.db` (read-only) and legacy JSON storage | file tools and patches, user and assistant text parts |
+| `gh` / `glab` (optional) | names and metadata of repositories you can access |
+
+Tool calls, tool output, reasoning blocks and harness-injected context
+(`<system-reminder>`, `<environment_context>`, AGENTS.md preambles) are never
+indexed as text. A message is cut at 4,800 characters, a conversation at 5,000
+messages or 2 MiB of text, and a transcript is read up to 512 MiB; each cut is
+reported as coverage, not hidden.
+
+## Evidence, not interpretation
+
+Every relation keeps its kind, its strength class and where it came from.
+They are never merged into a vague "related" score.
+
+| Relation | Class | Evidence |
+|---|---|---|
+| Cargo / package.json / pyproject path or Git dependency, Git submodule | `declared` | manifest file and line |
+| Symlink pointing into another project | `structural` | the symlink |
+| A doc names another project's URL or path | `documented` | doc file and line |
+| Separate clones of the same remote (`host/namespace/repo`) | `identity` | the remotes |
+| A conversation running in A read or wrote files of B | `observed` | transcript line; co-use, **not** a dependency |
+| Identical substantive files (Git blob id, 1 KiB – 4 MiB, licences, lockfiles, build output and vendored trees excluded, blobs shared by > 5 projects ignored) | `hash` | example file; shared content, **not** lineage |
+| A registry dependency has the same name as a package declared in another project | `candidate` | shown separately as UNVERIFIED, never used in `why` chains |
+
+Worktrees of one repository (same Git common dir) are the same project, not
+related projects. Remote and local copies are matched by normalized
+`host/namespace/repo`, so a repository you cloned is not listed again as
+remote-only.
+
+The same discipline applies elsewhere:
+
+- File access counts only from structured tool calls. A path inside a shell
+  command is a *mention* (`sh`), shown but never ranked. A tool call without a
+  recorded result is *requested*, not observed.
+- A bare filename in a doc that happens to match one file is an unverified
+  candidate, not a link.
+- Conversation text is historical. The latest user input of a conversation is
+  shown as "as typed; not a decision record". `ask` prints what changed on disk
+  since the conversation ended.
+
+## Freshness and coverage
+
+Views that make claims print where those claims stop:
+
+```
+Index: last scan 2026-10-21 06:26Z (3h ago) · history: newest 30 commits per worktree
+Coverage: 12 conversation(s), 840 searchable message(s); 1 truncated at the size cap, 2 source transcript missing (evidence kept)
+WARNING: index is stale (5d ago > 48h); run `workmap scan` — recent commits, docs and conversations may be missing
+```
+
+The stale threshold is 48 hours (`WORKMAP_STALE_HOURS`). Transcripts deleted
+after indexing keep their evidence and text, flagged as missing. Checkouts
+deleted from disk are pruned on the next scan. `workmap status` breaks coverage
+down per provider (parsed, unrelated, missing, error).
+
+## Remote discovery (gh / glab)
+
+When `gh` or `glab` is already logged in, `scan` lists the repositories you can
+access on each configured host, including self-hosted GitHub Enterprise and
+GitLab hosts from their config files (`~/.config/gh/hosts.yml`,
+`~/.config/glab-cli/config.yml`):
+
+- **Scope.** GitHub: `user/repos?affiliation=owner,collaborator,organization_member`.
+  GitLab: `projects?membership=true`. Repositories you own or are a member of,
+  not every public repository.
+- **Metadata only.** Host, namespace, name, URL, description, visibility,
+  archived flag, default branch, last update. Nothing is cloned or fetched, and
+  no docs or transcripts are downloaded.
+- **No prompts, no secrets.** workmap runs `gh auth status --hostname H` and
+  `gh api --hostname H --paginate …` (same for `glab`) with prompts disabled and
+  stdin closed. It never asks for a token, never runs `gh auth token`, never
+  reads or stores the CLIs' stderr, and reports failures as fixed messages
+  (`exit code 1`, `timed out after 180s`).
+- **Failure isolation and caching.** Each host is refreshed at most once per
+  24 hours (`WORKMAP_REMOTE_TTL_HOURS`). A host that fails (offline, rate
+  limit, logged out) keeps its previous entries, marked stale. Other hosts are
+  unaffected. No configured or authenticated host means remote discovery is
+  skipped silently.
+- **Opt out.** `workmap remote disable` (also deletes cached remote
+  metadata), `WORKMAP_REMOTE=0`, or `scan --no-remote` for one run.
+  `workmap remote refresh` forces a refresh.
+
+Remote metadata, private repositories included, stays in your local index and
+your generated skill files. Nothing is sent anywhere.
+
+## `ask`: read-only follow-up questions
+
+`ask` resumes a stored conversation with the provider's own CLI, restricted to
+reading. Before anything runs, workmap checks that the installed CLI's `--help`
+documents every restricting flag, and refuses otherwise. `--dry-run` prints the
+exact command, working directory and why each flag is there.
+
+- **Claude Code:** `claude -p --resume ID --fork-session --no-session-persistence --tools Read,Grep,Glob --disallowedTools Bash,Edit,Write,… --permission-mode dontAsk --strict-mcp-config` with an empty MCP config and hooks disabled. The original transcript is not appended to.
+- **Codex:** `codex exec resume --ignore-user-config --ephemeral -c sandbox_mode="read-only" -c approval_policy="never" -c mcp_servers={} ID`.
+- **OpenCode:** refused. `opencode run --session` has no read-only mode workmap
+  can verify, so it fails closed.
+
+The resumed agent remembers its transcript, not today's files. `ask` prints
+how many commits landed since the conversation ended, how many of the files it
+wrote have changed or vanished since, and how many tracked files are modified
+now.
 
 ## Data and privacy
 
-Everything stays on your machine. The index lives in
-`~/.local/state/workmap/index.db` (override with `WORKMAP_STATE_DIR`). It holds
-paths, metadata, short doc excerpts and evidence pointers, with
-secret-looking tokens redacted. Delete that directory to remove it.
+- The index lives in `~/.local/state/workmap/index.db` (`WORKMAP_STATE_DIR`).
+  Delete the directory to remove everything.
+- It contains paths, metadata, doc excerpts and sections, commit subjects, and
+  the natural-language text of your agent conversations (bounded, with
+  secret-looking tokens such as `ghp_…`, `sk-…`, `glpat-…` and long random
+  strings redacted). Treat it like the transcripts themselves.
+- workmap only reads your repositories and transcript stores. Git runs with
+  `GIT_OPTIONAL_LOCKS=0`, and the OpenCode and Codex databases are opened
+  read-only.
+- `WORKMAP_HOME` replaces `$HOME` for scanning, provider stores, gh/glab config
+  and install targets (tests and the demo use a fake home).
+  `WORKMAP_CLAUDE_DIR`, `WORKMAP_CODEX_DIR` and `WORKMAP_OPENCODE_DIR` point at
+  other stores. `WORKMAP_GH_BIN` and `WORKMAP_GLAB_BIN` select the CLIs.
+
+## Scale and limits
+
+Measured with [`examples/bench.sh`](examples/bench.sh) on a synthetic home: 40
+repositories × 60 files, 200 Claude-style transcripts × 200 messages
+(10.9 MB of JSONL), on a 3-vCPU VM (Xeon E5-2690 v2, ext4):
+
+| | |
+|---|---|
+| first scan | 15.3 s |
+| repeat scan, nothing changed | 4.6 s (mostly `git remote`/`branch`/`worktree` calls per repository) |
+| index size | 26.7 MB, 40,000 message passages |
+| `search` (global / one project) | 31 ms / 214 ms |
+| `context --task --file` | 0.4 s |
+| `related --depth 3` | 31 ms |
+
+These numbers describe that synthetic layout on that machine, not a benchmark.
+A real home is dominated by other costs: directory walk size, `git log` on slow
+or network storage, and reading the first 64 KiB of every Claude transcript on
+the first scan. Repeat scans only `stat` unchanged transcripts and skip
+unchanged checkouts.
+
+Known limits:
+
+- Codex has no structured read tool, so Codex reads appear only as shell
+  mentions.
+- Claude Code sub-agent transcripts (`<session>/subagents/*.jsonl`) are not
+  parsed.
+- Only HEAD history of each worktree is indexed (default 30 commits, 40 files
+  each). Other branches appear by name.
+- Relations come from each repository's main checkout. A dependency added only
+  on a feature branch is not seen until it is merged there.
+- Manifests are parsed line by line, not with a full TOML parser. Unusual
+  layouts (multi-line inline tables) can be missed. Python support covers PEP
+  621 `dependencies`, Poetry dependency tables and `tool.uv.sources`.
+- Search is word-based (SQLite FTS5, `unicode61`, diacritics folded). It has
+  no stemming and no fuzzy matching, and does not search code: use `rg` or your
+  editor for that.
+- `ask` enforcement is verified from each CLI's documented flags. OpenCode is
+  unsupported.
+- The scan skips dependency, cache and build directories (`node_modules`,
+  `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
+  and follows symlinked directories only within two levels of a root.
+
+## Development
+
+```sh
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+Tests build throwaway Git repositories, worktrees and synthetic Claude Code,
+Codex and OpenCode stores in a temp dir, and fake `gh`/`glab` scripts. They
+never touch your home or the network. CI runs the same on every push.
 
 ## License
 

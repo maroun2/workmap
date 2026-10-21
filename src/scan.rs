@@ -768,6 +768,7 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
             meta: &meta,
         },
     )?;
+    // The conversation title is searchable once, on its first message.
     let title = clip(&redact(&label), 120);
     let src_file = s.source_path.split("#session=").next().unwrap_or(&s.source_path);
     for m in &s.messages {
@@ -786,7 +787,7 @@ pub fn store_session(tx: &Connection, key: &str, s: &Session, matcher: &mut Matc
                     part: k as i64,
                     speaker: m.speaker,
                     ts: m.ts,
-                    title: &title,
+                    title: if m.seq == 1 && k == 0 { &title } else { "" },
                     heading: s.provider,
                     text: &chunk,
                     origin: &origin,

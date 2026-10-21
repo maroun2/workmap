@@ -119,7 +119,13 @@ pub fn search_view(v: &View, req: &Req, sr: &SearchReq) -> R<String> {
         Some(_) => Some(scope_project(v, req)?),
         None => None,
     };
-    let (hits, total) = db(search::run(v.c, &sr.query, scope.as_ref().map(|p| p.repo.id.as_str()), if sr.this_worktree { scope.as_ref().map(|p| p.focus.id.as_str()) } else { None }))?;
+    let (hits, total) = db(search::run_pref(
+        v.c,
+        &sr.query,
+        scope.as_ref().map(|p| p.repo.id.as_str()),
+        if sr.this_worktree { scope.as_ref().map(|p| p.focus.id.as_str()) } else { None },
+        scope.as_ref().map(|p| p.focus.id.as_str()),
+    ))?;
     let mut o = String::new();
     let kinds = if sr.query.kinds.is_empty() { "all kinds".to_string() } else { sr.query.kinds.join(",") };
     let where_ = match &scope {
@@ -516,8 +522,8 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
     }
     if let Some(task) = t.task.filter(|x| !x.trim().is_empty()) {
         let words: Vec<String> = task.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).filter(|w| w.chars().count() > 2).map(|w| w.to_lowercase()).collect();
-        let query = search::Query { text: task.to_string(), any: true, limit: 15, ..Default::default() };
-        let (hits, _) = db(search::run(c, &query, Some(&p.repo.id), None))?;
+        let query = search::Query { text: words.join(" "), any: true, limit: 15, ..Default::default() };
+        let (hits, _) = db(search::run_pref(c, &query, Some(&p.repo.id), None, Some(&co.id)))?;
         for (i, h) in hits.iter().enumerate() {
             let low = h.snippet.to_lowercase();
             let matched: Vec<&String> = words.iter().filter(|w| low.contains(&format!("[{w}"))).collect();
@@ -530,7 +536,7 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
                 10 + 5 * matched.len() as i64 - i as i64,
                 h.ts,
                 r,
-                format!("text matches {} in {d}", matched.iter().map(|w| format!("'{w}'")).collect::<Vec<_>>().join(",")),
+                format!("text matches {}in {d}", matched.iter().map(|w| format!("'{w}' ")).collect::<String>()),
                 Some(format!("\"{}\"", clip(&h.snippet, 150))),
             );
         }

@@ -6,7 +6,7 @@ use crate::config::Env;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const SEED: &str = "Use before exploring an unfamiliar project or repeating an investigation. Discover related work you may not know exists: files, worktrees, commits, and previous agent conversations. Find who already investigated a problem and ask follow-up questions using their saved context. Indexed projects: ";
+pub const SEED: &str = "Use before exploring an unfamiliar project or repeating an investigation. Discover related work you may not know exists: files, worktrees, commits, and previous agent conversations. Find who already investigated a problem, search past conversation messages, see related projects with evidence, and ask follow-up questions using their saved context. Indexed projects: ";
 pub const MAX_DESCRIPTION: usize = 1000;
 pub const MAX_BODY: usize = 24 * 1024;
 
@@ -79,6 +79,11 @@ pub fn description(c: &Connection) -> String {
         d.push_str("(none yet; run workmap scan)");
     }
     d.push('.');
+    let remote: i64 = c.query_row("SELECT count(*) FROM nodes WHERE kind='remote'", [], |r| r.get(0)).unwrap_or(0);
+    let extra = format!(" Plus {remote} accessible remote repositories not cloned here.");
+    if remote > 0 && d.len() + extra.len() <= MAX_DESCRIPTION {
+        d.push_str(&extra);
+    }
     d
 }
 
@@ -97,7 +102,7 @@ pub fn skill_body(c: &Connection, env: &Env, bin: &Path) -> String {
     let b = command_prefix(env, bin);
     let mut o = format!(
         "{MARKER}\n\n# workmap\n\nLocal index of Git repos, worktrees, docs, commits and native agent conversations (Claude Code, Codex, OpenCode). Output lists evidence with source paths, lines and timestamps; it does not decide what is authoritative.\n\n\
-         ## Commands\n\nPick a project from the overview below, then set the scope once and use short references:\n\n```\n{b} overview                                   # all indexed projects by name\nexport WORKMAP_PROJECT=<project>             # or add --project <project> to each command; WORKMAP_WORKTREE=<branch> for a non-main worktree\n{b} context                                    # project map: docs, key files, commits, conversations\n{b} expand :<path>                             # conversations that read/wrote a file, docs naming it, commits\n{b} expand ':<doc>#<heading-slug>'             # one doc section, quoted from the file\n{b} expand :commit:<sha-prefix>                # one commit\n{b} expand ':conversation:<title prefix>'      # one agent conversation and its file accesses (:session:<id-prefix> also works)\n{b} ask ':conversation:<title prefix>' 'question' --dry-run   # read-only resume plan; drop --dry-run to run\n{b} scan                                       # refresh (incremental; also refreshes this file)\n```\n\n"
+         ## Commands\n\nPick a project from the overview below, then set the scope once and use short references:\n\n```\n{b} overview                                   # all indexed projects by name\nexport WORKMAP_PROJECT=<project>             # or add --project <project> to each command; WORKMAP_WORKTREE=<branch> for a non-main worktree\n{b} context                                    # project map: docs, key files, commits, conversations, related projects\n{b} context --task 'what you are doing' --file <path> --budget 6000   # ranked context for a task; every item says why\n{b} search 'words'                             # full text over docs, commits, conversation messages (all projects, or scoped with --project)\n{b} related                                    # related projects with evidence (manifests, submodules, symlinks, doc links, shared files)\n{b} why <project> <other>                      # shortest evidence chain between two projects\n{b} expand :<path>                             # conversations that read/wrote a file, docs naming it, commits\n{b} expand ':<doc>#<heading-slug>'             # one doc section, quoted from the file\n{b} expand :commit:<sha-prefix>                # one commit\n{b} expand ':conversation:<title prefix>'      # one agent conversation and its file accesses (:session:<id-prefix> also works)\n{b} ask ':conversation:<title prefix>' 'question' --dry-run   # read-only resume plan; drop --dry-run to run\n{b} scan                                       # refresh (incremental; also refreshes this file)\n```\n\nOutput is evidence (paths, lines, timestamps), not interpretation. Conversation text is historical; a latest user input is not a decision. Check the `Index:` line for staleness and `Coverage:` for truncated or missing transcripts. Entries marked remote: are repositories you can access but have not cloned (metadata only).\n\n"
     );
     o.push_str(&format!(
         "## Registering project roots (do this once after install)\n\nThe default scan walks {} (symlinks followed two levels deep; caches, `.config`, `.local`, `tmp` skipped). Ask the user which directories hold their projects, and also look for project locations named in their agent configs, shell history or the repos listed below. Register every root directory outside that walk, then rescan:\n\n```\n{b} roots list\n{b} roots add <dir>          # repeat per project root\n{b} scan\n```\n\nRegistered roots:\n",
