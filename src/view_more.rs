@@ -1188,6 +1188,9 @@ fn hop_edge_score(kind: &str, strength: &str) -> i64 {
     match (kind, strength) {
         ("write", "observed") => 40,
         ("read", "observed") => 30,
+        // Codex parsed_cmd is best-effort intent evidence, not proof that the
+        // command returned the complete file. Keep it above a request only.
+        ("read", "parsed") => 22,
         (_, "requested") => 15,
         ("mentioned", _) => 3,
         _ => 5,
@@ -1199,6 +1202,7 @@ fn hop_verb(kind: &str, strength: &str) -> &'static str {
         ("mentioned", _) => "only named in a shell command (mention, not access) by",
         ("write", "observed") => "written by",
         ("read", "observed") => "read by",
+        ("read", "parsed") => "read via shell command (parsed by Codex, best effort) by",
         ("write", "requested") => "write requested (no result) by",
         ("read", "requested") => "read requested (no result) by",
         _ => "failed access by",

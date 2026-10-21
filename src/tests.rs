@@ -295,6 +295,17 @@ fn ask_plans_are_read_only_or_refused() {
 }
 
 #[test]
+fn help_probe_captures_stderr_for_opencode_style_clis() {
+    let dir = crate::testutil::TempDir::new("help-stderr");
+    let fake = dir.path().join("opencode");
+    std::fs::write(&fake, "#!/bin/sh\necho 'opencode --session [id] [project]' >&2\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let text = ask::real_help(fake.to_str().unwrap(), &["--help"]).unwrap();
+    assert!(text.contains("--session") && text.contains("[project]"), "{text}");
+}
+
+#[test]
 fn install_is_idempotent_and_refuses_symlinked_skill_dirs() {
     let fx = fixture();
     let env = Env::with_home(&fx.home);

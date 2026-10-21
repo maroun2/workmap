@@ -210,7 +210,11 @@ pub fn resolve_project(c: &Connection, name: &str) -> R<Project> {
 /// `--worktree <branch|dir-name|path>` within a project.
 pub fn select_worktree(p: &mut Project, name: Option<&str>) -> R<()> {
     let Some(name) = name else { return Ok(()) };
-    let hits: Vec<Node> = p.checkouts.iter().filter(|co| branch(co) == name || dir_name(co) == name || co.path.as_deref() == Some(name)).cloned().collect();
+    let matching: Vec<Node> = p.checkouts.iter().filter(|co| branch(co) == name || dir_name(co) == name || co.path.as_deref() == Some(name)).cloned().collect();
+    let live: Vec<Node> = matching.iter().filter(|co| !is_missing(co)).cloned().collect();
+    // Prefer a unique live checkout when an older, missing node shares its
+    // branch name. If no live match exists, keep historical refs expandable.
+    let hits = if live.is_empty() { matching } else { live };
     match hits.len() {
         1 => {
             p.focus = hits[0].clone();
@@ -759,8 +763,23 @@ pub fn project_map(v: &View, p: &Project, lim: &MapLimits) -> R<String> {
 // ------------------------------------------------------------------ file / doc / section
 
 fn find_file(c: &Connection, p: &Project, co: &Node, relp: &str) -> R<Option<Node>> {
-    let abs = format!("{}/{}", p.top(co), relp.trim_start_matches("./"));
-    let n = db(nodes(c, "path=?1 AND kind IN ('doc','file','memory') ORDER BY CASE kind WHEN 'doc' THEN 0 WHEN 'memory' THEN 1 ELSE 2 END", &[&abs]))?;
+    // Historical refs may embed the checkout's former absolute path. Keep
+    // those refs expandable after a move by resolving that exact indexed path.
+    let mut abs = if Path::new(relp).is_absolute() {
+        let top = p.top(co);
+        co.meta
+            .get("moved_paths")
+            .and_then(|v| v.as_array())
+            .and_then(|roots| roots.iter().filter_map(|r| r.as_str()).find_map(|root| relp.strip_prefix(root).filter(|s| s.starts_with('/')).map(|s| format!("{top}{}", s))))
+            .unwrap_or_else(|| relp.to_string())
+    } else {
+        format!("{}/{}", p.top(co), relp.trim_start_matches("./"))
+    };
+    let mut n = db(nodes(c, "path=?1 AND kind IN ('doc','file','memory') ORDER BY CASE kind WHEN 'doc' THEN 0 WHEN 'memory' THEN 1 ELSE 2 END", &[&abs]))?;
+    if n.is_empty() && Path::new(relp).is_absolute() && abs != relp {
+        abs = relp.to_string();
+        n = db(nodes(c, "path=?1 AND kind IN ('doc','file','memory') ORDER BY CASE kind WHEN 'doc' THEN 0 WHEN 'memory' THEN 1 ELSE 2 END", &[&abs]))?;
+    }
     if let Some(x) = n.into_iter().next() {
         return Ok(Some(x));
     }
@@ -817,7 +836,9 @@ pub(crate) fn file_conversations(c: &Connection, pc: &mut ProjectCache, p: &Proj
         let ev = (edge_code(&kind, &strength).to_string(), tool, line);
         let structured = kind == "read" || kind == "write";
         if let Some(x) = out.iter_mut().find(|x| x.session.id == sid) {
-            x.evs.push(ev);
+            if !x.evs.contains(&ev) {
+                x.evs.push(ev);
+            }
             x.structured |= structured;
             continue;
         }
@@ -1204,7 +1225,14 @@ pub fn commit_view(v: &View, p: &Project, prefix: &str, lim: &FileLimits) -> R<S
         return Err(format!("commit prefix {} must be at least 4 hex characters", sh_quote(prefix)));
     }
     let like = format!("{}%", prefix.to_lowercase());
-    let hits = db(nodes(c, "kind='commit' AND repo_id=?1 AND json_extract(meta,'$.sha') LIKE ?2 ORDER BY ts DESC", &[&p.repo.id, &like]))?;
+    // Commit nodes are keyed by SHA and shared across clones. Their repo_id is
+    // therefore only the most recently scanned clone; history edges carry the
+    // actual per-checkout attribution and remain correct for every clone.
+    let hits = db(nodes(
+        c,
+        "kind='commit' AND id IN (SELECT h.dst FROM edges h JOIN nodes co ON co.id=h.src WHERE h.kind='history' AND co.repo_id=?1) AND json_extract(meta,'$.sha') LIKE ?2 ORDER BY ts DESC",
+        &[&p.repo.id, &like],
+    ))?;
     let cm = match hits.len() {
         1 => hits[0].clone(),
         0 => return Err(format!("no indexed commit {prefix} in {} (only the latest commits per worktree are indexed)", p.handle)),

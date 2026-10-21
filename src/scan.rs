@@ -388,8 +388,14 @@ fn index_repo(
     )?;
     st.repos += 1;
     for (top, reported) in tops {
-        let co_id = stable_id("checkout", &top.to_string_lossy());
         let wt = wt_meta.get(top);
+        let (head, branch) = match wt {
+            Some(w) => (w.head.clone(), w.branch.clone()),
+            None => git::head_info(top),
+        };
+        let git_dir = git::git_dir(top).map(|g| std::fs::canonicalize(&g).unwrap_or(g).to_string_lossy().into_owned());
+        let proposed_id = stable_id("checkout", &top.to_string_lossy());
+        let co_id = reconnect_checkout_id(tx, &repo_id, git_dir.as_deref(), &head, branch.as_deref(), &proposed_id)?;
         let mut aliases: Vec<PathBuf> = reported.iter().filter(|r| *r != top).cloned().collect();
         if let Some(w) = wt {
             if &w.path != top && !aliases.contains(&w.path) {
@@ -406,12 +412,26 @@ fn index_repo(
             "UPDATE nodes SET meta=json_remove(meta,'$.missing','$.missing_since','$.missing_scan','$.moved_to','$.moved_candidates') WHERE id=?1 AND json_extract(meta,'$.missing') IS NOT NULL",
             [&co_id],
         )?;
+        let prior: Option<(Option<String>, String)> = tx.query_row("SELECT path,meta FROM nodes WHERE id=?1", [&co_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let mut moved_paths: Vec<String> = prior
+            .as_ref()
+            .and_then(|(_, m)| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|m| m.get("moved_paths").and_then(|x| serde_json::from_value(x.clone()).ok()))
+            .unwrap_or_default();
+        if let Some(Some(old_path)) = prior.as_ref().map(|(p, _)| p.clone()) {
+            if old_path != top.to_string_lossy() && !moved_paths.contains(&old_path) {
+                moved_paths.push(old_path);
+            }
+        }
+        if !moved_paths.is_empty() {
+            tx.execute(
+                "UPDATE nodes SET path=?2,meta=json_set(meta,'$.moved_paths',json(?3)) WHERE id=?1",
+                params![co_id, top.to_string_lossy(), serde_json::Value::from(moved_paths.clone()).to_string()],
+            )?;
+            clone_moved_file_edges(tx, &co_id, &repo_id, top, &moved_paths)?;
+        }
         // A checkout `git worktree list` reports under another path (moved without
         // `git worktree repair`): read HEAD and branch from the checkout itself.
-        let (head, branch) = match wt {
-            Some(w) => (w.head.clone(), w.branch.clone()),
-            None => git::head_info(top),
-        };
         // Unchanged HEAD, index and doc files: keep the previous derived edges.
         let sig = checkout_signature(tx, &co_id, top, &head)?;
         let old: Option<(Option<String>, Option<i64>)> =
@@ -431,8 +451,7 @@ fn index_repo(
         // Identity evidence for recognising this checkout after a move: the git
         // admin dir its `.git` points at, full HEAD and branch. `first_observed` is
         // when workmap first indexed it (never a creation time).
-        let git_dir = git::git_dir(top).map(|g| std::fs::canonicalize(&g).unwrap_or(g).to_string_lossy().into_owned());
-        let meta = json!({"branch": branch, "head": &head[..head.len().min(10)], "main": is_main, "reported_path": reported,
+        let meta = json!({"branch": branch, "head": &head[..head.len().min(10)], "main": is_main, "reported_path": reported, "moved_paths": moved_paths,
             "git_dir": git_dir, "head_full": head, "first_observed": first_observed.unwrap_or_else(now_unix)});
         db::upsert_node(
             tx,
@@ -499,6 +518,53 @@ fn index_repo(
         indexes.insert(co_id, idx);
     }
     Ok(())
+}
+
+/// Keep old transcript file evidence attached to live paths after `mv` by
+/// copying edges from historical absolute-path file nodes to same-relative-path
+/// nodes under the moved checkout. Original refs resolve through moved_paths.
+fn clone_moved_file_edges(tx: &Connection, co_id: &str, repo_id: &str, top: &Path, old_roots: &[String]) -> rusqlite::Result<()> {
+    let old_files = crate::overview::nodes(tx, "kind='file' AND checkout_id=?1", &[&co_id])?;
+    for old in old_files {
+        let Some(path) = old.path.as_deref() else { continue };
+        let Some((root, rel)) = old_roots.iter().find_map(|root| path.strip_prefix(root).filter(|suffix| suffix.starts_with('/')).map(|suffix| (root, suffix.trim_start_matches('/')))) else {
+            continue;
+        };
+        let _ = root;
+        if rel.is_empty() {
+            continue;
+        }
+        let new_path = top.join(rel).to_string_lossy().into_owned();
+        let new_id = db::ensure_file_node(tx, &new_path, Some(repo_id), Some(co_id), rel)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO edges(src,dst,kind,strength,source_path,source_line,ts,note,origin) SELECT src,?2,kind,strength,source_path,source_line,ts,note,origin FROM edges WHERE dst=?1",
+            params![old.id, new_id],
+        )?;
+        tx.execute("DELETE FROM edges WHERE dst=?1", [&old.id])?;
+    }
+    Ok(())
+}
+
+/// Reuse the recorded checkout identity after a move only when Git's admin dir
+/// matches and either branch or full HEAD also matches. This keeps historical
+/// refs and conversation attribution attached to the live checkout.
+fn reconnect_checkout_id(tx: &Connection, repo_id: &str, git_dir: Option<&str>, head: &str, branch: Option<&str>, proposed: &str) -> rusqlite::Result<String> {
+    let Some(git_dir) = git_dir.filter(|x| !x.is_empty()) else { return Ok(proposed.to_string()) };
+    // `mark_missing` runs after checkout indexing, so a moved checkout may not
+    // carry `missing=true` yet. An absent recorded path is sufficient to
+    // consider it, while identity still requires the admin dir plus branch/HEAD.
+    let candidates = crate::overview::nodes(tx, "kind='checkout' AND repo_id=?1 AND id<>?2", &[&repo_id, &proposed])?;
+    let matching: Vec<_> = candidates
+        .into_iter()
+        .filter(|co| {
+            let recorded_path_absent = co.path.as_deref().map(|p| !Path::new(p).is_dir()).unwrap_or(false);
+            let same_dir = co.meta.get("git_dir").and_then(|v| v.as_str()) == Some(git_dir);
+            let same_branch = branch.filter(|b| !b.is_empty()).is_some_and(|b| co.meta.get("branch").and_then(|v| v.as_str()) == Some(b));
+            let same_head = !head.is_empty() && co.meta.get("head_full").and_then(|v| v.as_str()) == Some(head);
+            recorded_path_absent && same_dir && (same_branch || same_head)
+        })
+        .collect();
+    Ok(if matching.len() == 1 { matching[0].id.clone() } else { proposed.to_string() })
 }
 
 /// Keep a checkout whose directory disappeared because conversations were

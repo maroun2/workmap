@@ -255,6 +255,44 @@ pub fn run_cmd(cmd: &mut Command, timeout: Duration) -> Option<String> {
     }
 }
 
+/// Run bounded help probes while preserving output written to either stream.
+/// Both streams are capped and drained concurrently; the child is killed at
+/// timeout, like `run_cmd`.
+pub fn run_cmd_both(cmd: &mut Command, timeout: Duration) -> Option<String> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+    let out_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = (&mut stdout).take(32 << 20).read_to_end(&mut v);
+        v
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = (&mut stderr).take(32 << 20).read_to_end(&mut v);
+        v
+    });
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                let mut out = out_reader.join().ok()?;
+                out.extend(err_reader.join().ok()?);
+                return if st.success() { Some(String::from_utf8_lossy(&out).into_owned()) } else { None };
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Like [`run_cmd`] but reports why it failed with a fixed message (never the
 /// command's stderr, which may echo credentials).
 pub fn run_status(cmd: &mut Command, timeout: Duration) -> Result<String, String> {

@@ -405,7 +405,10 @@ fn resume_refuses_a_missing_cwd_with_choices_and_reports_drift_for_cwd() {
     let (c, _) = scan_once(&env);
     let e = resume::plan(&c, &s, None, &h).unwrap_err();
     assert!(e.contains(&format!("{} no longer exists", fx.api_fix.display())), "{e}");
-    assert!(e.contains(&format!("git -C {} worktree move {} {}", fx.api.display(), moved.display(), fx.api_fix.display())), "branch is checked out at the new path: {e}");
+    assert!(
+        e.contains(&format!("git -C {} worktree repair && git -C {} worktree move {} {}", fx.api.display(), moved.display(), moved.display(), fx.api_fix.display())),
+        "branch is checked out at the new path: {e}"
+    );
     assert!(e.contains(&format!("--cwd {}", moved.display())), "reconnection candidate on the recorded branch: {e}");
     let p = resume::plan(&c, &s, Some(&moved), &h).unwrap();
     assert!(p.drift.iter().any(|l| l.contains("recorded cwd no longer exists")));

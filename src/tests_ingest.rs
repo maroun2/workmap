@@ -193,6 +193,23 @@ fn ingest_checkout_reindexes_only_that_checkout() {
 }
 
 #[test]
+fn commit_ref_expands_in_both_clones_after_shared_sha_node_is_overwritten() {
+    let fx = ledger();
+    let clone = fx.home.join("mirror/exact-ledger-api");
+    std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+    git(&fx.home, &["clone", "-q", fx.api.to_str().unwrap(), clone.to_str().unwrap()]);
+    let env = Env::with_home(&fx.home);
+    let (c, _) = scan_once(&env);
+    let sha = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&fx.api).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap();
+    let prefix = sha.trim().chars().take(8).collect::<String>();
+    for root in [&fx.api, &clone] {
+        let handle = handle_of(&c, root);
+        let out = view::expand(&v(&c), &format!("{handle}:commit:{prefix}"), &scoped(&handle)).unwrap_or_else(|e| panic!("{root:?}: {e}"));
+        assert!(out.contains(&prefix), "{root:?}: {out}");
+    }
+}
+
+#[test]
 fn concurrent_ingest_and_scan_do_not_corrupt_the_index() {
     let fx = ledger();
     let env = Env::with_home(&fx.home);
@@ -364,26 +381,34 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
     let (spike, _) = with_spike(&fx);
     let env = Env::with_home(&fx.home);
     drop(scan_once(&env));
+    let api = handle_of(&db::open(&env.db_path()).unwrap(), &fx.api);
+    let before = db::open(&env.db_path()).unwrap();
+    let old_ref = view::expand(&v(&before), ":conversation:Batch charges spike", &scoped(&api)).unwrap();
+    let old_file_ref = printed_refs(conv_section(&old_ref, "w — written (1)")[0])[0].clone();
     let moved = fx.home.join("archive/ledger-api-batching");
     std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
     std::fs::rename(&spike, &moved).unwrap();
     let (c, st) = scan_once(&env);
-    assert_eq!((st.checkouts_missing, st.checkouts_pruned), (1, 0), "{:?}", st.warnings);
+    assert_eq!((st.checkouts_missing, st.checkouts_pruned), (0, 0), "{:?}", st.warnings);
     let old_co = crate::util::stable_id("checkout", &spike.to_string_lossy());
     let s = sid("claude", "ffff6666-spike");
     let co: Option<String> = c.query_row("SELECT checkout_id FROM nodes WHERE id=?1", [&s], |r| r.get(0)).unwrap();
     assert_eq!(co.as_deref(), Some(old_co.as_str()), "the conversation keeps its historical checkout");
-    let meta: String = c.query_row("SELECT meta FROM nodes WHERE id=?1", [&old_co], |r| r.get(0)).unwrap();
+    let (path, meta): (String, String) = c.query_row("SELECT path,meta FROM nodes WHERE id=?1", [&old_co], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
-    assert_eq!(meta["missing"], json!(true));
-    let ev = meta.pointer("/moved_to/evidence").and_then(|x| x.as_str()).unwrap_or_else(|| panic!("{meta}"));
-    assert!(ev.starts_with("same git worktree admin dir ") && ev.contains("spike/batching"), "{ev}");
+    assert_eq!(meta.get("missing"), None);
+    assert!(meta["moved_paths"].as_array().is_some_and(|a| a.iter().any(|x| x == &json!(spike.to_string_lossy().to_string()))), "{meta}");
+    assert_eq!(path, moved.to_string_lossy());
+    assert!(count(&c, &format!("SELECT count(*) FROM nodes WHERE path='{}'", moved.join("ledger/batch.py").display())) > 0);
+    let moved_id = crate::util::stable_id("checkout", &moved.to_string_lossy());
+    assert!(overview::get_node(&c, &moved_id).unwrap().is_none(), "move must reuse prior checkout identity without a duplicate");
 
     let api = handle_of(&c, &fx.api);
     let cv = view::expand(&v(&c), ":conversation:Batch charges spike", &scoped(&api)).unwrap();
     assert!(!cv.contains("@?"), "{cv}");
-    assert!(cv.contains("checkout missing since ") && cv.contains(&format!("recorded at {} on branch spike/batching", spike.display())), "{cv}");
-    assert!(cv.contains("; now at ") && cv.contains(&moved.display().to_string()) && cv.contains("first observed "), "{cv}");
+    // Session keeps its original cwd as historical evidence, while its checkout
+    // ref resolves to the moved live worktree.
+    assert!(cv.contains(&spike.display().to_string()), "{cv}");
     assert!(cv.contains("try batching charges per merchant"), "recorded text excerpt: {cv}");
     let w = conv_section(&cv, "w — written (1)");
     assert!(w.len() == 1 && w[0].contains("ledger/batch.py"), "{cv}");
@@ -392,11 +417,17 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
     // The file ref printed there opens the historical file with the same note.
     let fref = printed_refs(w[0])[0].clone();
     let fv = expand_ref(&c, &api, &fref).unwrap();
-    assert!(fv.contains("NOT ON DISK") && fv.contains("checkout missing since") && fv.contains("Batch charges spike"), "{fv}");
-    // That view is scoped to the historical worktree (its Scope line says so).
+    assert!(fv.contains("Batch charges spike") && !fv.contains("NOT ON DISK"), "{fv}");
+    // A ref printed before the move still resolves, and subsequent refs use the
+    // same checkout identity now attached to the moved path.
+    let old_fv = expand_ref(&c, &api, &old_file_ref).unwrap();
+    assert!(old_fv.contains("Batch charges spike"), "{old_fv}");
+    let live_fv = view::expand(&v(&c), &format!("{api}@spike/batching:ledger/batch.py"), &scoped(&api)).unwrap();
+    assert!(live_fv.contains("Batch charges spike") && !live_fv.contains("NOT ON DISK"), "{live_fv}");
+    // Every ref in the view remains scoped to its live branch after the move.
     for r in printed_refs(&fv) {
         let mut req = scoped(&api);
-        req.scope_worktree = Some("ledger-api-spike".into());
+        req.scope_worktree = Some("spike/batching".into());
         let w = shell_split(&r);
         let got = view::expand(&v(&c), &w[0], &req).unwrap_or_else(|e| panic!("{r}: {e}"));
         if w[0].starts_with(':') {
@@ -405,18 +436,18 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
     }
     // The moved checkout is a live worktree of its own, with its branch read from git.
     let map = view::context(&v(&c), "", &scoped(&api)).unwrap();
-    assert!(map.contains("MISSING since") && map.contains(&format!("@ {}", moved.display())), "{map}");
+    assert!(!map.contains("MISSING since") && map.contains(&format!("@ {}", moved.display())), "{map}");
     // A partial scan elsewhere keeps the reconnection.
     let mut cp = db::open(&env.db_path()).unwrap();
     scan::run(&env, &mut cp, &scan::ScanOpts { include_home: false, roots: vec![fx.sdk.clone()], ..Default::default() }).unwrap();
-    let ev: Option<String> = cp.query_row("SELECT json_extract(meta,'$.moved_to.evidence') FROM nodes WHERE id=?1", [&old_co], |r| r.get(0)).unwrap();
-    assert!(ev.unwrap_or_default().starts_with("same git worktree admin dir "), "partial scan erased the reconnection");
+    let path: String = cp.query_row("SELECT path FROM nodes WHERE id=?1", [&old_co], |r| r.get(0)).unwrap();
+    assert_eq!(path, moved.to_string_lossy());
     // Moving it back makes it live again.
     std::fs::rename(&moved, &spike).unwrap();
     let (c, st) = scan_once(&env);
     assert_eq!(st.checkouts_missing, 0);
-    let missing: Option<bool> = c.query_row("SELECT json_extract(meta,'$.missing') FROM nodes WHERE id=?1", [&old_co], |r| r.get(0)).unwrap();
-    assert_eq!(missing, None);
+    let path: String = c.query_row("SELECT path FROM nodes WHERE id=?1", [&old_co], |r| r.get(0)).unwrap();
+    assert_eq!(path, spike.to_string_lossy());
 }
 
 #[test]
@@ -522,4 +553,7 @@ fn codex_parsed_shell_reads_are_their_own_evidence_class() {
     let pos = |needle: &str| t.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} missing:\n{t}"));
     assert!(pos("[90]") < pos("[70]"), "{t}");
     assert!(t.lines().any(|l| l.contains("[70]") && l.contains("via shell command (parsed by Codex, best effort)")), "{t}");
+    let graph = view::task(&v(&c), &api, &view::Req::default(), &view::more::TaskReq { task: Some("why do charges"), files: &[], budget: 6000 }).unwrap();
+    assert!(graph.contains("[hop1] read via shell command (parsed by Codex, best effort) by"), "parsed read must keep its best-effort meaning in task graph hops:\n{graph}");
+    assert!(!graph.lines().any(|l| l.contains(":ledger/charges.py") && l.contains("[hop1] failed access by")), "{graph}");
 }

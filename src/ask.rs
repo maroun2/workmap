@@ -44,7 +44,9 @@ pub type HelpFn<'a> = &'a dyn Fn(&str, &[&str]) -> Option<String>;
 pub fn real_help(program: &str, args: &[&str]) -> Option<String> {
     let mut c = Command::new(program);
     c.args(args);
-    crate::util::run_cmd(&mut c, Duration::from_secs(15))
+    // OpenCode writes help to stderr. Normal command stderr remains suppressed
+    // so it cannot leak credentials into output.
+    crate::util::run_cmd_both(&mut c, Duration::from_secs(15))
 }
 
 fn require(help: Option<String>, what: &str, needles: &[&str]) -> Result<(), String> {
