@@ -567,7 +567,6 @@ pub fn resolve(tx: &Connection, matcher: &mut Matcher) -> rusqlite::Result<usize
 /// One piece of relation evidence seen from `from`.
 #[derive(Clone, Debug)]
 pub struct Rel {
-    pub from: String,
     pub to: String,
     /// true when the stored edge points from `from` to `to`.
     pub forward: bool,
@@ -594,7 +593,7 @@ pub fn neighbors(c: &Connection, node: &str) -> rusqlite::Result<Vec<Rel>> {
     for row in rows {
         let (s, d, kind, class, sp, line, note) = row?;
         let forward = s == node;
-        v.push(Rel { from: node.to_string(), to: if forward { d } else { s }, forward, kind, class, source_path: sp, line, note });
+        v.push(Rel { to: if forward { d } else { s }, forward, kind, class, source_path: sp, line, note });
     }
     Ok(v)
 }

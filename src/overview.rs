@@ -207,6 +207,23 @@ pub fn overview(c: &Connection, max_repos: usize, cmd: &str) -> rusqlite::Result
     if repos.len() > max_repos {
         let _ = writeln!(o, "  … {} more: {} overview --limit {}", repos.len() - max_repos, cmd, repos.len());
     }
+    let remote: i64 = c.query_row("SELECT count(*) FROM nodes WHERE kind='remote'", [], |r| r.get(0))?;
+    if remote > 0 {
+        let rows = crate::remote::remote_only(c, 15)?;
+        let _ = writeln!(o, "Remote-only, not cloned ({remote}; metadata from authenticated gh/glab; expand remote:<name>):");
+        for (id, vis, archived, desc, stale) in rows {
+            let _ = writeln!(
+                o,
+                "- remote:{id} — {vis}{}{}{}",
+                if archived { ", archived" } else { "" },
+                if stale { ", stale" } else { "" },
+                if desc.is_empty() { String::new() } else { format!(" — {}", clip(&desc, 70)) }
+            );
+        }
+        if remote > 15 {
+            let _ = writeln!(o, "  … {} more: {cmd} remote list", remote - 15);
+        }
+    }
     Ok(o)
 }
 

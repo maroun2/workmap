@@ -298,6 +298,19 @@ pub fn add_raw_link(c: &Connection, l: &RawLink) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub fn source_state(c: &Connection, path: &str) -> rusqlite::Result<Option<(i64, i64, String, Option<String>)>> {
+    c.query_row("SELECT size,mtime,status,cwd FROM source_files WHERE path=?1", [path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn set_source(c: &Connection, path: &str, provider: &str, size: i64, mtime: i64, cwd: Option<&str>, status: &str, session_id: Option<&str>, warnings: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO source_files(path,provider,size,mtime,cwd,status,session_id,warnings) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![path, provider, size, mtime, cwd, status, session_id, warnings],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -326,17 +339,4 @@ mod tests {
         super::clear_origin(&c, "o").unwrap();
         assert_eq!(n(&c), 0, "deleted passages leave the FTS index");
     }
-}
-
-pub fn source_state(c: &Connection, path: &str) -> rusqlite::Result<Option<(i64, i64, String, Option<String>)>> {
-    c.query_row("SELECT size,mtime,status,cwd FROM source_files WHERE path=?1", [path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn set_source(c: &Connection, path: &str, provider: &str, size: i64, mtime: i64, cwd: Option<&str>, status: &str, session_id: Option<&str>, warnings: i64) -> rusqlite::Result<()> {
-    c.execute(
-        "INSERT OR REPLACE INTO source_files(path,provider,size,mtime,cwd,status,session_id,warnings) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![path, provider, size, mtime, cwd, status, session_id, warnings],
-    )?;
-    Ok(())
 }

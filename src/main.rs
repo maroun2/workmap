@@ -11,11 +11,13 @@ mod overview;
 mod relations;
 mod remote;
 mod scan;
+mod search;
 mod sessions;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod testutil;
+mod trust;
 mod util;
 mod view;
 
@@ -25,30 +27,40 @@ use std::process::ExitCode;
 const HELP: &str = "workmap — local map of repos, worktrees, docs, commits and agent conversations
 
 USAGE:
-  workmap [overview] [--limit N] [--no-install]
-  workmap context [<project>] [--project P] [--worktree W] [--docs N] [--files N] [--commits N] [--sessions N]
-  workmap expand REF [--project P] [--worktree W] [--limit N]      (alias: explore)
-  workmap ask REF <question> [--dry-run]
-
-  REF is <project>:<rest>, or :<rest> when a scope is set with --project P or WORKMAP_PROJECT=P
-  (WORKMAP_WORKTREE=W picks a non-main worktree of the scope project). <rest> is one of:
-    <path>                     a file/doc: conversations that read/wrote it, docs naming it, commits
-    <doc>#<heading-slug>       one doc section, read from the file
-    commit:<sha-prefix>        one commit
-    conversation:<title>       one agent conversation (exact title or unique title prefix)
-    session:<native-id-prefix> the same, by the provider's session id
-  Also accepted: <project> (project map), an absolute path, an internal id,
-  <project> --conversation <title> [--provider P] [--date YYYY-MM-DD] [--session ID],
-  and `ask <session-id> <question>`.
-  workmap scan [--root DIR]... [--no-home] [--full] [--no-sessions] [--no-refresh] [--max-dirs N] [--commits N] [--quiet] [--verbose]
+  workmap [overview] [--limit N] [--no-install]          every project (local and remote-only) by name
+  workmap context [<project>] [--docs N] [--files N] [--commits N] [--sessions N]
+  workmap context [<project>] --task 'words' [--file PATH]... [--budget BYTES]
+                                                       ranked context for a task/files; each item says why
+  workmap search WORDS... [--project P [--worktree W --this-worktree]] [--kind K[,K]] [--provider P]
+                 [--speaker user|assistant] [--since YYYY-MM-DD] [--limit N] [--any]
+                                                       full-text search: project, doc, commit, message, remote
+  workmap expand REF [--limit N]                       one item and everything related to it (alias: explore)
+  workmap related [<project>] [--depth N] [--limit N]  related projects with evidence
+  workmap why <project> <other> [--depth N]            shortest evidence chain between two projects
+  workmap ask REF <question> [--dry-run]               read-only continuation of a stored conversation
+  workmap scan [--root DIR]... [--no-home] [--full] [--no-sessions] [--no-remote] [--refresh-remote]
+               [--no-refresh] [--max-dirs N] [--commits N] [--quiet] [--verbose]
   workmap roots add <DIR> | roots list
-  workmap install [--no-activate]
+  workmap remote status|list|refresh|enable|disable    gh/glab catalog of repos you can access (metadata only)
+  workmap install [--no-activate] | workmap uninstall
   workmap status
 
-Scans $HOME plus persisted roots. State: ~/.local/state/workmap (override WORKMAP_STATE_DIR;
-WORKMAP_HOME replaces $HOME for scanning, provider sources and install targets).
-Projects are named by their label (see `workmap overview`); ambiguous names fail with choices.
---worktree <branch|dir> picks a checkout of the project. Help never installs anything. `ask` runs the provider's own resume read-only or refuses.";
+REF is <project>:<rest>, or :<rest> with a scope (--project P or WORKMAP_PROJECT=P;
+WORKMAP_WORKTREE=W picks a non-main worktree). <rest> is one of:
+  <path>                       a file/doc: conversations that read/wrote it, docs naming it, commits
+  <doc>#<heading-slug>         one doc section, read from the file
+  commit:<sha-prefix>          one commit
+  conversation:<title>         one agent conversation (exact title or unique title prefix)
+  session:<native-id-prefix>   the same, by the provider's session id
+  message:<session-prefix>:<l<line>|p<n>>   one message with its neighbours (printed by search)
+  related:<other project>      all relation evidence between the two projects
+Also: remote:<host/namespace/name> (a repository you can access but have not cloned), <project>,
+an absolute path, an internal id, <project> --conversation <title> [--provider P] [--date D] [--session ID].
+
+Scans $HOME plus persisted roots. State: ~/.local/state/workmap (WORKMAP_STATE_DIR; WORKMAP_HOME replaces
+$HOME for scanning, provider stores and install targets). Remote discovery uses gh/glab only when they are
+already authenticated; opt out with `workmap remote disable`, WORKMAP_REMOTE=0 or scan --no-remote.
+Nothing is sent anywhere else. Help never installs anything. `ask` runs the provider's own resume read-only or refuses.";
 
 struct Args {
     pos: Vec<String>,
@@ -57,7 +69,28 @@ struct Args {
 
 impl Args {
     fn parse(v: Vec<String>) -> Args {
-        let valued = ["--limit", "--root", "--max-dirs", "--commits", "--files", "--sessions", "--docs", "--worktree", "--conversation", "--provider", "--date", "--session", "--project"];
+        let valued = [
+            "--kind",
+            "--since",
+            "--depth",
+            "--task",
+            "--file",
+            "--budget",
+            "--speaker",
+            "--limit",
+            "--root",
+            "--max-dirs",
+            "--commits",
+            "--files",
+            "--sessions",
+            "--docs",
+            "--worktree",
+            "--conversation",
+            "--provider",
+            "--date",
+            "--session",
+            "--project",
+        ];
         let mut a = Args { pos: vec![], flags: vec![] };
         let mut it = v.into_iter();
         while let Some(x) = it.next() {
@@ -96,7 +129,13 @@ impl Args {
             worktree: self.get("--worktree"),
             conv: view::ConvSel { title: self.get("--conversation"), provider: self.get("--provider"), date: self.get("--date"), session: self.get("--session") },
             limit: self.get("--limit").and_then(|x| x.parse().ok()),
-            map: view::MapLimits { docs: self.num("--docs", d.docs), files: self.num("--files", d.files), commits: self.num("--commits", d.commits), sessions: self.num("--sessions", d.sessions) },
+            map: view::MapLimits {
+                docs: self.num("--docs", d.docs),
+                files: self.num("--files", d.files),
+                commits: self.num("--commits", d.commits),
+                sessions: self.num("--sessions", d.sessions),
+                related: d.related,
+            },
         }
         .scoped(self.get("--project"), env("WORKMAP_PROJECT"), env("WORKMAP_WORKTREE"))
     }
@@ -151,6 +190,13 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             let v = view::View { c: &c, cmd: cli_cmd(), state: state_vars() };
+            if cmd == "context" && (a.has("--task") || a.has("--file")) {
+                let files = a.all("--file");
+                let task = a.get("--task");
+                let t = if t == "." && req.project.is_none() { ".".to_string() } else { t };
+                print!("{}", view::task(&v, &t, &req, &view::more::TaskReq { task: task.as_deref(), files: &files, budget: a.num("--budget", 6000).max(800) })?);
+                return Ok(());
+            }
             let out = if cmd == "context" { view::context(&v, &t, &req)? } else { view::expand(&v, &t, &req)? };
             print!("{out}");
         }
@@ -163,6 +209,7 @@ fn run() -> Result<(), String> {
                 verbose: a.has("--verbose"),
                 full: a.has("--full"),
                 sessions: !a.has("--no-sessions"),
+                remote: remote::mode(&env, a.has("--no-remote"), a.has("--refresh-remote")),
                 ..Default::default()
             };
             let st = scan::run(&env, &mut c, &opts).map_err(|e| e.to_string())?;
@@ -184,6 +231,13 @@ fn run() -> Result<(), String> {
                     st.dirs_visited,
                     bytes
                 );
+                println!(
+                    "indexed: {} searchable messages, {} truncated/capped conversations, {} relation evidence rows, {} checkouts pruned",
+                    st.messages, st.sessions_truncated, st.relations, st.checkouts_pruned
+                );
+                for r in &st.remote {
+                    println!("remote: {r}");
+                }
                 for w in &st.warnings {
                     println!("warning: {w}");
                 }
@@ -195,6 +249,79 @@ fn run() -> Result<(), String> {
                         println!("{l}");
                     }
                 }
+            }
+        }
+        "search" | "find" => {
+            let words = a.pos[1..].join(" ");
+            if words.trim().is_empty() {
+                return Err("usage: workmap search WORDS... [--project P] [--kind doc,message,commit,project,remote] [--any]".into());
+            }
+            let kinds: Vec<String> = a.all("--kind").iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+            if let Some(bad) = kinds.iter().find(|k| !search::KINDS.contains(&k.as_str())) {
+                return Err(format!("unknown --kind {bad}; kinds: {}", search::KINDS.join(", ")));
+            }
+            let since = match a.get("--since") {
+                Some(d) => Some(search::date_to_ts(&d).ok_or_else(|| format!("--since {d}: expected YYYY-MM-DD"))?),
+                None => None,
+            };
+            let query = search::Query { text: words, kinds, provider: a.get("--provider"), speaker: a.get("--speaker"), since, limit: a.num("--limit", 10), any: a.has("--any") };
+            let v = view::View { c: &c, cmd: cli_cmd(), state: state_vars() };
+            print!("{}", view::more::search_view(&v, &a.req(), &view::more::SearchReq { query, this_worktree: a.has("--this-worktree") })?);
+        }
+        "related" => {
+            let req = a.req();
+            let v = view::View { c: &c, cmd: cli_cmd(), state: state_vars() };
+            let p = view::project_arg(&v, a.pos.get(1).map(String::as_str), &req)?;
+            print!("{}", view::more::related_view(&v, &p, a.num("--depth", 2).min(6), a.num("--limit", 15))?);
+        }
+        "why" => {
+            let req = a.req();
+            let v = view::View { c: &c, cmd: cli_cmd(), state: state_vars() };
+            let (from, to) = match (a.pos.get(1), a.pos.get(2)) {
+                (Some(x), Some(y)) => (Some(x.as_str()), y.clone()),
+                (Some(y), None) if req.project.is_some() => (None, y.clone()),
+                _ => return Err("usage: workmap why <project> <other> [--depth N]   (or: why <other> with --project/WORKMAP_PROJECT)".into()),
+            };
+            let p = view::project_arg(&v, from, &req)?;
+            print!("{}", view::more::why_view(&v, &p, &to, a.num("--depth", 4).min(8))?);
+        }
+        "remote" => match a.pos.get(1).map(String::as_str).unwrap_or("status") {
+            "status" => print!("{}", remote::status(&env, &c).map_err(|e| e.to_string())?),
+            "list" => {
+                let rows = remote::remote_only(&c, a.num("--limit", 200)).map_err(|e| e.to_string())?;
+                println!("{} remote-only repositories (not cloned; metadata from gh/glab):", rows.len());
+                for (id, vis, archived, desc, stale) in rows {
+                    println!("- remote:{id} {vis}{}{} {}", if archived { " archived" } else { "" }, if stale { " (stale)" } else { "" }, util::clip(&desc, 80));
+                }
+            }
+            "refresh" => {
+                if remote::disabled(&env) {
+                    return Err("remote discovery is disabled (workmap remote enable to turn it back on)".into());
+                }
+                let tx = c.transaction().map_err(|e| e.to_string())?;
+                let mut st = scan::Stats::default();
+                remote::sync(&env, &tx, remote::Mode::Force, &mut st).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                for l in st.remote {
+                    println!("{l}");
+                }
+                println!("relations to remote-only entries update on the next `workmap scan`");
+            }
+            "disable" => {
+                std::fs::create_dir_all(&env.state_dir).map_err(|e| e.to_string())?;
+                std::fs::write(env.state_dir.join("no-remote"), "remote discovery disabled by `workmap remote disable`\n").map_err(|e| e.to_string())?;
+                remote::clear(&c).map_err(|e| e.to_string())?;
+                println!("remote discovery disabled; cached remote metadata deleted from {}", env.db_path().display());
+            }
+            "enable" => {
+                let _ = std::fs::remove_file(env.state_dir.join("no-remote"));
+                println!("remote discovery enabled (takes effect on the next scan; WORKMAP_REMOTE=0 still overrides)");
+            }
+            x => return Err(format!("unknown remote subcommand {x}; use status|list|refresh|enable|disable")),
+        },
+        "uninstall" => {
+            for l in install::uninstall(&env).map_err(|e| e.to_string())? {
+                println!("{l}");
             }
         }
         "roots" => match a.pos.get(1).map(String::as_str) {
@@ -228,6 +355,7 @@ fn run() -> Result<(), String> {
             };
             let sid = &sid;
             let p = ask::plan(&c, sid, &q, &ask::real_help).map_err(|e| format!("ask refused: {e}"))?;
+            print!("{}", view::more::ask_note(&c, sid));
             print!("{}", p.render());
             if !a.has("--dry-run") {
                 let code = ask::execute(&p).map_err(|e| e.to_string())?;
@@ -244,13 +372,24 @@ fn run() -> Result<(), String> {
         }
         "status" => {
             let q = |s: &str| c.query_row(s, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
-            println!("db: {}", env.db_path().display());
-            for k in ["repo", "checkout", "doc", "memory", "file", "commit", "session"] {
+            println!("db: {} ({} bytes)", env.db_path().display(), std::fs::metadata(env.db_path()).map(|m| m.len()).unwrap_or(0));
+            print!("{}", trust::index_line(&c));
+            for k in ["repo", "checkout", "doc", "memory", "file", "commit", "session", "remote"] {
                 println!("{k}: {}", q(&format!("SELECT count(*) FROM nodes WHERE kind='{k}'")));
             }
-            println!("edges: {}", q("SELECT count(*) FROM edges"));
+            println!("edges: {} (relation evidence: {})", q("SELECT count(*) FROM edges"), q("SELECT count(*) FROM edges WHERE kind LIKE 'rel:%'"));
+            println!("searchable passages: {}", q("SELECT count(*) FROM passages"));
+            for k in search::KINDS {
+                println!("  {k}: {}", q(&format!("SELECT count(*) FROM passages WHERE kind='{k}'")));
+            }
+            print!("{}", trust::coverage_line(&trust::coverage(&c, None)));
+            for (p, s, n) in trust::sources(&c) {
+                println!("  sources {p} {s}: {n}");
+            }
+            println!("  (unrelated = transcript cwd outside every indexed checkout; missing = deleted since indexed, evidence kept; error = could not be parsed)");
+            print!("{}", remote::status(&env, &c).map_err(|e| e.to_string())?);
             let last: String = c.query_row("SELECT stats FROM scans WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap_or_default();
-            println!("last scan: {last}");
+            println!("last scan stats: {last}");
         }
         other => return Err(format!("unknown command {other:?}\n\n{HELP}")),
     }

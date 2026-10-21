@@ -18,6 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::path::Path;
 
+#[path = "view_more.rs"]
+pub mod more;
+
 type R<T> = Result<T, String>;
 
 fn db<T>(r: rusqlite::Result<T>) -> R<T> {
@@ -441,11 +444,12 @@ pub struct MapLimits {
     pub files: usize,
     pub commits: usize,
     pub sessions: usize,
+    pub related: usize,
 }
 
 impl Default for MapLimits {
     fn default() -> Self {
-        MapLimits { docs: 6, files: 8, commits: 4, sessions: 6 }
+        MapLimits { docs: 6, files: 8, commits: 4, sessions: 6, related: 5 }
     }
 }
 
@@ -470,7 +474,16 @@ pub fn project_map(v: &View, p: &Project, lim: &MapLimits) -> R<String> {
             facts.push(format!("{} {}", r.get("name").and_then(|x| x.as_str()).unwrap_or(""), r.get("url").and_then(|x| x.as_str()).unwrap_or("")));
         }
     }
+    if let Some(cat) = p.repo.meta.get("catalog") {
+        let g = |k: &str| cat.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        facts.push(format!("{} {}{}", g("identity"), g("visibility"), if cat.get("archived").and_then(|x| x.as_bool()) == Some(true) { " archived" } else { "" }));
+    }
     let _ = writeln!(o, "{}", facts.join(" · "));
+    if let Some(d) = p.repo.meta.pointer("/catalog/description").and_then(|x| x.as_str()).filter(|d| !d.is_empty()) {
+        let _ = writeln!(o, "description ({}): {}", p.repo.meta.pointer("/catalog/provider").and_then(|x| x.as_str()).unwrap_or("remote"), clip(d, 160));
+    }
+    o.push_str(&crate::trust::index_line(c));
+    o.push_str(&crate::trust::coverage_line(&crate::trust::coverage(c, Some(&p.repo.id))));
     o.push_str(&header(v, p, true));
     let mut more: Vec<String> = Vec::new();
 
@@ -582,6 +595,7 @@ pub fn project_map(v: &View, p: &Project, lim: &MapLimits) -> R<String> {
     if all.len() > lim.sessions {
         more.push(format!("--sessions {}", (lim.sessions * 3).min(all.len())));
     }
+    o.push_str(&more::related_section(v, p, lim.related)?);
     if !more.is_empty() {
         let _ = writeln!(o, "\nMore: {} context {}", v.cmd, more.join(" "));
     }
@@ -870,7 +884,7 @@ pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R
     let started = s.meta.get("started").and_then(|x| x.as_i64()).unwrap_or(0);
     let _ = writeln!(o, "session {} · {} → {} · cwd {}", meta(s, "native_id"), fmt_ts(started), fmt_ts(s.ts), meta(s, "cwd"));
     let _ = writeln!(o, "transcript {}{}", s.path.clone().unwrap_or_default(), if s.meta.get("source_missing").is_some() { " (source file no longer exists)" } else { "" });
-    for (k, label) in [("first_prompt", "first input"), ("last_prompt", "latest input")] {
+    for (k, label) in [("first_prompt", "first user input"), ("last_prompt", "latest user input (as typed; not a decision record)")] {
         if let Some(pr) = s.meta.get(k).filter(|x| !x.is_null()) {
             if k == "last_prompt" && s.meta.get("first_prompt") == Some(pr) {
                 continue;
@@ -885,6 +899,25 @@ pub fn conversation_view(v: &View, p: &Project, s: &Node, lim: &FileLimits) -> R
         }
     }
     let _ = writeln!(o, "access: {}", codes(&access_counts(c, &s.id)?));
+    let nmsg = s.meta.get("messages").and_then(|x| x.as_i64()).unwrap_or(0);
+    let mut flags = Vec::new();
+    for (k, t) in [("truncated", "transcript truncated at the size cap"), ("messages_capped", "message text capped"), ("source_missing", "source transcript missing")] {
+        if s.meta.get(k).and_then(|x| x.as_bool()) == Some(true) {
+            flags.push(t);
+        }
+    }
+    if s.meta.get("warnings").and_then(|x| x.as_i64()).unwrap_or(0) > 0 {
+        flags.push("some transcript lines unparseable");
+    }
+    let _ = writeln!(o, "coverage: {nmsg} searchable message(s){}", if flags.is_empty() { String::new() } else { format!("; {}", flags.join(", ")) });
+    let all_s = sessions_of(c, p)?;
+    let pre = more::session_prefix(&all_s, s);
+    if nmsg > 0 {
+        let mut st = db(c.prepare("SELECT loc, speaker FROM passages WHERE kind='message' AND node_id=?1 AND part=0 ORDER BY CAST(substr(loc,2) AS INTEGER) LIMIT 3"))?;
+        let first: Vec<(String, String)> = db(db(st.query_map([&s.id], |r| Ok((r.get(0)?, r.get(1)?))))?.collect::<Result<_, _>>())?;
+        let l: Vec<String> = first.iter().map(|(loc, sp)| format!("{} ({sp})", q(&format!(":message:{pre}:{loc}")))).collect();
+        let _ = writeln!(o, "messages: {} … (search inside: search 'words' --kind message)", l.join(", "));
+    }
     o.push_str(&header(v, p, true));
     let groups = [
         ("w — written", "write", "observed"),
@@ -928,6 +961,10 @@ pub enum Target {
     Commit(String),
     Conversation(String),
     Session(String),
+    /// `message:<session-id-prefix>:<l<line>|p<ordinal>>`
+    Message(String, String),
+    /// `related:<other project>`: all relation evidence between the two.
+    Related(String),
 }
 
 /// What follows `<project>:` (or a leading `:` under a scope).
@@ -943,6 +980,13 @@ pub fn parse_rest(rest: &str) -> Target {
     }
     if let Some(x) = rest.strip_prefix("session:") {
         return Target::Session(x.to_string());
+    }
+    if let Some(x) = rest.strip_prefix("message:") {
+        let (sid, loc) = x.rsplit_once(':').unwrap_or((x, ""));
+        return Target::Message(sid.to_string(), loc.to_string());
+    }
+    if let Some(x) = rest.strip_prefix("related:") {
+        return Target::Related(x.to_string());
     }
     match rest.rsplit_once('#') {
         Some((f, sl)) if !sl.is_empty() && !f.is_empty() => Target::File(f.to_string(), Some(sl.to_string())),
@@ -1064,6 +1108,11 @@ pub fn expand(v: &View, target: &str, req: &Req) -> R<String> {
     if !target.contains(':') && !target.starts_with('/') && !target.is_empty() && db(get_node(v.c, target))?.map(|n| n.kind != "repo" && n.kind != "checkout").unwrap_or(false) {
         return db(crate::overview::expand(v.c, target, req.limit.unwrap_or(40)));
     }
+    if let Some(id) = target.strip_prefix("remote:") {
+        if let Some(out) = more::remote_view(v, id)? {
+            return Ok(out);
+        }
+    }
     let (p, t) = locate(v, target, req)?;
     if let Some(sel) = conv_from(&t, req) {
         let s = resolve_conversation(v, &p, &sel)?;
@@ -1073,8 +1122,25 @@ pub fn expand(v: &View, target: &str, req: &Req) -> R<String> {
         Target::Project => project_map(v, &p, &req.map),
         Target::File(f, sl) => file_view(v, &p, &f, sl.as_deref(), &lim),
         Target::Commit(sha) => commit_view(v, &p, &sha, &lim),
+        Target::Message(sid, loc) => more::message_view(v, &p, &sid, &loc),
+        Target::Related(other) => more::relation_view(v, &p, &other, req.limit.unwrap_or(20)),
         Target::Conversation(_) | Target::Session(_) => unreachable!(),
     }
+}
+
+/// Project named by a target (or the scope when empty) for project-level commands.
+pub fn project_arg(v: &View, target: Option<&str>, req: &Req) -> R<Project> {
+    let (p, t) = locate(v, target.unwrap_or(""), req)?;
+    match t {
+        Target::Project => Ok(p),
+        _ => Err(format!("{} names something inside a project; give the project name", target.unwrap_or(""))),
+    }
+}
+
+/// `context --task … --file …`: ranked, budget-bounded context.
+pub fn task(v: &View, target: &str, req: &Req, t: &more::TaskReq) -> R<String> {
+    let p = project_arg(v, Some(target), req)?;
+    more::task_context(v, &p, t)
 }
 
 /// Session node id for `ask REF` / `ask <project> --conversation …`.
