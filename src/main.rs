@@ -6,10 +6,12 @@ mod db;
 mod discover;
 mod docs;
 mod git;
+mod hook;
 mod install;
 mod overview;
 mod relations;
 mod remote;
+mod resume;
 mod scan;
 mod search;
 mod sessions;
@@ -46,8 +48,15 @@ USAGE:
   workmap remote snapshots status|enable|disable|set KEY VALUE
                                                        opt-in: index docs/manifests of remote-only repos from
                                                        temporary shallow clones (cached per commit)
+  workmap ingest --transcript FILE... [--checkout DIR]... [--quiet]
+                                                       index only these sources now (no home walk, no pruning)
+  workmap hook <event> --harness claude                read a host hook event (JSON) on stdin; print
+                                                       bounded context or nothing
+  workmap hooks status|install|uninstall [--harness claude]
+                                                       opt-in host hook integration (see `hooks status`)
+  workmap resume REF [--cwd DIR] [--dry-run]           interactive native resume of the original session
   workmap install [--no-activate] | workmap uninstall
-  workmap status
+  workmap status | workmap --version
 
 REF is <project>:<rest>, or :<rest> with a scope (--project P or WORKMAP_PROJECT=P;
 WORKMAP_WORKTREE=W picks a non-main worktree). <rest> is one of:
@@ -95,6 +104,10 @@ impl Args {
             "--date",
             "--session",
             "--project",
+            "--transcript",
+            "--cwd",
+            "--harness",
+            "--checkout",
         ];
         let mut a = Args { pos: vec![], flags: vec![] };
         let mut it = v.into_iter();
@@ -151,6 +164,10 @@ impl Args {
 
 fn run() -> Result<(), String> {
     let a = Args::parse(std::env::args().skip(1).collect());
+    if a.has("--version") || a.has("-V") || a.pos.first().map(|s| s == "version").unwrap_or(false) {
+        println!("workmap {}", version());
+        return Ok(());
+    }
     if a.has("--help") || a.has("-h") || a.pos.first().map(|s| s == "help").unwrap_or(false) {
         println!("{HELP}");
         return Ok(());
@@ -430,9 +447,30 @@ fn run() -> Result<(), String> {
             let last: String = c.query_row("SELECT stats FROM scans WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap_or_default();
             println!("last scan stats: {last}");
         }
+        "ingest" => {
+            let _ = (&a.all("--transcript"), &a.all("--checkout"));
+            return Err("ingest: not implemented yet".into());
+        }
+        "hook" => {
+            let event = a.pos.get(1).ok_or("usage: workmap hook <event> --harness claude   (event JSON on stdin)")?;
+            return hook::run(&env, &c, event, a.get("--harness").as_deref().unwrap_or("claude"));
+        }
+        "hooks" => {
+            let _ = a.get("--harness");
+            return Err("hooks: not implemented yet".into());
+        }
+        "resume" => {
+            let _ = (a.get("--cwd"), a.has("--dry-run"));
+            return resume::run(&c);
+        }
         other => return Err(format!("unknown command {other:?}\n\n{HELP}")),
     }
     Ok(())
+}
+
+/// `<semver> (<revision>[, <build>])`; see build.rs for where the revision comes from.
+fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 /// How printed follow-up commands invoke this binary.

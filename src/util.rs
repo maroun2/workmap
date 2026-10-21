@@ -326,7 +326,8 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration, watch: Option<(&Path, u
 
 /// POSIX shell quoting: bare when safe, otherwise single-quoted.
 pub fn sh_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_=./:,+@#%".contains(c)) && !s.starts_with('#') {
+    // `~` is literal except at the start of a word (tilde expansion).
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_=./:,+@#%~".contains(c)) && !s.starts_with('#') && !s.starts_with('~') {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))

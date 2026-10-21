@@ -70,14 +70,43 @@ fn checkouts_of(c: &Connection, repo_id: &str) -> R<Vec<Node>> {
     db(nodes(c, "kind='checkout' AND repo_id=?1 ORDER BY json_extract(meta,'$.main') DESC, ts DESC, path", &[&repo_id]))
 }
 
-/// The name printed for a project: its label when unique, else its main checkout path.
+/// The name printed for a project: its label when unique, else `label~<hex>`, the
+/// shortest (≥4) prefix of the repository id that tells same-named clones apart.
+/// Derived from the clone's git directory, so it is stable across scans and
+/// independent of the caller's scope or environment.
 pub fn project_handle(c: &Connection, repo: &Node) -> R<String> {
-    let same: i64 = db(c.query_row("SELECT count(*) FROM nodes WHERE kind='repo' AND label=?1", [&repo.label], |r| r.get(0)))?;
-    if same <= 1 && !repo.label.contains(':') && !repo.label.starts_with('/') {
+    let same = db(nodes(c, "kind='repo' AND label=?1", &[&repo.label]))?;
+    let plain = !repo.label.contains([':', '@', '~', '/']) && !repo.label.is_empty();
+    if same.len() <= 1 && plain {
         return Ok(repo.label.clone());
+    }
+    let hex = |id: &str| id.rsplit('-').next().unwrap_or(id).to_string();
+    let mine = hex(&repo.id);
+    let others: Vec<String> = same.iter().filter(|r| r.id != repo.id).map(|r| hex(&r.id)).collect();
+    let n = (4..=mine.len()).find(|&n| others.iter().all(|o| !o.starts_with(&mine[..n]))).unwrap_or(mine.len());
+    if plain {
+        return Ok(format!("{}~{}", repo.label, &mine[..n]));
     }
     let cos = checkouts_of(c, &repo.id)?;
     Ok(cos.first().and_then(|n| n.path.clone()).unwrap_or_else(|| repo.id.clone()))
+}
+
+/// Fully qualified, scope-independent reference: `<handle>[@<worktree>]:<rest>`
+/// (shell-quoted). `@<worktree>` is omitted for the project's main checkout.
+#[allow(dead_code)] // used by the graph views (foundation for cross-checkout refs)
+pub fn qualified_ref(c: &Connection, co: &Node, rest: &str) -> R<String> {
+    let repo = db(get_node(c, co.repo_id.as_deref().unwrap_or("")))?.ok_or("checkout without repository")?;
+    let p = build_project(c, repo, Some(co.clone()))?;
+    Ok(q(&qualified_raw(&p, co, rest)))
+}
+
+/// Unquoted [`qualified_ref`] within an already resolved project.
+pub fn qualified_raw(p: &Project, co: &Node, rest: &str) -> String {
+    if p.is_default(co) {
+        format!("{}:{rest}", p.handle)
+    } else {
+        format!("{}@{}:{rest}", p.handle, worktree_name(p, co))
+    }
 }
 
 fn build_project(c: &Connection, repo: Node, focus: Option<Node>) -> R<Project> {
@@ -109,6 +138,12 @@ pub fn resolve_project(c: &Connection, name: &str) -> R<Project> {
         return build_project(c, repo, Some(co));
     }
     let all = all_projects(c)?;
+    if let Some((label, hex)) = name.rsplit_once('~').filter(|(l, h)| !l.is_empty() && h.len() >= 4 && h.chars().all(|ch| ch.is_ascii_hexdigit())) {
+        let hits: Vec<&Node> = all.iter().filter(|r| r.label == label && r.id.rsplit('-').next().unwrap_or("").starts_with(&hex.to_lowercase())).collect();
+        if hits.len() == 1 {
+            return build_project(c, hits[0].clone(), None);
+        }
+    }
     let mut hits: Vec<&Node> = all.iter().filter(|r| r.label == name).collect();
     if hits.is_empty() {
         hits = all.iter().filter(|r| r.label.eq_ignore_ascii_case(name)).collect();
@@ -130,11 +165,11 @@ pub fn resolve_project(c: &Connection, name: &str) -> R<Project> {
             Err(m)
         }
         _ => {
-            let mut m = format!("project name {} is ambiguous ({} repositories); choose one by checkout path:", sh_quote(name), hits.len());
+            let mut m = format!("project name {} is ambiguous ({} clones); choose one by handle (or checkout path):", sh_quote(name), hits.len());
             for r in hits {
                 let cos = checkouts_of(c, &r.id)?;
                 let p = cos.first().and_then(|n| n.path.clone()).unwrap_or_default();
-                let _ = write!(m, "\n  {}  ({} checkout(s), last commit {})", sh_quote(&p), cos.len(), fmt_date(r.ts));
+                let _ = write!(m, "\n  {}  ({}, {} checkout(s), last commit {})", sh_quote(&project_handle(c, r)?), sh_quote(&p), cos.len(), fmt_date(r.ts));
             }
             Err(m)
         }
@@ -267,14 +302,13 @@ fn q(s: &str) -> String {
     sh_quote(s)
 }
 
-/// Short, shell-quoted reference relative to the scope project; adds `--worktree`
-/// when the item lives in a checkout other than the scope's.
+/// Short, shell-quoted reference relative to the scope project; fully qualified
+/// (`<handle>[@<worktree>]:<rest>`) when the item lives in another checkout.
 fn fref(p: &Project, co: &Node, rest: &str) -> String {
-    let r = q(&format!(":{rest}"));
     if co.id == p.focus.id {
-        r
+        q(&format!(":{rest}"))
     } else {
-        format!("{r} --worktree {}", q(&worktree_name(p, co)))
+        q(&qualified_raw(p, co, rest))
     }
 }
 
@@ -633,7 +667,7 @@ fn file_ref(v: &View, p: &Project, coid: Option<&str>, path: Option<&str>, memor
     let repo = get_node(v.c, co.repo_id.as_deref()?).ok()??;
     let other = build_project(v.c, repo, Some(co.clone())).ok()?;
     let r = memory_label.map(str::to_string).unwrap_or_else(|| rel(path, co.path.as_deref().unwrap_or("")).to_string());
-    Some(format!("{}{} (other project)", q(&format!("{}:{r}", other.handle)), if other.is_default(&co) { String::new() } else { format!(" --worktree {}", q(&worktree_name(&other, &co))) }))
+    Some(format!("{} (other project)", q(&qualified_raw(&other, &co, &r))))
 }
 
 fn more_line(o: &mut String, v: &View, this: &str, shown: usize, total: usize) {
@@ -1078,8 +1112,21 @@ fn locate(v: &View, target: &str, req: &Req) -> R<(Project, Target)> {
         return Err(format!("{target} is not inside an indexed checkout"));
     }
     let (proj, t) = parse_target(target);
-    let mut p = resolve_project(v.c, &proj)?;
-    select_worktree(&mut p, req.worktree.as_deref())?;
+    // `<handle>@<worktree>:<rest>` pins the checkout without any scope or flag.
+    let (proj, pinned) = match resolve_project(v.c, &proj) {
+        Ok(p) => (p, None),
+        Err(e) => match proj.split_once('@') {
+            Some((name, wt)) if !name.is_empty() && !wt.is_empty() => (resolve_project(v.c, name).map_err(|_| e)?, Some(wt.to_string())),
+            _ => return Err(e),
+        },
+    };
+    let mut p = proj;
+    if let (Some(a), Some(b)) = (pinned.as_deref(), req.worktree.as_deref()) {
+        if a != b {
+            return Err(format!("{target} names worktree {} but --worktree says {}", q(a), q(b)));
+        }
+    }
+    select_worktree(&mut p, pinned.as_deref().or(req.worktree.as_deref()))?;
     Ok((p, t))
 }
 

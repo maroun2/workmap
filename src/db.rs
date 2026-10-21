@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS scans (
 "#;
 
 /// Bump when session parsers or derived passages change what they extract.
-pub const PARSER_VERSION: i64 = 3;
+pub const PARSER_VERSION: i64 = 4;
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(dir) = path.parent() {

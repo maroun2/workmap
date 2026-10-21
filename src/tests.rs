@@ -463,6 +463,11 @@ fn printed_refs(out: &str) -> Vec<String> {
                     }
                 }
                 i = j;
+            } else if start_ok && fq_len(&b[i..]) > 0 {
+                // Fully qualified `<handle>[~hex][@worktree]:<rest>`, optionally '…'-quoted.
+                let n = fq_len(&b[i..]);
+                tok.extend(&b[i..i + n]);
+                i += n;
             } else if start_ok && b[i] == ':' && b.get(i + 1).map(|c| !c.is_whitespace()).unwrap_or(false) {
                 let mut j = i;
                 while j < b.len() && !b[j].is_whitespace() && b[j] != ',' {
@@ -483,6 +488,38 @@ fn printed_refs(out: &str) -> Vec<String> {
         }
     }
     refs
+}
+
+/// Length of a fully qualified reference token at the start of `b` (0 if none):
+/// a handle containing `~` or `@` before the first `:`, followed by a non-space.
+fn fq_len(b: &[char]) -> usize {
+    let quoted = b.first() == Some(&'\'');
+    let s = if quoted { 1 } else { 0 };
+    let Some(colon) = b[s..].iter().position(|&c| c == ':' || c.is_whitespace() || c == '\'').map(|k| k + s) else { return 0 };
+    if b[colon] != ':' || colon == s || !b[s..colon].iter().any(|&c| c == '@' || c == '~') || !b[s..colon].iter().all(|&c| c.is_alphanumeric() || "._-~@/+".contains(c)) {
+        return 0;
+    }
+    if b.get(colon + 1).map(|c| c.is_whitespace()).unwrap_or(true) {
+        return 0;
+    }
+    let mut j = colon + 1;
+    if quoted {
+        while j < b.len() {
+            if b[j] == '\'' {
+                if b.get(j + 1) == Some(&'\\') && b.get(j + 2) == Some(&'\'') && b.get(j + 3) == Some(&'\'') {
+                    j += 4;
+                    continue;
+                }
+                return j + 1;
+            }
+            j += 1;
+        }
+        return 0;
+    }
+    while j < b.len() && !b[j].is_whitespace() && b[j] != ',' {
+        j += 1;
+    }
+    j
 }
 
 /// Minimal POSIX word splitter for bare words and '...' quoting.
@@ -529,6 +566,10 @@ fn shell_split(cmd: &str) -> Vec<String> {
 /// Expand a printed reference under a scope, like `workmap expand <ref> --project <scope>`.
 fn expand_ref(c: &Connection, scope: &str, printed: &str) -> Result<String, String> {
     let w = shell_split(printed);
+    if !w[0].starts_with(':') {
+        // Fully qualified references must resolve without any scope or flag.
+        return view::expand(&v(c), &w[0], &view::Req::default());
+    }
     let mut req = scoped(scope);
     if w.len() == 3 && w[1] == "--worktree" {
         req.worktree = Some(w[2].clone());
@@ -542,7 +583,14 @@ fn assert_refs_roundtrip(c: &Connection, scope: &str, out: &str) -> usize {
     for r in &refs {
         let got = expand_ref(c, scope, r).unwrap_or_else(|e| panic!("{r}: {e}\n--- in ---\n{out}"));
         let plain = r.split(" --worktree").next().unwrap();
-        if !plain.contains("(other") {
+        let w = shell_split(plain);
+        if !w[0].starts_with(':') {
+            // `<handle>[@wt]:<rest>` → the view titles it with the scoped form `:<rest>`.
+            let rest = &w[0][w[0].find(':').unwrap()..];
+            let want = crate::util::sh_quote(rest);
+            let want = want.split('#').next().unwrap();
+            assert!(got.starts_with(&format!("# {want}")), "{r} expanded to a different node:\n{}", got.lines().next().unwrap_or(""));
+        } else if !plain.contains("(other") {
             assert!(got.starts_with(&format!("# {plain} ")), "{r} expanded to a different node:\n{}", got.lines().next().unwrap_or(""));
         }
     }
@@ -655,9 +703,16 @@ fn duplicate_project_names_refuse_and_path_handle_works() {
     let (c, _) = scan_once(&env);
     let e = view::expand(&v(&c), ":main.py", &scoped("proj")).unwrap_err();
     assert!(e.contains("ambiguous") && e.contains(&*fx.main.to_string_lossy()) && e.contains(&*other.to_string_lossy()), "{e}");
-    let handle = fx.main.to_string_lossy().into_owned();
+    // The error lists stable compact handles; the checkout path still works too.
+    let path = fx.main.to_string_lossy().into_owned();
+    let by_path = view::context(&v(&c), "", &scoped(&path)).unwrap();
+    let handle = by_path.split_whitespace().nth(1).unwrap().to_string();
+    assert!(handle.starts_with("proj~") && handle.len() >= 9 && e.contains(&handle), "{handle}\n{e}");
     let m = view::context(&v(&c), "", &scoped(&handle)).unwrap();
     assert!(m.starts_with(&format!("# {handle} — project map")) && m.contains(&format!("WORKMAP_PROJECT={handle}")), "{m}");
+    assert_eq!(m, by_path, "handle and path name the same project");
+    let (c2, _) = scan_once(&env);
+    assert_eq!(view::context(&v(&c2), "", &scoped(&handle)).unwrap(), m, "handle is stable across scans");
     assert_refs_roundtrip(&c, &handle, &m);
     assert!(view::context(&v(&c), "nosuch", &view::Req::default()).unwrap_err().contains("no project named"));
 }
@@ -774,3 +829,14 @@ fn unique_name_matches_are_unverified_candidates_not_references() {
 
 #[path = "tests_more.rs"]
 mod more_tests;
+// One module per workstream; shared fixtures live in testutil.rs.
+#[path = "tests_graph.rs"]
+mod graph_tests;
+#[path = "tests_hooks.rs"]
+mod hook_tests;
+#[path = "tests_identity.rs"]
+mod identity_tests;
+#[path = "tests_ingest.rs"]
+mod ingest_tests;
+#[path = "tests_search.rs"]
+mod search_tests;

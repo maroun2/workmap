@@ -258,10 +258,12 @@ fn relations_keep_their_kind_and_evidence() {
     // Views: exact source line for declared evidence, candidates separate.
     let app = view::resolve_project(&c, "app").unwrap();
     let rv = more::related_view(&v(&c), &app, 2, 20).unwrap();
-    let lib_handle = fx.lib.to_string_lossy();
+    let lib = view::resolve_project(&c, &fx.lib.to_string_lossy()).unwrap();
+    let lib_handle = lib.handle.clone();
+    assert!(lib_handle.starts_with("lib~"), "{lib_handle}");
     assert!(rv.contains("Cargo path dependency [declared] at") && rv.contains("Cargo.toml:5: \"lib = { path = \"../lib\" }\""), "{rv}");
     assert!(rv.contains("## Uncertain candidates (1; name matches only, not evidence)"), "{rv}");
-    assert!(rv.contains(&*lib_handle), "lib is ambiguous by name, so it is shown by path:\n{rv}");
+    assert!(rv.contains(&*lib_handle), "lib is ambiguous by name, so it is shown by its compact handle:\n{rv}");
     let first = rv.lines().find(|l| l.starts_with("- ")).unwrap();
     assert!(first.contains("Cargo git dependency") || first.contains("Cargo path dependency"), "declared relations sort first:\n{rv}");
     let ev = view::expand(&v(&c), ":related:web", &scoped("app")).unwrap();

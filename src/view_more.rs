@@ -38,8 +38,11 @@ fn scoped_ref(scope: Option<&Project>, target: &Project, co: Option<&Node>, rest
             None => q(&format!(":{rest}")),
         },
         _ => {
-            let wt = co.filter(|co| !target.is_default(co)).map(|co| format!(" --worktree {}", q(&worktree_name(target, co)))).unwrap_or_default();
-            format!("{}{wt}{}", q(&format!("{}:{rest}", target.handle)), if scope.is_some() { " (other project)" } else { "" })
+            let raw = match co {
+                Some(co) => qualified_raw(target, co, rest),
+                None => format!("{}:{rest}", target.handle),
+            };
+            format!("{}{}", q(&raw), if scope.is_some() { " (other project)" } else { "" })
         }
     }
 }
