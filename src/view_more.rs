@@ -638,8 +638,11 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
         let relp = rel(f, &top).trim_start_matches("./").to_string();
         let (head, blocks) = same_path_blocks(c, &mut pc, p, &all, &relp, 3)?;
         if !blocks.is_empty() {
-            sib_blocks.push(head.trim_start_matches('\n').replace("## Same path", &format!("## {relp}: same path")));
-            sib_blocks.extend(blocks);
+            // The heading travels with its first block: never printed alone.
+            let mut it = blocks.into_iter();
+            let first = it.next().unwrap_or_default();
+            sib_blocks.push(format!("{}{first}", head.trim_start_matches('\n').replace("## Same path", &format!("## {relp}: same path"))));
+            sib_blocks.extend(it);
         }
         let Some(n) = find_file(c, p, co, &relp)? else {
             notes.push(format!(
@@ -945,8 +948,11 @@ pub fn task_context(v: &View, p: &Project, t: &TaskReq) -> R<String> {
         if uncertain_omitted > 0 {
             parts.push(format!("{uncertain_omitted} uncertain mention(s)"));
         }
-        let next = first_omitted.filter(|r| r.len() < 120).map(|r| format!(", or expand {r}")).unwrap_or_default();
-        let _ = writeln!(o, "… omitted to stay within --budget {}: {}; rerun with --budget {}{next}", t.budget, parts.join(", "), needed + RESERVE + 20);
+        let mut footer = format!("… omitted to stay within --budget {}: {}; rerun with --budget {}", t.budget, parts.join(", "), needed + RESERVE + 20);
+        if let Some(r) = first_omitted.filter(|r| footer.len() + r.len() + 14 < RESERVE) {
+            let _ = write!(footer, ", or expand {r}");
+        }
+        let _ = writeln!(o, "{footer}");
     }
     Ok(o)
 }
