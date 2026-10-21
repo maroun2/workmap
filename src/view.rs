@@ -360,7 +360,7 @@ pub(crate) fn headings(path: &str) -> Vec<(usize, usize, String, String)> {
 }
 
 fn section_of_line(hs: &[(usize, usize, String, String)], line: usize) -> Option<&(usize, usize, String, String)> {
-    hs.iter().filter(|h| h.0 <= line).last()
+    hs.iter().rev().find(|h| h.0 <= line)
 }
 
 pub(crate) fn line_text(path: &str, line: usize, max: usize) -> Option<String> {
