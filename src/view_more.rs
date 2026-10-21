@@ -324,6 +324,7 @@ fn diagnose(v: &View, scope: Option<&Project>, sr: &SearchReq, opts: &SearchOpts
         None => "every indexed project, remote catalog and snapshot".into(),
     };
     let _ = writeln!(o, "Searched: {place} · {} · limit {}", filt.join(" · "), q.limit);
+    let head_len = o.len();
     if full {
         // 2. What the index holds there.
         let (cnt_where, cnt_args): (String, Vec<String>) = match scope {
@@ -403,7 +404,7 @@ fn diagnose(v: &View, scope: Option<&Project>, sr: &SearchReq, opts: &SearchOpts
                     let _ = writeln!(o, "  - {r} — {d} [{}]{tag}", h.tier);
                 }
             }
-        } else {
+        } else if full {
             let _ = writeln!(o, "Outside this scope: no matches anywhere else in the index either");
         }
     }
@@ -456,7 +457,8 @@ fn diagnose(v: &View, scope: Option<&Project>, sr: &SearchReq, opts: &SearchOpts
     }
     // 6. What was never indexed or only partly.
     if !full {
-        return Ok(o);
+        // Few hits and nothing actionable to add: print nothing.
+        return Ok(if o.len() == head_len { String::new() } else { o });
     }
     let src = |status: &str, under: Option<&[Node]>| -> i64 {
         match under {

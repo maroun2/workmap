@@ -87,6 +87,7 @@ fn prefix_and_stem_tiers_recover_inflected_words_and_label_every_hit() {
     assert!(lines.iter().all(|l| l.ends_with("[prefix]")), "{out}");
     assert!(out.contains(":message:cccc3333:l3") && out.contains(":docs/runbook.md#worker-stalls") && out.contains("[deadlocked]"), "{out}");
     assert!(!out.contains("scratch dir"), "the unrelated transcript is not indexed");
+    assert!(!out.contains("## Why"), "few hits with nothing to widen: no empty diagnostics block\n{out}");
     // `--exact` keeps today's strict behaviour and says what the fallbacks would add.
     let strict = global(&c, search::Query { exact: true, ..qy("deadlock") });
     assert!(strict.contains("no matches") && strict.contains("Tiers: exact 0 (") && !strict.contains("stricter:"), "{strict}");
