@@ -230,6 +230,8 @@ pub fn uninstall(env: &Env) -> std::io::Result<Vec<String>> {
         std::fs::remove_dir_all(&share)?;
         report.push(format!("removed {}", share.display()));
     }
+    // Opt-in host hooks (user scope); project-scope entries are listed by `workmap hooks status`.
+    report.extend(crate::hook::uninstall_user(env));
     let _ = std::fs::remove_file(env.state_dir.join("installed"));
     report.push(format!("kept the index at {} — delete that directory to remove all indexed data", env.state_dir.display()));
     Ok(report)

@@ -50,11 +50,13 @@ USAGE:
                                                        temporary shallow clones (cached per commit)
   workmap ingest --transcript FILE... [--checkout DIR]... [--quiet]
                                                        index only these sources now (no home walk, no pruning)
-  workmap hook <event> --harness claude                read a host hook event (JSON) on stdin; print
-                                                       bounded context or nothing
-  workmap hooks status|install|uninstall [--harness claude]
-                                                       opt-in host hook integration (see `hooks status`)
-  workmap resume REF [--cwd DIR] [--dry-run]           interactive native resume of the original session
+  workmap hook <event> --harness claude|codex          read a host hook event (JSON) on stdin; print bounded
+                                                       context or nothing; always exits 0 (used by installed hooks)
+  workmap hooks status|install|uninstall [--harness claude|codex] [--scope user|project] [--dry-run]
+                                                       opt-in host hooks: context at session start / per prompt,
+                                                       ingest on stop; `hooks status` shows the support matrix
+  workmap resume REF [--cwd DIR] [--dry-run]           interactive native resume of the ORIGINAL session in its
+                                                       own CLI and recorded cwd (writes to it; `ask` is read-only)
   workmap install [--no-activate] | workmap uninstall
   workmap status | workmap --version
 
@@ -108,6 +110,7 @@ impl Args {
             "--cwd",
             "--harness",
             "--checkout",
+            "--scope",
         ];
         let mut a = Args { pos: vec![], flags: vec![] };
         let mut it = v.into_iter();
@@ -173,6 +176,12 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let env = config::Env::from_process();
+    if a.pos.first().map(|s| s == "hook").unwrap_or(false) {
+        // Host hook: must never fail or block the host session, so it runs before
+        // (and instead of) the regular index open, which creates/migrates and waits.
+        hook::main(&env, a.pos.get(1).map(String::as_str), a.get("--harness").as_deref().unwrap_or("claude"), cli_cmd());
+        return Ok(());
+    }
     let mut c = db::open(&env.db_path()).map_err(|e| format!("open index {}: {e}", env.db_path().display()))?;
     let cmd = a.pos.first().cloned().unwrap_or_else(|| "overview".into());
     match cmd.as_str() {
@@ -451,17 +460,57 @@ fn run() -> Result<(), String> {
             let _ = (&a.all("--transcript"), &a.all("--checkout"));
             return Err("ingest: not implemented yet".into());
         }
-        "hook" => {
-            let event = a.pos.get(1).ok_or("usage: workmap hook <event> --harness claude   (event JSON on stdin)")?;
-            return hook::run(&env, &c, event, a.get("--harness").as_deref().unwrap_or("claude"));
-        }
+        "hook" => unreachable!("dispatched before the index is opened"),
         "hooks" => {
-            let _ = a.get("--harness");
-            return Err("hooks: not implemented yet".into());
+            let harness = a.get("--harness").unwrap_or_else(|| "claude".into());
+            let scope = match a.get("--scope").as_deref() {
+                None | Some("user") => hook::Scope::User,
+                Some("project") => hook::Scope::Project,
+                Some(x) => return Err(format!("--scope {x}: use user or project")),
+            };
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            match a.pos.get(1).map(String::as_str).unwrap_or("status") {
+                "status" => print!("{}", hook::status(&env, &cwd)),
+                "install" => {
+                    // Prefer the stable copy `workmap install` maintains over a build directory.
+                    let canonical = env.home.join(".local/share/workmap/bin/workmap");
+                    let bin = if canonical.is_file() { canonical } else { std::env::current_exe().map_err(|e| e.to_string())? };
+                    for l in hook::install(&env, &hook::HooksOpts { harness: &harness, scope, cwd: &cwd, bin: &bin, dry_run: a.has("--dry-run") })? {
+                        println!("{l}");
+                    }
+                }
+                "uninstall" => {
+                    let l = hook::uninstall(&env, &harness, scope, &cwd, a.has("--dry-run"))?;
+                    if l.is_empty() {
+                        println!("no workmap hooks in {}", hook::settings_path(&env, &harness, scope, &cwd)?.display());
+                    }
+                    for l in l {
+                        println!("{l}");
+                    }
+                }
+                x => return Err(format!("unknown hooks subcommand {x}; use status|install|uninstall [--harness claude|codex] [--scope user|project] [--dry-run]")),
+            }
         }
         "resume" => {
-            let _ = (a.get("--cwd"), a.has("--dry-run"));
-            return resume::run(&c);
+            let req = a.req();
+            let target =
+                a.pos.get(1).ok_or("usage: workmap resume REF [--cwd DIR] [--dry-run]   (REF = :conversation:<title> | :session:<id-prefix> with a scope, <project>:session:<id>, or a session id)")?;
+            let is_ref = target.starts_with(':') || target.contains(":conversation:") || target.contains(":session:");
+            let sid = if is_ref || req.conv.title.is_some() || req.conv.session.is_some() {
+                view::ask_session(&view::View { c: &c, cmd: cli_cmd(), state: state_vars() }, target, &req)?
+            } else {
+                resume::find_session(&c, target)?
+            };
+            let cwd = a.get("--cwd").map(PathBuf::from);
+            let p = resume::plan(&c, &sid, cwd.as_deref(), &ask::real_help).map_err(|e| format!("resume refused: {e}"))?;
+            print!("{}", view::more::ask_note(&c, &sid));
+            print!("{}", p.render());
+            if !a.has("--dry-run") {
+                let code = resume::execute(&p).map_err(|e| format!("{}: {e}", p.program))?;
+                if code != 0 {
+                    return Err(format!("{} exited with {code}", p.program));
+                }
+            }
         }
         other => return Err(format!("unknown command {other:?}\n\n{HELP}")),
     }
