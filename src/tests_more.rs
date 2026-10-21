@@ -456,7 +456,7 @@ fn task_context_ranks_with_reasons_and_respects_the_budget() {
     let t = more::TaskReq { task: Some("why does main print"), files: &files, budget: 6000 };
     let out = view::task(&v(&c), "proj", &view::Req::default(), &t).unwrap();
     assert_eq!(out, view::task(&v(&c), "proj", &view::Req::default(), &t).unwrap(), "deterministic");
-    let ranked: Vec<&str> = out.split("## Ranked").nth(1).unwrap().lines().filter(|l| l.starts_with("- ")).collect();
+    let ranked: Vec<&str> = out.split("## Ranked").nth(1).unwrap().split("\n## ").next().unwrap().lines().filter(|l| l.starts_with("- ")).collect();
     assert!(ranked[0].contains(":conversation:Investigate") && ranked[0].contains("read main.py (observed, Read) at transcript l.3"), "observed access ranks first:\n{out}");
     assert!(out.contains("names main.py at CLAUDE.md:4") && out.contains("changed main.py (A)") && out.contains("text matches"), "{out}");
     assert!(ranked.iter().all(|l| l.contains(" — ")), "every item says why");
@@ -470,7 +470,7 @@ fn task_context_ranks_with_reasons_and_respects_the_budget() {
     scores.clear();
     let small = view::task(&v(&c), "proj", &view::Req::default(), &more::TaskReq { budget: 1100, ..t }).unwrap();
     assert!(small.len() <= 1100 + 120, "budget bounds the output: {} bytes\n{small}", small.len());
-    assert!(small.contains("more item(s) omitted to stay within --budget 1100"), "{small}");
+    assert!(small.contains("… omitted to stay within --budget 1100: ") && small.contains("ranked item(s)"), "{small}");
     let missing = view::task(&v(&c), "proj", &view::Req::default(), &more::TaskReq { task: None, files: &["nope.rs".to_string()], budget: 3000 }).unwrap();
     assert!(missing.contains("note: nope.rs: no indexed evidence"), "{missing}");
 }
