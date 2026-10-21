@@ -71,8 +71,11 @@ fn version_string_embeds_semver_revision_and_build() {
     let v = crate::version();
     assert!(v.starts_with(&format!("{} (rev ", env!("CARGO_PKG_VERSION"))) && env!("CARGO_PKG_VERSION") == "0.3.0", "{v}");
     let rev = v.split("(rev ").nth(1).unwrap().split([';', ')']).next().unwrap();
+    // From git: 12 hex digits (+ `-dirty`). From WORKMAP_BUILD_REV (Nix
+    // `--argstr rev`): any value the sanitizer accepts, e.g. a short sha or tag.
     let hex = rev.trim_end_matches("-dirty");
-    assert!(rev == "unknown" || (hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit())), "{rev}");
+    let from_git = hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit());
+    assert!(rev == "unknown" || from_git || crate::buildinfo::revision(None, false, Some(rev)) == rev, "{rev}");
     assert!(v.contains("; debug;") || v.contains("; release;"), "build profile shown: {v}");
     // Fallback order used by build.rs: git revision, else WORKMAP_BUILD_REV, else unknown.
     use crate::buildinfo::{render, revision};
