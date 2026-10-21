@@ -84,7 +84,7 @@ fn hit_ref(cache: &mut RefCache, scope: Option<&Project>, h: &Hit) -> (String, S
             },
             "project".into(),
         ),
-        "commit" => (scoped_ref(scope, &p, None, &commit_ref(&h.loc)), format!("commit by {}", h.speaker)),
+        "commit" => (scoped_ref(scope, &p, None, &commit_ref(&h.loc)[1..]), format!("commit by {}", h.speaker)),
         "doc" => {
             let top = co.as_ref().and_then(|c| c.path.clone()).unwrap_or_default();
             let relp = if h.title.starts_with("claude-memory/") { h.title.clone() } else { rel(&h.source_path, &top).to_string() };
@@ -263,7 +263,8 @@ pub fn relation_view(v: &View, p: &Project, other: &str, limit: usize) -> R<Stri
 
 /// Related projects up to `depth` hops, with the evidence for each hop.
 pub fn related_view(v: &View, p: &Project, depth: usize, limit: usize) -> R<String> {
-    let reach = db(relations::bfs(v.c, &p.repo.id, depth.max(1), 500))?;
+    let mut reach = db(relations::bfs(v.c, &p.repo.id, depth.max(1), 500))?;
+    reach.sort_by_cached_key(|(n, path)| (path.len(), path.iter().map(|r| class_rank(&r.class)).max().unwrap_or(9), relations::node_name(v.c, n)));
     let mut o = String::new();
     let _ = writeln!(o, "# {} — related projects (depth {depth}; {} found)", p.handle, reach.len());
     o.push_str(&trust::index_line(v.c));
@@ -429,9 +430,9 @@ fn add_item(items: &mut BTreeMap<String, Item>, score: i64, ts: i64, r: String, 
 
 fn strength_score(kind: &str, strength: &str) -> i64 {
     match (kind, strength) {
-        ("write", "observed") => 60,
-        ("read", "observed") => 50,
-        (_, "requested") => 25,
+        ("write", "observed") => 100,
+        ("read", "observed") => 90,
+        (_, "requested") => 45,
         ("mentioned", _) => 5,
         _ => 10,
     }

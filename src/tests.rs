@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
-struct Fixture {
+pub(crate) struct Fixture {
     _t: TempDir,
     _outside: TempDir,
     home: PathBuf,
@@ -771,3 +771,6 @@ fn unique_name_matches_are_unverified_candidates_not_references() {
     assert_refs_roundtrip(&c, "proj", &f);
     assert_refs_roundtrip(&c, "proj", &s);
 }
+
+#[path = "tests_more.rs"]
+mod more_tests;

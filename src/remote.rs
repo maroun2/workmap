@@ -245,10 +245,10 @@ pub fn rebuild(tx: &Connection) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM edges WHERE src IN (SELECT id FROM nodes WHERE kind='remote') OR dst IN (SELECT id FROM nodes WHERE kind='remote')", [])?;
     tx.execute("DELETE FROM nodes WHERE kind='remote'", [])?;
     tx.execute("UPDATE nodes SET meta=json_remove(meta,'$.catalog') WHERE kind='repo'", [])?;
-    let mut local: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut local: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for r in crate::overview::nodes(tx, "kind='repo' ORDER BY id", &[])? {
         for id in crate::relations::repo_identities(&r) {
-            local.entry(id).or_insert(r.id.clone());
+            local.entry(id).or_default().push(r.id.clone());
         }
     }
     let ttl = ttl_secs();
@@ -284,8 +284,10 @@ pub fn rebuild(tx: &Connection) -> rusqlite::Result<()> {
         let stale = now_unix() - fetched > ttl || status != "ok";
         let meta = json!({"identity": identity, "provider": provider, "host": host, "namespace": ns, "name": name, "url": url, "description": desc,
             "visibility": vis, "archived": archived, "default_branch": branch, "updated_at": updated, "fetched_at": fetched, "stale": stale});
-        if let Some(repo) = local.get(&identity) {
-            tx.execute("UPDATE nodes SET meta=json_set(meta,'$.catalog',json(?2)) WHERE id=?1", params![repo, meta.to_string()])?;
+        if let Some(repos) = local.get(&identity) {
+            for repo in repos {
+                tx.execute("UPDATE nodes SET meta=json_set(meta,'$.catalog',json(?2)) WHERE id=?1", params![repo, meta.to_string()])?;
+            }
             continue;
         }
         let id = stable_id("remote", &identity);
