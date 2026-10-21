@@ -120,7 +120,33 @@ pub fn log(dir: &Path, n: usize, max_files: usize) -> Vec<Commit> {
     v
 }
 
+/// Configured remotes as `(name, url)`, credentials stripped. The URL is the
+/// raw `remote.<name>.url` value (first one per remote, config includes
+/// honoured), not the `url.<base>.insteadOf` rewrite that `git remote -v`
+/// prints: a local rewrite rule must not change a repository's identity.
 pub fn remotes(dir: &Path) -> Vec<(String, String)> {
+    let Some(out) = run_cmd(git(dir).args(["config", "-z", "--get-regexp", r"^remote\..*\.url$"]), T) else { return vec![] };
+    parse_remote_config(&out)
+}
+
+/// `git config -z --get-regexp` records (`key\nvalue\0`) → `(name, url)`.
+pub fn parse_remote_config(out: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    for rec in out.split('\0') {
+        let Some((key, val)) = rec.split_once('\n') else { continue };
+        let Some(name) = key.strip_prefix("remote.").and_then(|k| k.strip_suffix(".url")) else { continue };
+        let val = val.trim();
+        if name.is_empty() || val.is_empty() || v.iter().any(|x| x.0 == name) {
+            continue;
+        }
+        v.push((name.to_string(), strip_credentials(val)));
+    }
+    v
+}
+
+/// Effective fetch URLs after `insteadOf` rewriting, as `(name, url)`; only a
+/// secondary identity candidate for matching, never the recorded identity.
+pub fn rewritten_remotes(dir: &Path) -> Vec<(String, String)> {
     let Some(out) = run_cmd(git(dir).args(["remote", "-v"]), T) else { return vec![] };
     let mut v: Vec<(String, String)> = out
         .lines()
@@ -134,14 +160,64 @@ pub fn remotes(dir: &Path) -> Vec<(String, String)> {
     v
 }
 
-/// Never persist `https://user:token@host` credentials.
+/// Never persist credentials: `scheme://user:token@host/...` loses its userinfo,
+/// scp-style `user:secret@host:path` loses the secret, and any query string
+/// (`?private_token=…`, `?access_token=…`) or fragment is dropped.
 pub fn strip_credentials(url: &str) -> String {
+    let url = url.trim();
     if let Some((scheme, rest)) = url.split_once("://") {
-        if let Some((_, host)) = rest.split_once('@') {
-            return format!("{scheme}://{host}");
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let (auth, path) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        };
+        let host = match auth.rsplit_once('@') {
+            // An ssh login name is not a secret; any http(s) userinfo may be a token.
+            Some((user, host)) if scheme.ends_with("ssh") && !user.contains(':') && !user.is_empty() => format!("{user}@{host}"),
+            Some((_, host)) => host.to_string(),
+            None => auth.to_string(),
+        };
+        return format!("{scheme}://{host}{path}");
+    }
+    // scp-like `[user[:secret]@]host:path`: keep a bare user (`git@`), never a secret.
+    if let Some((user, rest)) = url.split_once('@') {
+        if !user.contains('/') && rest.contains(':') {
+            let user = user.split(':').next().unwrap_or("");
+            let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+            return format!("{}{rest}", if user.is_empty() { String::new() } else { format!("{user}@") });
         }
     }
     url.to_string()
+}
+
+/// [`strip_credentials`] applied to every `scheme://` URL inside a line of text
+/// (quoted manifest/doc lines shown as evidence).
+pub fn scrub_urls(text: &str) -> String {
+    if !text.contains("://") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |w: &mut String, out: &mut String| {
+        if w.contains("://") {
+            let start = w.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(0);
+            out.push_str(&w[..start]);
+            out.push_str(&strip_credentials(&w[start..]));
+        } else {
+            out.push_str(w);
+        }
+        w.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | ',') {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        } else {
+            word.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 /// Local branches by recency: (name, unix ts, sha).

@@ -216,11 +216,21 @@ pub fn run(env: &Env, c: &mut Connection, opts: &ScanOpts) -> rusqlite::Result<S
         // One transaction per repository: an interrupted scan keeps finished repos.
         let tx = c.transaction()?;
         let main_top = tops.iter().map(|t| &t.0).find(|t| t.join(".git").is_dir()).unwrap_or(&tops[0].0).clone();
+        // Identity comes from the raw configured URL; the insteadOf-rewritten fetch
+        // URL is kept only as a secondary matching candidate when it differs.
         let remotes = git::remotes(&main_top);
+        let rewritten = git::rewritten_remotes(&main_top);
+        let remote_json: Vec<serde_json::Value> = remotes
+            .iter()
+            .map(|r| match rewritten.iter().find(|w| w.0 == r.0 && w.1 != r.1) {
+                Some(w) => json!({"name": r.0, "url": r.1, "fetch_url": w.1}),
+                None => json!({"name": r.0, "url": r.1}),
+            })
+            .collect();
         let repo_id = stable_id("repo", &common.to_string_lossy());
         let label = repo_label(common, &remotes, &main_top);
         let branches = git::branches(&main_top, 20);
-        let repo_meta = json!({"common_dir": common, "remotes": remotes.iter().map(|r| json!({"name": r.0, "url": r.1})).collect::<Vec<_>>(),
+        let repo_meta = json!({"common_dir": common, "remotes": remote_json,
             "branches": branches.iter().map(|b| json!({"name": b.0, "ts": b.1, "sha": &b.2[..b.2.len().min(10)]})).collect::<Vec<_>>(), "checkouts": tops.len()});
         let repo_ts = branches.iter().map(|b| b.1).max();
         db::upsert_node(&tx, &NodeRow { id: &repo_id, kind: "repo", label: &label, path: Some(&common.to_string_lossy()), repo_id: Some(&repo_id), checkout_id: None, ts: repo_ts, meta: &repo_meta })?;
@@ -549,7 +559,7 @@ pub(crate) fn doc_passages(tx: &Connection, text: &str, id: &str, label: &str, a
                     ts: mtime,
                     title: label,
                     heading: &heading,
-                    text: &redact(&chunk),
+                    text: &redact(&crate::git::scrub_urls(&chunk)),
                     origin,
                 },
             )?;

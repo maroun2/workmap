@@ -26,7 +26,8 @@ use std::process::Command;
 use std::time::Duration;
 
 /// Bump when what a snapshot extracts changes (combined with the parser version).
-pub const VERSION: i64 = 1;
+/// 2: passages are kind `remote` (docs, manifests, head commit) and manifests are cached.
+pub const VERSION: i64 = 2;
 
 pub fn version() -> i64 {
     VERSION * 1000 + db::PARSER_VERSION
@@ -281,6 +282,35 @@ fn remotes(c: &Connection) -> rusqlite::Result<Vec<Remote>> {
     Ok(v)
 }
 
+/// `speaker` of cached snapshot file passages (all snapshot passages are kind `remote`).
+pub const SPEAKER_DOC: &str = "snapshot-doc";
+pub const SPEAKER_MANIFEST: &str = "snapshot-manifest";
+
+/// Whole lines (newlines kept) packed into at most `n` chunks of about `max` bytes.
+fn line_chunks(text: &str, max: usize, n: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![String::new()];
+    for l in text.lines() {
+        let l = clip(l, 300);
+        if out.last().map(|c| !c.is_empty() && c.len() + l.len() > max).unwrap_or(false) {
+            if out.len() >= n {
+                break;
+            }
+            out.push(String::new());
+        }
+        let cur = out.last_mut().unwrap();
+        cur.push_str(&l);
+        cur.push('\n');
+    }
+    out.retain(|c| !c.trim().is_empty());
+    out
+}
+
+/// Retag the doc passages just written for a snapshot file.
+fn tag_passages(tx: &Connection, origin: &str, speaker: &str) -> rusqlite::Result<()> {
+    tx.execute("UPDATE passages SET kind='remote', speaker=?2 WHERE origin=?1 AND kind='doc'", params![origin, speaker])?;
+    Ok(())
+}
+
 pub fn origin(identity: &str) -> String {
     format!("snap:{identity}")
 }
@@ -360,7 +390,7 @@ fn take(env: &Env, tx: &Connection, s: &Settings, r: &Remote, branch: &str) -> R
         db::add_passage(
             tx,
             &db::Passage {
-                kind: "commit",
+                kind: "remote",
                 node_id: &r.id,
                 repo_id: Some(&r.id),
                 checkout_id: None,
@@ -397,12 +427,23 @@ fn take(env: &Env, tx: &Connection, s: &Settings, r: &Remote, branch: &str) -> R
     for d in docs {
         let Some(text) = blob(&d.1) else { continue };
         crate::scan::doc_passages(tx, &text, &r.id, &d.3, &vpath(&d.3), &r.id, None, &o, None).map_err(db_err)?;
+        tag_passages(tx, &o, SPEAKER_DOC).map_err(db_err)?;
         for (line, raw, kind) in crate::docs::outside_links(&text, 100) {
             if kind == "doc_url" {
                 let lt = text.lines().nth(line - 1).unwrap_or("");
                 db::add_raw_link(
                     tx,
-                    &db::RawLink { origin: &o, repo_id: &r.id, checkout_id: &r.id, kind, raw: &raw, resolved: "", source_path: &vpath(&d.3), line: line as i64, note: &redact(&clip(lt.trim(), 160)) },
+                    &db::RawLink {
+                        origin: &o,
+                        repo_id: &r.id,
+                        checkout_id: &r.id,
+                        kind,
+                        raw: &crate::relations::safe_raw(kind, &raw),
+                        resolved: "",
+                        source_path: &vpath(&d.3),
+                        line: line as i64,
+                        note: &crate::git::scrub_urls(&redact(&clip(lt.trim(), 160))),
+                    },
                 )
                 .map_err(db_err)?;
             }
@@ -423,6 +464,31 @@ fn take(env: &Env, tx: &Connection, s: &Settings, r: &Remote, branch: &str) -> R
         }
         let Some(text) = blob(&e.1) else { continue };
         manifests += 1;
+        // Cached (bounded, redacted) so `remote:<id>:<path>` expands after the clone is gone.
+        // One passage per chunk, no section parsing (`#` starts a comment in TOML).
+        for (k, chunk) in line_chunks(&crate::git::scrub_urls(&text), 1500, 3).into_iter().enumerate() {
+            db::add_passage(
+                tx,
+                &db::Passage {
+                    kind: "remote",
+                    node_id: &r.id,
+                    repo_id: Some(&r.id),
+                    checkout_id: None,
+                    source_path: &vpath(&e.3),
+                    line: 1,
+                    // Distinct per file: search collapses passages by (node, loc).
+                    loc: &e.3,
+                    part: k as i64,
+                    speaker: SPEAKER_MANIFEST,
+                    ts: None,
+                    title: &e.3,
+                    heading: "",
+                    text: &redact(&chunk),
+                    origin: &o,
+                },
+            )
+            .map_err(db_err)?;
+        }
         for (kind, raw, line) in crate::relations::parse_manifest(name, &text).unwrap_or_default() {
             if kind.ends_with("_path") || (kind == "submodule" && raw.starts_with('.')) {
                 continue;
@@ -430,7 +496,17 @@ fn take(env: &Env, tx: &Connection, s: &Settings, r: &Remote, branch: &str) -> R
             let lt = text.lines().nth(line.saturating_sub(1)).unwrap_or("");
             db::add_raw_link(
                 tx,
-                &db::RawLink { origin: &o, repo_id: &r.id, checkout_id: &r.id, kind, raw: &raw, resolved: "", source_path: &vpath(&e.3), line: line as i64, note: &redact(&clip(lt.trim(), 160)) },
+                &db::RawLink {
+                    origin: &o,
+                    repo_id: &r.id,
+                    checkout_id: &r.id,
+                    kind,
+                    raw: &crate::relations::safe_raw(kind, &raw),
+                    resolved: "",
+                    source_path: &vpath(&e.3),
+                    line: line as i64,
+                    note: &crate::git::scrub_urls(&redact(&clip(lt.trim(), 160))),
+                },
             )
             .map_err(db_err)?;
         }

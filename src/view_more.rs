@@ -69,20 +69,22 @@ impl<'a> RefCache<'a> {
 
 /// `(reference, description)` for a search hit.
 fn hit_ref(cache: &mut RefCache, scope: Option<&Project>, h: &Hit) -> (String, String) {
-    if h.kind == "remote" {
-        return (q(&format!("remote:{}", h.title)), "remote repository (not cloned)".into());
-    }
     if let Some(at) = h.source_path.strip_prefix("remote:") {
-        // Remote snapshot passage: virtual ref tied to the indexed commit.
+        // Remote snapshot passage (kind `remote`): ref to the cached text of the indexed commit.
         let (identity, rest) = at.split_once('@').unwrap_or((at, ""));
         let sha = rest.split('/').next().unwrap_or("");
-        return match h.kind.as_str() {
-            "doc" => (
-                q(&format!("remote:{identity}:{}{}", h.title, if h.loc.is_empty() { String::new() } else { format!("#{}", h.loc) })),
-                format!("doc {}{} l.{} in REMOTE SNAPSHOT at {sha} (not on local disk)", h.title, if h.heading.is_empty() { String::new() } else { format!(" § {}", h.heading) }, h.line),
-            ),
-            _ => (q(&format!("remote:{identity}")), format!("head commit of REMOTE SNAPSHOT {sha} by {}", h.speaker)),
+        let section = if h.heading.is_empty() { String::new() } else { format!(" § {}", h.heading) };
+        let rest_ref = |t: &str, loc: &str| q(&format!("remote:{identity}:{t}{}", if loc.is_empty() { String::new() } else { format!("#{loc}") }));
+        return if h.speaker == crate::snapshot::SPEAKER_DOC || h.kind == "doc" {
+            (rest_ref(&h.title, &h.loc), format!("doc {}{section} l.{} in REMOTE SNAPSHOT at {sha} (not on local disk)", h.title, h.line))
+        } else if h.speaker == crate::snapshot::SPEAKER_MANIFEST {
+            (rest_ref(&h.title, ""), format!("manifest {} in REMOTE SNAPSHOT at {sha} (not on local disk)", h.title))
+        } else {
+            (q(&format!("remote:{identity}")), format!("head commit of REMOTE SNAPSHOT {sha} by {}", h.speaker))
         };
+    }
+    if h.kind == "remote" {
+        return (q(&format!("remote:{}", h.title)), "remote repository (not cloned)".into());
     }
     let Some(repo) = h.repo_id.clone() else {
         return (h.node_id.clone(), format!("{} without project", h.kind));
@@ -238,18 +240,68 @@ pub fn message_view(v: &View, p: &Project, sid_prefix: &str, loc: &str) -> R<Str
 
 // ------------------------------------------------------------------ relations
 
-fn other_ref(scope: &Project, c: &Connection, id: &str) -> String {
-    let _ = scope;
-    q(&format!(":related:{}", relations::node_name(c, id)))
+/// One end of a relation query: a local project or a remote-only repository.
+pub struct Endpoint {
+    /// Graph node id (repo or remote node).
+    pub id: String,
+    /// Printable name: project handle or `remote:<identity>`.
+    pub name: String,
+    pub project: Option<Project>,
+}
+
+impl Endpoint {
+    fn of(p: Project) -> Endpoint {
+        Endpoint { id: p.repo.id.clone(), name: p.handle.clone(), project: Some(p) }
+    }
+}
+
+/// Local repositories with a remote (raw or rewritten fetch URL) for `identity`.
+fn local_clones(c: &Connection, identity: &str) -> R<Vec<Node>> {
+    let identity = identity.to_lowercase();
+    Ok(db(nodes(c, "kind='repo' ORDER BY label, id", &[]))?.into_iter().filter(|r| relations::repo_identities(r).contains(&identity)).collect())
+}
+
+/// `remote:<identity>` → the remote-only node, or the single local clone of it.
+fn remote_endpoint(c: &Connection, identity: &str) -> R<Endpoint> {
+    let identity = identity.trim_end_matches('/');
+    let id = crate::util::stable_id("remote", &identity.to_lowercase());
+    if let Some(n) = db(get_node(c, &id))? {
+        return Ok(Endpoint { id, name: format!("remote:{}", n.label), project: None });
+    }
+    let clones = local_clones(c, identity)?;
+    match clones.len() {
+        0 => Err(format!("no remote repository {identity} in the catalog and no local clone of it (see `workmap remote list` and `workmap overview`)")),
+        1 => Ok(Endpoint::of(build_project(c, clones[0].clone(), None)?)),
+        n => {
+            let mut m = format!("remote:{identity} is cloned locally {n} times; choose a clone by handle:");
+            for r in &clones {
+                let _ = write!(m, "\n  {}", q(&project_handle(c, r)?));
+            }
+            Err(m)
+        }
+    }
+}
+
+/// Endpoint named on the command line: `remote:<identity>`, a project, or the scope.
+pub fn endpoint(v: &View, name: Option<&str>, req: &Req) -> R<Endpoint> {
+    if let Some(identity) = name.and_then(|n| n.strip_prefix("remote:")) {
+        return remote_endpoint(v.c, identity);
+    }
+    Ok(Endpoint::of(project_arg(v, name, req)?))
+}
+
+fn other_ref(scope: Option<&Project>, c: &Connection, id: &str) -> String {
+    let name = relations::node_name(c, id);
+    match scope {
+        Some(_) => q(&format!(":related:{name}")),
+        None => q(&name),
+    }
 }
 
 fn relation_target(c: &Connection, other: &str) -> R<(String, String)> {
     if let Some(identity) = other.strip_prefix("remote:") {
-        let id = crate::util::stable_id("remote", identity);
-        return match db(get_node(c, &id))? {
-            Some(_) => Ok((id, other.to_string())),
-            None => Err(format!("no remote-only repository {identity} in the catalog (see `workmap remote list`)")),
-        };
+        let e = remote_endpoint(c, identity)?;
+        return Ok((e.id, e.name));
     }
     let p = resolve_project(c, other)?;
     Ok((p.repo.id.clone(), p.handle))
@@ -283,22 +335,43 @@ pub fn relation_view(v: &View, p: &Project, other: &str, limit: usize) -> R<Stri
 }
 
 /// Related projects up to `depth` hops, with the evidence for each hop.
+#[allow(dead_code)] // project-typed entry point (tests, other views)
 pub fn related_view(v: &View, p: &Project, depth: usize, limit: usize) -> R<String> {
-    let mut reach = db(relations::bfs(v.c, &p.repo.id, depth.max(1), 500))?;
+    related_from(v, &Endpoint::of(clone_project(p)), depth, limit)
+}
+
+/// `related [<project>|remote:<identity>]`.
+pub fn related_cmd(v: &View, target: Option<&str>, req: &Req, depth: usize, limit: usize) -> R<String> {
+    related_from(v, &endpoint(v, target, req)?, depth, limit)
+}
+
+fn related_from(v: &View, start: &Endpoint, depth: usize, limit: usize) -> R<String> {
+    let mut reach = db(relations::bfs(v.c, &start.id, depth.max(1), 500))?;
     reach.sort_by_cached_key(|(n, path)| (path.len(), path.iter().map(|r| class_rank(&r.class)).max().unwrap_or(9), relations::node_name(v.c, n)));
     let mut o = String::new();
-    let _ = writeln!(o, "# {} — related projects (depth {depth}; {} found)", p.handle, reach.len());
+    let _ = writeln!(o, "# {} — related projects (depth {depth}; {} found)", start.name, reach.len());
     o.push_str(&trust::index_line(v.c));
-    o.push_str(&header(v, p, false));
+    match &start.project {
+        Some(p) => o.push_str(&header(v, p, false)),
+        None => {
+            let _ = writeln!(o, "{} is a remote repository you have not cloned; evidence comes from its catalog entry and, when enabled, its cached snapshot (expand {}).", start.name, q(&start.name));
+        }
+    }
     if reach.is_empty() {
         let _ = writeln!(o, "- none with recorded evidence (manifests, submodules, symlinks, doc links, conversation access, identical files, shared remotes)");
     }
     for (node, path) in reach.iter().take(limit) {
         let hops = path.len();
         let via: Vec<String> = path[..hops - 1].iter().map(|r| relations::node_name(v.c, &r.to)).collect();
-        let _ = writeln!(o, "- {} — {}{}", other_ref(p, v.c, node), relations::label(&path[hops - 1].kind), if via.is_empty() { String::new() } else { format!(" (via {})", via.join(" → ")) });
+        let _ = writeln!(
+            o,
+            "- {} — {}{}",
+            other_ref(start.project.as_ref(), v.c, node),
+            relations::label(&path[hops - 1].kind),
+            if via.is_empty() { String::new() } else { format!(" (via {})", via.join(" → ")) }
+        );
         if hops == 1 {
-            let ev = db(relations::between(v.c, &p.repo.id, node))?;
+            let ev = db(relations::between(v.c, &start.id, node))?;
             let firm: Vec<&Rel> = ev.iter().filter(|r| !r.is_candidate()).collect();
             for r in firm.iter().take(2) {
                 let _ = writeln!(o, "    {}", relations::evidence_line(v.c, r));
@@ -307,13 +380,13 @@ pub fn related_view(v: &View, p: &Project, depth: usize, limit: usize) -> R<Stri
                 let _ = writeln!(o, "    … {} more", firm.len() - 2);
             }
         } else {
-            let _ = writeln!(o, "    chain: {} why {} {}", v.cmd, q(&p.handle), q(&relations::node_name(v.c, node)));
+            let _ = writeln!(o, "    chain: {} why {} {}", v.cmd, q(&start.name), q(&relations::node_name(v.c, node)));
         }
     }
     if reach.len() > limit {
         let _ = writeln!(o, "  … {} more (--limit {})", reach.len() - limit, reach.len());
     }
-    let cands: Vec<Rel> = db(relations::neighbors(v.c, &p.repo.id))?.into_iter().filter(|r| r.is_candidate()).collect();
+    let cands: Vec<Rel> = db(relations::neighbors(v.c, &start.id))?.into_iter().filter(|r| r.is_candidate()).collect();
     if !cands.is_empty() {
         let _ = writeln!(o, "\n## Uncertain candidates ({}; name matches only, not evidence)", cands.len());
         for r in cands.iter().take(limit) {
@@ -324,14 +397,30 @@ pub fn related_view(v: &View, p: &Project, depth: usize, limit: usize) -> R<Stri
 }
 
 /// Shortest evidence chain between two projects.
+#[allow(dead_code)] // project-typed entry point (tests, other views)
 pub fn why_view(v: &View, a: &Project, b_name: &str, depth: usize) -> R<String> {
     let (bid, bname) = relation_target(v.c, b_name)?;
+    why_between(v, &Endpoint::of(clone_project(a)), &Endpoint { id: bid, name: bname, project: None }, depth)
+}
+
+/// `why <a> <b>` where either end may be `remote:<identity>`.
+pub fn why_cmd(v: &View, from: Option<&str>, to: &str, req: &Req, depth: usize) -> R<String> {
+    let a = endpoint(v, from, req)?;
+    let b = endpoint(v, Some(to), req)?;
+    why_between(v, &a, &b, depth)
+}
+
+fn why_between(v: &View, a: &Endpoint, b: &Endpoint, depth: usize) -> R<String> {
     let mut o = String::new();
-    let _ = writeln!(o, "# why {} → {bname} (max {depth} steps)", a.handle);
+    let _ = writeln!(o, "# why {} → {} (max {depth} steps)", a.name, b.name);
     o.push_str(&trust::index_line(v.c));
-    match db(relations::chain(v.c, &a.repo.id, &bid, depth))? {
+    if a.id == b.id {
+        let _ = writeln!(o, "both name the same repository");
+        return Ok(o);
+    }
+    match db(relations::chain(v.c, &a.id, &b.id, depth))? {
         Some(path) => {
-            let mut from = a.repo.id.clone();
+            let mut from = a.id.clone();
             for (i, r) in path.iter().enumerate() {
                 let ev = db(relations::between(v.c, &from, &r.to))?;
                 let firm: Vec<&Rel> = ev.iter().filter(|r| !r.is_candidate()).collect();
@@ -342,12 +431,15 @@ pub fn why_view(v: &View, a: &Project, b_name: &str, depth: usize) -> R<String> 
                 from = r.to.clone();
             }
             let _ = writeln!(o, "Each step is a recorded relation; a chain does not imply the first project depends on the last.");
+            if path.iter().any(|r| r.to.starts_with("remote-")) || a.id.starts_with("remote-") {
+                let _ = writeln!(o, "Remote-only steps are repositories you have not cloned; their evidence is from the catalog or a cached snapshot at a recorded commit, not local disk.");
+            }
         }
         None => {
             let _ = writeln!(o, "no evidence chain within {depth} steps");
         }
     }
-    let cands: Vec<Rel> = db(relations::between(v.c, &a.repo.id, &bid))?.into_iter().filter(|r| r.is_candidate()).collect();
+    let cands: Vec<Rel> = db(relations::between(v.c, &a.id, &b.id))?.into_iter().filter(|r| r.is_candidate()).collect();
     if !cands.is_empty() {
         let _ = writeln!(o, "\nUncertain candidates between them (not used in the chain):");
         for r in cands {
@@ -355,6 +447,69 @@ pub fn why_view(v: &View, a: &Project, b_name: &str, depth: usize) -> R<String> 
         }
     }
     Ok(o)
+}
+
+/// Where a piece of relation evidence was read, as an expandable reference when
+/// one exists (`<handle>[@wt]:<path> l.N`, `remote:<id>:<path> l.N`); otherwise
+/// the source path explicitly marked source-only, with a usable reference.
+pub(crate) fn evidence_locator(c: &Connection, sp: &str, line: i64) -> String {
+    let at_line = if line > 0 { format!(" l.{line}") } else { String::new() };
+    if let Some(rest) = sp.strip_prefix("remote:") {
+        // `<id>@<sha>/<path>` (snapshot provenance), `<id>@<sha>` (head commit) or `<id>:<path>`.
+        let (identity, path, sha) = match rest.split_once('@') {
+            Some((id, tail)) => {
+                let (sha, p) = tail.split_once('/').unwrap_or((tail, ""));
+                (id, p, sha)
+            }
+            None => match rest.split_once(':') {
+                Some((id, p)) => (id, p, ""),
+                None => (rest, "", ""),
+            },
+        };
+        if path.is_empty() {
+            return q(&format!("remote:{identity}"));
+        }
+        let cached: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM passages WHERE origin=?1 AND title=?2 AND (speaker IN (?3,?4) OR kind='doc'))",
+                params![crate::snapshot::origin(identity), path, crate::snapshot::SPEAKER_DOC, crate::snapshot::SPEAKER_MANIFEST],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        return if cached {
+            format!("{}{at_line}", q(&format!("remote:{identity}:{path}")))
+        } else {
+            format!("{path}{at_line} in the remote snapshot{} (text not cached; source only) — {}", if sha.is_empty() { String::new() } else { format!(" at {sha}") }, q(&format!("remote:{identity}")))
+        };
+    }
+    if sp.starts_with('/') {
+        let mut best: Option<Node> = None;
+        for co in nodes(c, "kind='checkout'", &[]).unwrap_or_default() {
+            let top = co.path.clone().unwrap_or_default();
+            if !top.is_empty() && sp.starts_with(&format!("{top}/")) && best.as_ref().and_then(|b| b.path.as_ref()).map(|b| b.len() < top.len()).unwrap_or(true) {
+                best = Some(co);
+            }
+        }
+        if let Some(co) = best {
+            let top = co.path.clone().unwrap_or_default();
+            if let Ok(r) = qualified_ref(c, &co, &sp[top.len() + 1..]) {
+                return format!("{r}{at_line}");
+            }
+        }
+        // A transcript: point at the conversation it belongs to.
+        if let Ok(Some(s)) = nodes(c, "kind='session' AND path=?1 ORDER BY ts DESC LIMIT 1", &[&sp]).map(|v| v.into_iter().next()) {
+            if let Some(p) = s.repo_id.as_deref().and_then(|rid| project_by_repo(c, rid, None)) {
+                let all = sessions_of(c, &p).unwrap_or_default();
+                return format!("{sp}{} (transcript; source only) — conversation {}", if line > 0 { format!(":{line}") } else { String::new() }, q(&format!("{}{}", p.handle, conv_ref_raw(&all, &s))));
+            }
+        }
+    }
+    format!("{sp}{} (source only; outside every indexed checkout)", if line > 0 { format!(":{line}") } else { String::new() })
+}
+
+#[allow(dead_code)] // project-typed entry point (tests, other views)
+fn clone_project(p: &Project) -> Project {
+    Project { repo: p.repo.clone(), handle: p.handle.clone(), checkouts: p.checkouts.clone(), focus: p.focus.clone() }
 }
 
 /// Bounded "Related projects" block for the project map.
@@ -372,7 +527,7 @@ pub fn related_section(v: &View, p: &Project, n: usize) -> R<String> {
     let mut rows: Vec<(&String, &Vec<&Rel>)> = by.iter().collect();
     rows.sort_by_key(|(id, rs)| (rs.iter().map(|r| class_rank(&r.class)).min().unwrap_or(9), relations::node_name(v.c, id)));
     for (id, rs) in rows.iter().take(n) {
-        let _ = writeln!(o, "- {} — {}", other_ref(p, v.c, id), relations::evidence_line(v.c, rs[0]));
+        let _ = writeln!(o, "- {} — {}", other_ref(Some(p), v.c, id), relations::evidence_line(v.c, rs[0]));
     }
     if cands > 0 {
         let _ = writeln!(o, "- plus {cands} uncertain name-match candidate(s): {} related {}", v.cmd, q(&p.handle));
@@ -394,105 +549,234 @@ fn class_rank(c: &str) -> u8 {
 
 // ------------------------------------------------------------------ remote
 
-pub fn remote_view(v: &View, target: &str) -> R<Option<String>> {
-    let (identity, path) = match target.split_once(':') {
+/// Parsed `remote:` reference: `<identity>[:<path>[#slug]]`, or the provenance
+/// alias `<identity>@<sha>/<path>[:<line>]` printed by older versions.
+struct RemoteRef<'a> {
+    identity: &'a str,
+    path: Option<&'a str>,
+    slug: Option<&'a str>,
+    /// (commit prefix, line) from a provenance alias.
+    provenance: Option<(&'a str, i64)>,
+}
+
+fn parse_remote_ref(target: &str) -> RemoteRef<'_> {
+    let at = target.find('@');
+    let colon = target.find(':');
+    if let Some(i) = at.filter(|&i| colon.map(|c| i < c).unwrap_or(true)) {
+        let identity = &target[..i];
+        let tail = &target[i + 1..];
+        let (sha, file) = tail.split_once('/').unwrap_or((tail, ""));
+        let (file, line) = match file.rsplit_once(':') {
+            Some((f, l)) if l.chars().all(|c| c.is_ascii_digit()) && !l.is_empty() => (f, l.parse().unwrap_or(0)),
+            _ => (file, 0),
+        };
+        return RemoteRef { identity, path: Some(file).filter(|f| !f.is_empty()), slug: None, provenance: Some((sha, line)) };
+    }
+    let (identity, rest) = match target.split_once(':') {
         Some((i, p)) => (i, Some(p)),
         None => (target, None),
     };
-    let Some(n) = db(get_node(v.c, &crate::util::stable_id("remote", identity)))? else { return Ok(None) };
-    if let Some(p) = path {
-        return remote_doc_view(v, &n, p).map(Some);
+    let (path, slug) = match rest.map(|r| r.rsplit_once('#').unwrap_or((r, ""))) {
+        Some((p, s)) => (Some(p).filter(|p| !p.is_empty()), Some(s).filter(|s| !s.is_empty())),
+        None => (None, None),
+    };
+    RemoteRef { identity: identity.trim_end_matches('/'), path, slug, provenance: None }
+}
+
+/// Cached snapshot files of a remote node: (path, speaker, passages, sections).
+fn snapshot_files(c: &Connection, n: &Node) -> R<Vec<(String, String, i64, Vec<(String, String)>)>> {
+    let mut st = db(c.prepare(
+        "SELECT title, CASE WHEN kind='doc' THEN ?2 ELSE speaker END AS sp, count(*), group_concat(CASE WHEN loc<>'' AND loc<>title AND part=0 THEN loc || char(31) || heading END, char(30)) FROM passages
+         WHERE origin=?1 AND (speaker IN (?2,?3) OR kind='doc') GROUP BY title, sp ORDER BY sp, title",
+    ))?;
+    let rows: Vec<(String, String, i64, Option<String>)> =
+        db(db(st.query_map(params![crate::snapshot::origin(&n.label), crate::snapshot::SPEAKER_DOC, crate::snapshot::SPEAKER_MANIFEST], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?
+            .collect::<Result<_, _>>())?;
+    Ok(rows
+        .into_iter()
+        .map(|(t, sp, k, secs)| {
+            let secs = secs.unwrap_or_default().split('\x1e').filter_map(|x| x.split_once('\x1f')).map(|(a, b)| (a.to_string(), b.to_string())).collect();
+            (t, sp, k, secs)
+        })
+        .collect())
+}
+
+pub fn remote_view(v: &View, target: &str) -> R<Option<String>> {
+    let rr = parse_remote_ref(target);
+    let Some(n) = db(get_node(v.c, &crate::util::stable_id("remote", &rr.identity.to_lowercase())))? else {
+        let clones = local_clones(v.c, rr.identity)?;
+        if clones.is_empty() {
+            return Err(format!("no remote repository {} in the catalog (see `{} remote list`; the catalog lists repositories you can access via gh/glab)", rr.identity, v.cmd));
+        }
+        let mut o = format!("# {} — cloned locally, so it is indexed as a project (not as a remote entry)\n", q(&format!("remote:{}", rr.identity)));
+        for r in &clones {
+            let h = project_handle(v.c, r)?;
+            let _ = writeln!(o, "- {} — expand it, or {} for a file in it", q(&h), q(&format!("{h}:{}", rr.path.unwrap_or("README.md"))));
+        }
+        return Ok(Some(o));
+    };
+    if rr.path.is_some() || rr.provenance.is_some() {
+        return remote_doc_view(v, &n, &rr).map(Some);
     }
     let m = &n.meta;
     let s = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let this = q(&format!("remote:{}", n.label));
     let mut o = String::new();
-    let _ = writeln!(o, "# {} — remote repository, not cloned locally", q(&format!("remote:{}", n.label)));
+    let _ = writeln!(o, "# {this} — remote repository, not cloned locally");
+    let fetched = m.get("fetched_at").and_then(|x| x.as_i64()).unwrap_or(0);
     let _ = writeln!(
         o,
-        "{} · {}{} · default branch {} · updated {} · via {} on {}",
+        "\n## Catalog metadata (from {} on {}, fetched {}{})",
+        s("provider"),
+        s("host"),
+        fmt_ts(fetched),
+        if m.get("stale").and_then(|x| x.as_bool()) == Some(true) { "; STALE: refresh failed or older than the TTL" } else { "" }
+    );
+    let _ = writeln!(
+        o,
+        "{} · {}{} · default branch {} · updated {}",
         s("url"),
         s("visibility"),
         if m.get("archived").and_then(|x| x.as_bool()) == Some(true) { ", archived" } else { "" },
         s("default_branch"),
         s("updated_at"),
-        s("provider"),
-        s("host")
     );
-    let fetched = m.get("fetched_at").and_then(|x| x.as_i64()).unwrap_or(0);
-    let _ = writeln!(o, "catalog fetched {}{}", fmt_ts(fetched), if m.get("stale").and_then(|x| x.as_bool()) == Some(true) { " (STALE: refresh failed or older than the TTL)" } else { "" });
     if !s("description").is_empty() {
         let _ = writeln!(o, "description: {}", s("description"));
     }
-    match crate::snapshot::row(v.c, &n.label) {
+    let snap = crate::snapshot::row(v.c, &n.label);
+    match &snap {
         Some((branch, sha, at, status, err, files, docs)) if !sha.is_empty() => {
-            let _ = writeln!(o, "\n## Remote snapshot (opt-in; derived text from a temporary shallow clone, already deleted)");
-            let _ = writeln!(
-                o,
-                "{branch} @ {sha} indexed {} · {files} files, {docs} docs · status {status}{}",
-                fmt_ts(at),
-                if err.is_empty() { String::new() } else { format!(" (last refresh failed: {err}; data above is from the indexed commit)") }
-            );
+            let list = snapshot_files(v.c, &n)?;
+            let manifests = list.iter().filter(|f| f.1 == crate::snapshot::SPEAKER_MANIFEST).count();
+            let _ = writeln!(o, "\n## Cached snapshot (opt-in; text from a temporary shallow clone, already deleted)");
+            let _ = writeln!(o, "{branch} @ {sha} · indexed {} · {files} files, {docs} docs, {manifests} manifests cached · status {status}", fmt_ts(*at));
+            if !err.is_empty() {
+                let _ = writeln!(o, "last refresh failed: {err}; the data here is still from {}", &sha[..12.min(sha.len())]);
+            }
             let _ = writeln!(o, "Only {branch} is indexed; other branches are not. This is the remote at that commit, not anything on local disk.");
-            let mut st = db(v.c.prepare("SELECT title, min(line), count(*) FROM passages WHERE node_id=?1 AND kind='doc' AND origin LIKE 'snap:%' GROUP BY title ORDER BY title"))?;
-            let ds: Vec<(String, i64, i64)> = db(db(st.query_map([&n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>())?;
-            for (t, _, k) in ds.iter().take(15) {
-                let _ = writeln!(o, "- {} ({k} passage(s)) {}", q(&format!("remote:{}:{t}", n.label)), crate::snapshot::blob_link(&s("provider"), &s("url"), &sha, t, 0));
+            let mut shown = 0;
+            for (kind, label) in [(crate::snapshot::SPEAKER_DOC, "Docs"), (crate::snapshot::SPEAKER_MANIFEST, "Manifests")] {
+                let fs: Vec<_> = list.iter().filter(|f| f.1 == kind).collect();
+                if fs.is_empty() {
+                    continue;
+                }
+                let _ = writeln!(o, "{label} ({}):", fs.len());
+                for (t, _, k, secs) in fs.iter().take(15) {
+                    let _ = writeln!(o, "- {} ({k} passage(s)) {}", q(&format!("remote:{}:{t}", n.label)), crate::snapshot::blob_link(&s("provider"), &s("url"), sha, t, 0));
+                    for (slug, heading) in secs.iter().take(4) {
+                        let _ = writeln!(o, "    {} {heading}", q(&format!("remote:{}:{t}#{slug}", n.label)));
+                    }
+                    shown += 1;
+                }
+            }
+            if shown == 0 {
+                let _ = writeln!(o, "(no docs or manifests cached in this snapshot)");
             }
         }
         Some((branch, _, _, _, err, _, _)) => {
-            let _ = writeln!(o, "\nRemote snapshot of {branch}: not available yet ({err})");
+            let _ = writeln!(o, "\n## Cached snapshot\nnone yet for {branch} ({err}); only catalog metadata is indexed");
         }
-        None => {}
+        None => {
+            let _ = writeln!(o, "\n## Cached snapshot\nnone: only catalog metadata is indexed (opt in with `{} remote snapshots enable`, then scan)", v.cmd);
+        }
     }
     let ev = db(relations::neighbors(v.c, &n.id))?;
     if !ev.is_empty() {
-        let _ = writeln!(o, "\n## Projects related to it ({})", ev.len());
+        let _ = writeln!(o, "\n## Projects related to it ({}) — {} related {this} for all hops", ev.len(), v.cmd);
         for r in ev.iter().take(10) {
-            let _ = writeln!(o, "- {} {}", relations::node_name(v.c, &r.to), relations::evidence_line(v.c, r));
+            let _ = writeln!(o, "- {} {}", q(&relations::node_name(v.c, &r.to)), relations::evidence_line(v.c, r));
         }
     }
-    let _ = writeln!(o, "\nOnly metadata is indexed. To work on it: git clone {} && {} scan", s("url"), v.cmd);
+    let _ = writeln!(o, "\nTo work on it: git clone {} && {} scan", s("url"), v.cmd);
     Ok(Some(o))
 }
 
-/// `remote:<identity>:<path>[#slug]`: cached snapshot text of one doc (section).
-fn remote_doc_view(v: &View, n: &Node, target: &str) -> R<String> {
-    let (path, slug) = match target.rsplit_once('#') {
-        Some((p, s)) if !s.is_empty() => (p, Some(s)),
-        _ => (target.trim_end_matches('#'), None),
-    };
+/// `remote:<identity>:<path>[#slug]` (or the provenance alias): cached snapshot
+/// text of one doc section or manifest, read from the index only.
+fn remote_doc_view(v: &View, n: &Node, rr: &RemoteRef) -> R<String> {
     let row = crate::snapshot::row(v.c, &n.label).filter(|r| !r.1.is_empty()).ok_or_else(|| format!("remote:{} has no snapshot; enable with `workmap remote snapshots enable` and scan", n.label))?;
-    let mut st = db(v.c.prepare("SELECT line, heading, loc, text FROM passages WHERE node_id=?1 AND kind='doc' AND origin LIKE 'snap:%' AND title=?2 AND (?3 IS NULL OR loc=?3) ORDER BY line, part"))?;
-    let rows: Vec<(i64, String, String, String)> = db(db(st.query_map(params![n.id, path, slug], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?.collect::<Result<_, _>>())?;
-    if rows.is_empty() {
-        let mut st = db(v.c.prepare("SELECT DISTINCT title FROM passages WHERE node_id=?1 AND kind='doc' AND origin LIKE 'snap:%' ORDER BY title LIMIT 20"))?;
-        let titles: Vec<String> = db(db(st.query_map([&n.id], |r| r.get(0)))?.collect::<Result<_, _>>())?;
-        return Err(format!("no indexed doc {target} in the snapshot of {}; indexed docs: {}", n.label, titles.join(", ")));
-    }
     let m = &n.meta;
     let g = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let Some(path) = rr.path else {
+        // `<identity>@<sha>`: the head commit.
+        return Ok(format!(
+            "# {} — head commit of the REMOTE SNAPSHOT ({} @ {})\nexpand {} for the snapshot and its files\n",
+            q(&format!("remote:{}@{}", n.label, rr.provenance.map(|p| p.0).unwrap_or(""))),
+            row.0,
+            row.1,
+            q(&format!("remote:{}", n.label))
+        ));
+    };
+    let mut st = db(v.c.prepare(
+        "SELECT line, heading, loc, text, CASE WHEN kind='doc' THEN ?2 ELSE speaker END FROM passages WHERE origin=?1 AND (speaker IN (?2,?3) OR kind='doc') AND title=?4 AND (?5 IS NULL OR loc=?5) ORDER BY line, part",
+    ))?;
+    let rows: Vec<(i64, String, String, String, String)> = db(db(st
+        .query_map(params![crate::snapshot::origin(&n.label), crate::snapshot::SPEAKER_DOC, crate::snapshot::SPEAKER_MANIFEST, path, rr.slug], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        }))?
+    .collect::<Result<_, _>>())?;
+    if rows.is_empty() {
+        let files: Vec<String> = snapshot_files(v.c, n)?.into_iter().map(|f| f.0).take(20).collect();
+        return Err(format!(
+            "no cached {}{} in the snapshot of {}; cached docs and manifests: {}",
+            path,
+            rr.slug.map(|s| format!("#{s}")).unwrap_or_default(),
+            n.label,
+            if files.is_empty() { "none".into() } else { files.join(", ") }
+        ));
+    }
+    let canonical = format!("remote:{}:{path}{}", n.label, rr.slug.map(|s| format!("#{s}")).unwrap_or_default());
     let mut o = String::new();
-    let _ = writeln!(o, "# {} — REMOTE SNAPSHOT of {} at {} ({}), not on local disk", q(&format!("remote:{}:{target}", n.label)), n.label, &row.1[..12], row.0);
+    let kind = if rows[0].4 == crate::snapshot::SPEAKER_MANIFEST { "manifest" } else { "doc" };
+    let _ = writeln!(o, "# {} — {kind} in the REMOTE SNAPSHOT of {} at {} ({}), not on local disk", q(&canonical), n.label, &row.1[..12], row.0);
     let _ = writeln!(
         o,
-        "indexed {} from a temporary shallow clone (deleted); the remote may have moved since. Browser: {}",
+        "cached text indexed {} from a temporary shallow clone (deleted); the remote may have moved since. Browser: {}",
         fmt_ts(row.2),
-        crate::snapshot::blob_link(&g("provider"), &g("url"), &row.1, path, rows[0].0)
+        crate::snapshot::blob_link(&g("provider"), &g("url"), &row.1, path, rr.provenance.map(|p| p.1).filter(|l| *l > 0).unwrap_or(rows[0].0))
     );
+    if let Some((sha, line)) = rr.provenance {
+        let same = !sha.is_empty() && row.1.starts_with(&sha.to_lowercase());
+        let _ = writeln!(
+            o,
+            "provenance {}@{sha}/{path}{} → {}",
+            n.label,
+            if line > 0 { format!(":{line}") } else { String::new() },
+            if same { format!("the indexed commit; canonical ref {}", q(&canonical)) } else { format!("NOT the indexed commit {} (re-snapshotted since); showing the indexed text", &row.1[..12]) }
+        );
+        if line > 0 && same {
+            let note: Option<String> = db(v
+                .c
+                .query_row("SELECT note FROM raw_links WHERE origin=?1 AND source_path LIKE ?2 AND line=?3 LIMIT 1", params![crate::snapshot::origin(&n.label), format!("%/{path}"), line], |r| {
+                    r.get(0)
+                })
+                .optional())?;
+            let manifest_line = (kind == "manifest").then(|| rows.iter().map(|r| r.3.as_str()).collect::<String>().lines().nth(line as usize - 1).map(str::to_string)).flatten();
+            if let Some(t) = manifest_line.or(note) {
+                let _ = writeln!(o, "line {line}: \"{}\"", clip(t.trim(), 200));
+            }
+        }
+    }
     let mut bytes = 0;
-    let mut last = String::new();
-    for (line, heading, loc, text) in &rows {
-        if *loc != last {
-            let _ =
-                writeln!(o, "\n## l.{line}{} {}", if heading.is_empty() { String::new() } else { format!(" {heading}") }, crate::snapshot::blob_link(&g("provider"), &g("url"), &row.1, path, *line));
-            last = loc.clone();
+    let mut last: Option<String> = None;
+    for (line, heading, loc, text, _) in &rows {
+        if last.as_deref() != Some(loc.as_str()) {
+            let r = if loc.is_empty() || loc == path { String::new() } else { format!(" {}", q(&format!("remote:{}:{path}#{loc}", n.label))) };
+            let _ = writeln!(
+                o,
+                "\n## l.{line}{}{r} {}",
+                if heading.is_empty() { String::new() } else { format!(" {heading}") },
+                crate::snapshot::blob_link(&g("provider"), &g("url"), &row.1, path, *line)
+            );
+            last = Some(loc.clone());
         }
         if bytes > 6000 {
             let _ = writeln!(o, "… more in the browser link above");
             break;
         }
         bytes += text.len();
-        let _ = writeln!(o, "{text}");
+        let _ = writeln!(o, "{}", text.trim_end());
     }
     Ok(o)
 }
