@@ -406,6 +406,11 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
     // The moved checkout is a live worktree of its own, with its branch read from git.
     let map = view::context(&v(&c), "", &scoped(&api)).unwrap();
     assert!(map.contains("MISSING since") && map.contains(&format!("@ {}", moved.display())), "{map}");
+    // A partial scan elsewhere keeps the reconnection.
+    let mut cp = db::open(&env.db_path()).unwrap();
+    scan::run(&env, &mut cp, &scan::ScanOpts { include_home: false, roots: vec![fx.sdk.clone()], ..Default::default() }).unwrap();
+    let ev: Option<String> = cp.query_row("SELECT json_extract(meta,'$.moved_to.evidence') FROM nodes WHERE id=?1", [&old_co], |r| r.get(0)).unwrap();
+    assert!(ev.unwrap_or_default().starts_with("same git worktree admin dir "), "partial scan erased the reconnection");
     // Moving it back makes it live again.
     std::fs::rename(&moved, &spike).unwrap();
     let (c, st) = scan_once(&env);

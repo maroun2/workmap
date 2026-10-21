@@ -510,7 +510,10 @@ fn mark_missing(tx: &Connection, co: &crate::overview::Node, walked: &HashSet<St
     let mut strong: Vec<(String, String, String)> = Vec::new();
     let mut weak: Vec<(String, String, String)> = Vec::new();
     for live in crate::overview::nodes(tx, "kind='checkout'", &[])? {
-        if live.id == co.id || !walked.contains(&live.id) {
+        // Any live checkout counts, walked by this run or not: a partial scan must
+        // not forget a reconnection a full scan established.
+        let on_disk = live.path.as_deref().map(|p| Path::new(p).is_dir()).unwrap_or(false);
+        if live.id == co.id || (!walked.contains(&live.id) && (!on_disk || live.meta.get("missing").and_then(|x| x.as_bool()) == Some(true))) {
             continue;
         }
         let path = live.path.clone().unwrap_or_default();
@@ -729,9 +732,17 @@ fn decide(tx: &Connection, key: &str, size: i64, mtime: i64, matcher: &mut Match
         }
     }
     let cwd = head_cwd();
+    // Indexed earlier and attributed to a checkout (that this run does not know,
+    // e.g. outside a partial scan's roots): keep it rather than demote it.
+    let attributed = || -> rusqlite::Result<bool> {
+        if prev.as_ref().map(|p| p.2 != "parsed").unwrap_or(true) {
+            return Ok(false);
+        }
+        tx.query_row("SELECT count(*) FROM source_files f JOIN nodes n ON n.id=f.session_id WHERE f.path=?1 AND n.checkout_id IS NOT NULL", [key], |r| r.get::<_, i64>(0)).map(|n| n > 0)
+    };
     match cwd.as_deref() {
         Some(c) if matcher.locate_any(Path::new(c)).is_some() => Ok(Decision::Parse),
-        _ if prev.as_ref().map(|p| p.2 == "parsed").unwrap_or(false) => Ok(Decision::Keep),
+        _ if attributed()? => Ok(Decision::Keep),
         _ => Ok(Decision::Unrelated(cwd)),
     }
 }
