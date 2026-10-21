@@ -5,7 +5,7 @@
 use super::*;
 use crate::{relations, remote, search, trust, view::more};
 
-fn scan_with(env: &Env, opts: scan::ScanOpts) -> (Connection, scan::Stats) {
+pub(crate) fn scan_with(env: &Env, opts: scan::ScanOpts) -> (Connection, scan::Stats) {
     let mut c = db::open(&env.db_path()).unwrap();
     let st = scan::run(env, &mut c, &opts).unwrap();
     (c, st)
@@ -15,7 +15,7 @@ fn q(text: &str) -> search::Query {
     search::Query { text: text.into(), limit: 20, ..Default::default() }
 }
 
-fn global(c: &Connection, text: &str) -> String {
+pub(crate) fn global(c: &Connection, text: &str) -> String {
     more::search_view(&v(c), &view::Req::default(), &more::SearchReq { query: q(text), this_worktree: false }).unwrap()
 }
 
@@ -158,11 +158,11 @@ fn parser_version_migration_and_missing_sources_keep_search_consistent() {
 
 // ------------------------------------------------------------------ relations
 
-struct Rels {
-    _t: TempDir,
-    home: PathBuf,
-    app: PathBuf,
-    lib: PathBuf,
+pub(crate) struct Rels {
+    pub(crate) _t: TempDir,
+    pub(crate) home: PathBuf,
+    pub(crate) app: PathBuf,
+    pub(crate) lib: PathBuf,
 }
 
 fn init(dir: &Path, origin: Option<&str>) {
@@ -174,7 +174,7 @@ fn init(dir: &Path, origin: Option<&str>) {
     git(dir, &["commit", "-qm", "start"]);
 }
 
-fn relations_fixture() -> Rels {
+pub(crate) fn relations_fixture() -> Rels {
     let t = TempDir::new("rels");
     let home = t.path().join("home");
     let code = home.join("code");
@@ -261,7 +261,7 @@ fn relations_keep_their_kind_and_evidence() {
     let lib = view::resolve_project(&c, &fx.lib.to_string_lossy()).unwrap();
     let lib_handle = lib.handle.clone();
     assert!(lib_handle.starts_with("lib~"), "{lib_handle}");
-    assert!(rv.contains("Cargo path dependency [declared] at") && rv.contains("Cargo.toml:5: \"lib = { path = \"../lib\" }\""), "{rv}");
+    assert!(rv.contains("Cargo path dependency [declared] at") && rv.contains("Cargo.toml l.5: \"lib = { path = \"../lib\" }\""), "{rv}");
     assert!(rv.contains("## Uncertain candidates (1; name matches only, not evidence)"), "{rv}");
     assert!(rv.contains(&*lib_handle), "lib is ambiguous by name, so it is shown by its compact handle:\n{rv}");
     let first = rv.lines().find(|l| l.starts_with("- ")).unwrap();
@@ -304,7 +304,7 @@ fn why_chains_are_bounded_and_survive_cycles() {
 
 // ------------------------------------------------------------------ remote discovery
 
-fn fake_cli(dir: &Path, name: &str, script: &str) -> PathBuf {
+pub(crate) fn fake_cli(dir: &Path, name: &str, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
     write(&p, script);
@@ -312,7 +312,7 @@ fn fake_cli(dir: &Path, name: &str, script: &str) -> PathBuf {
     p
 }
 
-fn remote_env(fx: &Rels, gh_ok: bool) -> Env {
+pub(crate) fn remote_env(fx: &Rels, gh_ok: bool) -> Env {
     let bin = fx.home.join("bin");
     let log = fx.home.join("gh.log");
     let page1 = r#"[{"full_name":"acme/lib","html_url":"https://github.com/acme/lib","private":false,"archived":false,"default_branch":"main","updated_at":"2026-05-01T00:00:00Z","description":"the parser library"}]"#;
@@ -332,9 +332,9 @@ fn remote_env(fx: &Rels, gh_ok: bool) -> Env {
     env
 }
 
-fn dump(c: &Connection) -> String {
+pub(crate) fn dump(c: &Connection) -> String {
     let mut all = String::new();
-    for t in ["nodes", "edges", "passages", "remote_repos", "remote_hosts", "scans"] {
+    for t in ["nodes", "edges", "passages", "remote_repos", "remote_hosts", "scans", "raw_links", "file_hashes", "remote_snapshots"] {
         let mut st = c.prepare(&format!("SELECT * FROM {t}")).unwrap();
         let n = st.column_count();
         let rows = st.query_map([], |r| Ok((0..n).map(|i| format!("{:?}", r.get_ref(i).unwrap())).collect::<Vec<_>>().join("|"))).unwrap();
@@ -508,7 +508,7 @@ fn deleted_checkouts_are_pruned_but_unmounted_parents_are_not() {
 
 // ------------------------------------------------------------------ remote snapshots
 
-fn git_out(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn git_out(dir: &Path, args: &[&str]) -> String {
     let o = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=T", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
     assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
     String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -516,7 +516,7 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
 
 /// A bare "GitHub" repository acme/secret-tool on branch dev, reachable through
 /// `url.<file>.insteadOf=https://github.com/`, plus a work clone to push from.
-fn snapshot_env(fx: &Rels) -> (Env, PathBuf, PathBuf) {
+pub(crate) fn snapshot_env(fx: &Rels) -> (Env, PathBuf, PathBuf) {
     // Outside the scanned home, so neither is indexed as a local project.
     let remotes = fx._t.path().join("remotes");
     let bare = remotes.join("acme/secret-tool.git");
@@ -543,11 +543,11 @@ fn snapshot_env(fx: &Rels) -> (Env, PathBuf, PathBuf) {
     (env, bare, work)
 }
 
-fn snap_scan(env: &Env) -> (Connection, scan::Stats) {
+pub(crate) fn snap_scan(env: &Env) -> (Connection, scan::Stats) {
     scan_with(env, scan::ScanOpts { remote: remote::Mode::Force, snapshots: None, ..Default::default() })
 }
 
-fn tmp_entries(env: &Env) -> usize {
+pub(crate) fn tmp_entries(env: &Env) -> usize {
     std::fs::read_dir(crate::snapshot::tmp_root(env)).map(|r| r.count()).unwrap_or(0)
 }
 
@@ -583,7 +583,7 @@ fn remote_snapshots_are_opt_in_cached_per_commit_and_survive_failures() {
     let raws: i64 = c.query_row("SELECT count(*) FROM raw_links WHERE origin='snap:github.com/acme/secret-tool' AND (kind LIKE '%_path' OR kind='symlink')", [], |r| r.get(0)).unwrap();
     assert_eq!(raws, 0);
     let rv = view::expand(&v(&c), "remote:github.com/acme/secret-tool", &view::Req::default()).unwrap();
-    assert!(rv.contains("## Remote snapshot (opt-in") && rv.contains("Only dev is indexed; other branches are not."), "{rv}");
+    assert!(rv.contains("## Cached snapshot (opt-in") && rv.contains("Only dev is indexed; other branches are not."), "{rv}");
     let at: i64 = c.query_row("SELECT indexed_at FROM remote_snapshots", [], |r| r.get(0)).unwrap();
     drop(c);
 

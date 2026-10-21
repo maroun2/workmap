@@ -295,6 +295,15 @@ pub fn hash_excluded(rel: &str) -> bool {
         || dir_skip.iter().any(|d| rel.starts_with(d) || rel.contains(&format!("/{d}")))
 }
 
+/// URL-like link candidates are stored without credentials (`user:token@`, query).
+pub fn safe_raw(kind: &str, raw: &str) -> String {
+    if kind.ends_with("_git") || kind == "submodule" || kind == "doc_url" {
+        crate::git::strip_credentials(raw)
+    } else {
+        raw.to_string()
+    }
+}
+
 /// Record raw relation candidates of one (main) checkout. Bounded: manifests,
 /// links and hashed files are capped; only `stat` is used for sizes.
 pub fn extract_checkout(tx: &Connection, top: &Path, repo_id: &str, co_id: &str, staged: &[(String, String, String)]) -> rusqlite::Result<()> {
@@ -304,6 +313,7 @@ pub fn extract_checkout(tx: &Connection, top: &Path, repo_id: &str, co_id: &str,
             return Ok(());
         }
         n_links += 1;
+        let raw = &safe_raw(kind, raw);
         db::add_raw_link(tx, &RawLink { origin: co_id, repo_id, checkout_id: co_id, kind, raw, resolved, source_path: &src.to_string_lossy(), line: line as i64, note })
     };
     let mut manifests = 0usize;
@@ -387,17 +397,28 @@ pub fn extract_doc_links(tx: &Connection, home: &Path, doc: &Path, text: &str, t
         } else {
             String::new()
         };
-        db::add_raw_link(tx, &RawLink { origin: co_id, repo_id, checkout_id: co_id, kind, raw: &raw, resolved: &resolved, source_path: &doc.to_string_lossy(), line: line as i64, note: "doc" })?;
+        db::add_raw_link(
+            tx,
+            &RawLink { origin: co_id, repo_id, checkout_id: co_id, kind, raw: &safe_raw(kind, &raw), resolved: &resolved, source_path: &doc.to_string_lossy(), line: line as i64, note: "doc" },
+        )?;
     }
     Ok(())
 }
 
-/// Normalized remote identities of a repository node (from `git remote -v`).
+/// Normalized remote identities of a repository node: the raw configured URLs
+/// first, plus any `insteadOf`-rewritten fetch URL that names another host
+/// (secondary candidate for matching a catalog entry or another clone).
 pub fn repo_identities(repo: &Node) -> Vec<String> {
-    let mut v: Vec<String> =
-        repo.meta.get("remotes").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|r| r.get("url").and_then(|u| u.as_str())).filter_map(remote_identity).collect()).unwrap_or_default();
-    v.sort();
-    v.dedup();
+    let mut v: Vec<String> = Vec::new();
+    for key in ["url", "fetch_url"] {
+        for r in repo.meta.get("remotes").and_then(|r| r.as_array()).into_iter().flatten() {
+            if let Some(id) = r.get(key).and_then(|u| u.as_str()).and_then(remote_identity) {
+                if !v.contains(&id) {
+                    v.push(id);
+                }
+            }
+        }
+    }
     v
 }
 
@@ -538,7 +559,7 @@ pub fn resolve(tx: &Connection, matcher: &mut Matcher) -> rusqlite::Result<usize
     {
         let mut st = tx.prepare(
             "WITH shared AS (SELECT blob FROM file_hashes GROUP BY blob HAVING count(DISTINCT repo_id) BETWEEN 2 AND ?1)
-             SELECT a.repo_id, b.repo_id, count(DISTINCT a.blob), min(coalesce(ca.path, 'remote:' || ca.label) || '/' || a.rel), min(b.rel), max(a.size)
+             SELECT a.repo_id, b.repo_id, count(DISTINCT a.blob), min(CASE WHEN ca.kind='remote' THEN 'remote:' || ca.label || ':' || a.rel ELSE ca.path || '/' || a.rel END), min(b.rel), max(a.size)
              FROM file_hashes a JOIN file_hashes b ON a.blob=b.blob AND a.repo_id < b.repo_id
              JOIN nodes ca ON ca.id=a.checkout_id
              WHERE a.blob IN (SELECT blob FROM shared) GROUP BY a.repo_id, b.repo_id ORDER BY a.repo_id, b.repo_id",
@@ -673,21 +694,30 @@ pub fn node_name(c: &Connection, id: &str) -> String {
     }
 }
 
-/// One evidence line: what, where (path:line) and, for manifest/doc/symlink
-/// evidence, the exact source line read now (bounded).
+/// Line `line` of a local source file as read now: URL credentials stripped
+/// first (so the URL stays readable), then token-like words redacted, bounded.
+fn source_line(path: &str, line: usize, max: usize) -> Option<String> {
+    let bytes = crate::util::read_head(Path::new(path), 256 << 10).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let l = text.lines().nth(line.checked_sub(1)?)?;
+    Some(crate::util::redact(&clip(&crate::git::scrub_urls(l.trim()), max)))
+}
+
+/// One evidence line: what, where (an expandable reference plus line, or a
+/// source path marked source-only) and, for manifest/doc/symlink evidence, the
+/// exact source line read now (bounded, credentials scrubbed).
 pub fn evidence_line(c: &Connection, r: &Rel) -> String {
     let arrow = if r.forward { "→" } else { "←" };
     let mut s = format!("{arrow} {} [{}]", label(&r.kind), r.class);
     if !r.source_path.is_empty() {
-        s.push_str(&format!(" at {}{}", r.source_path, if r.line > 0 { format!(":{}", r.line) } else { String::new() }));
+        s.push_str(&format!(" at {}", crate::view::more::evidence_locator(c, &r.source_path, r.line)));
     }
     let quote = matches!(r.class.as_str(), "declared" | "documented" | "candidate") && r.line > 0;
-    match quote.then(|| crate::view::line_text(&r.source_path, r.line as usize, 140)).flatten() {
+    match quote.then(|| source_line(&r.source_path, r.line as usize, 140)).flatten() {
         Some(t) => s.push_str(&format!(": \"{t}\"")),
-        None if !r.note.is_empty() => s.push_str(&format!(" — {}", clip(&r.note, 160))),
+        None if !r.note.is_empty() => s.push_str(&format!(" — {}", crate::git::scrub_urls(&clip(&r.note, 160)))),
         None => {}
     }
-    let _ = c;
     s
 }
 

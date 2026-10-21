@@ -118,7 +118,12 @@ Try it without touching your own data: `examples/demo.sh target/release/workmap`
 
 ```sh
 nix-build -I nixpkgs=flake:nixpkgs      # result/bin/workmap; runs the test suite in the sandbox
+nix-build -I nixpkgs=flake:nixpkgs --argstr rev "$(git rev-parse --short=12 HEAD)"   # same, with the revision in --version
 ```
+
+`workmap --version` prints `<version> (rev <git revision>[-dirty]; <profile>; <target>)`. Cargo builds
+from a checkout read the revision from Git; the Nix source has no `.git`, so it comes from the
+`rev` argument (`WORKMAP_BUILD_REV`), else `unknown`.
 
 In a NixOS or home-manager configuration, `import /path/to/workmap { inherit pkgs; }`
 gives you the package (`default.nix` is a plain `rustPlatform.buildRustPackage`),

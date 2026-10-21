@@ -1,6 +1,7 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments, clippy::format_collect)]
 
 mod ask;
+mod buildinfo;
 mod config;
 mod db;
 mod discover;
@@ -38,8 +39,8 @@ USAGE:
                  [--speaker user|assistant] [--since YYYY-MM-DD] [--limit N] [--any]
                                                        full-text search: project, doc, commit, message, remote
   workmap expand REF [--limit N]                       one item and everything related to it (alias: explore)
-  workmap related [<project>] [--depth N] [--limit N]  related projects with evidence
-  workmap why <project> <other> [--depth N]            shortest evidence chain between two projects
+  workmap related [<project>] [--depth N] [--limit N]  related projects with evidence (<project> may be remote:<id>)
+  workmap why <project> <other> [--depth N]            shortest evidence chain between two projects (either may be remote:<id>)
   workmap ask REF <question> [--dry-run]               read-only continuation of a stored conversation
   workmap scan [--root DIR]... [--no-home] [--full] [--no-sessions] [--no-remote] [--refresh-remote] [--[no-]snapshots]
                [--no-refresh] [--max-dirs N] [--commits N] [--quiet] [--verbose]
@@ -300,8 +301,7 @@ fn run() -> Result<(), String> {
         "related" => {
             let req = a.req();
             let v = view::View { c: &c, cmd: cli_cmd(), state: state_vars() };
-            let p = view::project_arg(&v, a.pos.get(1).map(String::as_str), &req)?;
-            print!("{}", view::more::related_view(&v, &p, a.num("--depth", 2).min(6), a.num("--limit", 15))?);
+            print!("{}", view::more::related_cmd(&v, a.pos.get(1).map(String::as_str), &req, a.num("--depth", 2).min(6), a.num("--limit", 15))?);
         }
         "why" => {
             let req = a.req();
@@ -311,8 +311,7 @@ fn run() -> Result<(), String> {
                 (Some(y), None) if req.project.is_some() => (None, y.clone()),
                 _ => return Err("usage: workmap why <project> <other> [--depth N]   (or: why <other> with --project/WORKMAP_PROJECT)".into()),
             };
-            let p = view::project_arg(&v, from, &req)?;
-            print!("{}", view::more::why_view(&v, &p, &to, a.num("--depth", 4).min(8))?);
+            print!("{}", view::more::why_cmd(&v, from, &to, &req, a.num("--depth", 4).min(8))?);
         }
         "remote" => match a.pos.get(1).map(String::as_str).unwrap_or("status") {
             "status" => {
@@ -470,7 +469,7 @@ fn run() -> Result<(), String> {
 
 /// `<semver> (<revision>[, <build>])`; see build.rs for where the revision comes from.
 fn version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    buildinfo::render(env!("CARGO_PKG_VERSION"), env!("WORKMAP_BUILD_REV"), env!("WORKMAP_BUILD_PROFILE"), env!("WORKMAP_BUILD_TARGET"))
 }
 
 /// How printed follow-up commands invoke this binary.
