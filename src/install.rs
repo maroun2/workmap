@@ -171,7 +171,7 @@ fn owned_link(env: &Env, entry: &Path) -> bool {
     }
     let mut known: Vec<PathBuf> = skill_dirs(env).into_iter().map(|(_, d, _)| d.join("workmap")).collect();
     known.push(stable_skill_dir(env));
-    known.iter().any(|k| *k == target)
+    known.contains(&target)
 }
 
 fn links_to(entry: &Path, target: &Path) -> bool {
@@ -455,7 +455,7 @@ pub fn resolve_tools(env: &Env, path: Option<&std::ffi::OsStr>) -> Tools {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut add = |p: Option<PathBuf>| {
         if let Some(d) = p.as_deref().filter(|p| p.is_absolute()).and_then(Path::parent) {
-            if !d.starts_with(&tmp) && !dirs.iter().any(|x| x == d) {
+            if !d.starts_with(&tmp) && !dirs.contains(&d.to_path_buf()) {
                 dirs.push(d.to_path_buf());
             }
         }
