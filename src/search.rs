@@ -465,7 +465,14 @@ pub fn run(c: &Connection, q: &Query, repo: Option<&str>, checkout: Option<&str>
 /// [`run`] where, among identical passages (the same doc in several
 /// worktrees), the one in `prefer` wins, then the one in a main checkout.
 pub fn run_pref(c: &Connection, q: &Query, repo: Option<&str>, checkout: Option<&str>, prefer: Option<&str>) -> rusqlite::Result<(Vec<Hit>, i64)> {
+    run_pref_in(c, q, repo, checkout, prefer, false)
+}
+
+/// [`run_pref`]; with `text_only`, a passage's title (a message's conversation
+/// label, a doc's path) is not searched, only its text.
+pub fn run_pref_in(c: &Connection, q: &Query, repo: Option<&str>, checkout: Option<&str>, prefer: Option<&str>, text_only: bool) -> rusqlite::Result<(Vec<Hit>, i64)> {
     let Some(m) = fts_query(&q.text, q.any) else { return Ok((vec![], 0)) };
+    let m = if text_only { format!("text : ({m})") } else { m };
     let t = Tier { label: if q.any { "any" } else { "exact" }, table: "passages_fts", expr: m, needles: vec![] };
     let s = Scope { repo, checkout, prefer };
     let total = count(c, q, &s, std::slice::from_ref(&t))?;

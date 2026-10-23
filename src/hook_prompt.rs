@@ -699,8 +699,10 @@ pub fn context(env: &Env, c: &Connection, p: &Project, session_id: &str, prompt:
     if query.is_empty() {
         tr.push("no known anchor or phrase in the prompt: nothing searched".into());
     } else {
+        // Text only: conversation labels repeat across templated sessions and
+        // would fill the candidate slots with passages that never match.
         let q = search::Query { text: query.clone(), kinds: vec!["doc".into(), "message".into(), "commit".into()], any: true, limit: CANDIDATES, ..Default::default() };
-        let (hits, total) = search::run_pref(c, &q, Some(&p.repo.id), None, Some(&p.focus.id)).map_err(|e| e.to_string())?;
+        let (hits, total) = search::run_pref_in(c, &q, Some(&p.repo.id), None, Some(&p.focus.id), true).map_err(|e| e.to_string())?;
         tally.candidates = hits.len();
         tr.push(format!("query {query:?}: {total} passage(s), {} candidate(s)", hits.len()));
         let mut sessions: Option<Vec<Node>> = None;
