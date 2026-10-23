@@ -203,7 +203,7 @@ fn install_adds_hooks_by_default_idempotently_and_keeps_backups_out_of_settings_
     let r1 = install::install(&env, &c, &exe(&l), &o).unwrap();
     assert!(r1.iter().any(|x| x.starts_with("codex hooks: installed 4 workmap hook(s)")), "{r1:?}");
     assert!(r1.iter().any(|x| x.starts_with("claude hooks: installed 4 workmap hook(s)")), "{r1:?}");
-    assert!(r1.iter().any(|x| x.starts_with("verify: codex trust records")), "{r1:?}");
+    assert!(r1.iter().any(|x| x.starts_with("verify: codex trust records") && x.contains("0 total")), "{r1:?}");
     let before = std::fs::read(l.codex.join("hooks.json")).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&before).unwrap();
     assert_eq!(v["other"], 1);
@@ -261,6 +261,6 @@ fn codex_trust_records_are_read_not_written() {
     write(&cfg, &text);
     assert_eq!(hook::codex_trust_records(&env), vec![format!("{}:stop:0:0", hooks.display())]);
     let lines = hook::trust_lines(&env).join("\n");
-    assert!(lines.contains("trust records for") && lines.contains(": 1 "), "{lines}");
+    assert!(lines.contains("trust records in") && lines.contains(": 1 total, 1 naming"), "{lines}");
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
 }

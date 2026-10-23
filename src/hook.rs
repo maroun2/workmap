@@ -698,12 +698,14 @@ pub fn trust_lines(env: &Env) -> Vec<String> {
         out.push(format!("verify: {h} user hooks {}: {owned} workmap entr{}", path.display(), if owned == 1 { "y" } else { "ies" }));
     }
     let hooks_json = env.codex_home().join("hooks.json");
-    let recs: Vec<String> = codex_trust_records(env).into_iter().filter(|k| k.contains(&*hooks_json.to_string_lossy())).collect();
+    let all = codex_trust_records(env);
+    let here = all.iter().filter(|k| k.contains(&*hooks_json.to_string_lossy())).count();
     out.push(format!(
-        "verify: codex trust records for {}: {} — Codex runs these hooks only after `/hooks` review accepts the exact current definitions{}",
+        "verify: codex trust records in {}: {} total, {here} naming {} — Codex runs these hooks only after `/hooks` review accepts the exact current definitions{}",
+        env.codex_home().join("config.toml").display(),
+        all.len(),
         hooks_json.display(),
-        recs.len(),
-        if recs.is_empty() { "; none recorded yet: open `codex`, run /hooks, review and trust the workmap entries" } else { "" }
+        if all.is_empty() { "; none recorded yet: open `codex`, run /hooks, review and trust the workmap entries" } else { "" }
     ));
     out
 }

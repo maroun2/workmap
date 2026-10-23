@@ -307,7 +307,7 @@ fn run() -> Result<(), String> {
             // Keep installed skill overviews current; only existing workmap-owned files.
             if !a.has("--no-refresh") {
                 for l in install::refresh_skills(&env, &c).map_err(|e| format!("skill refresh: {e}"))? {
-                    if !a.has("--quiet") || !l.starts_with("unchanged") {
+                    if !a.has("--quiet") || !(l.starts_with("unchanged") || l.starts_with("linked")) {
                         println!("{l}");
                     }
                 }
