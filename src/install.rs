@@ -452,11 +452,14 @@ pub fn resolve_tools(env: &Env, path: Option<&std::ffi::OsStr>) -> Tools {
     let explicit = std::env::var_os("WORKMAP_GIT_BIN").filter(|v| !v.is_empty()).map(PathBuf::from);
     let git = explicit.or_else(|| crate::util::find_on_path("git", path));
     let tmp = std::env::temp_dir();
+    // Tool dirs first, then the standard ones in a fixed order (always present).
+    let standard: Vec<PathBuf> = ["/usr/local/bin", "/usr/bin", "/bin"].iter().map(PathBuf::from).collect();
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut add = |p: Option<PathBuf>| {
         if let Some(d) = p.as_deref().filter(|p| p.is_absolute()).and_then(Path::parent) {
-            if !d.starts_with(&tmp) && !dirs.contains(&d.to_path_buf()) {
-                dirs.push(d.to_path_buf());
+            let d = d.to_path_buf();
+            if !d.starts_with(&tmp) && !dirs.contains(&d) && !standard.contains(&d) {
+                dirs.push(d);
             }
         }
     };
@@ -464,9 +467,7 @@ pub fn resolve_tools(env: &Env, path: Option<&std::ffi::OsStr>) -> Tools {
     for (bin, name) in [(&env.gh_bin, "gh"), (&env.glab_bin, "glab")] {
         add(if bin.is_absolute() { Some(bin.clone()) } else { crate::util::find_on_path(name, path) });
     }
-    for d in ["/usr/local/bin", "/usr/bin", "/bin"] {
-        add(Some(Path::new(d).join("x")));
-    }
+    dirs.extend(standard.iter().cloned());
     let path = dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(":");
     Tools { git, path }
 }

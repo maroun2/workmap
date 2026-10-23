@@ -240,7 +240,8 @@ fn service_unit_carries_git_and_path_and_scan_requires_git() {
     let git = tools.git.clone().expect("git on PATH for tests");
     let (svc, _) = install::units(&env, Path::new("/opt/work map/workmap"), &tools);
     assert!(svc.contains(&format!("Environment=\"WORKMAP_GIT_BIN={}\"", git.display())), "{svc}");
-    assert!(svc.contains(&format!("Environment=\"PATH={}", git.parent().unwrap().display())), "{svc}");
+    assert!(svc.contains("Environment=\"PATH=") && tools.path.split(':').any(|d| Path::new(d) == git.parent().unwrap()), "{svc}");
+    assert!(tools.path.ends_with("/usr/local/bin:/usr/bin:/bin"), "{}", tools.path);
     assert!(svc.contains("ExecStart=\"/opt/work map/workmap\" scan --quiet"), "{svc}");
     // A PATH that lists only a temp dir contributes nothing temporary.
     let tmp_git = l.home.join("t/git");
