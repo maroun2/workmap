@@ -417,7 +417,7 @@ pub fn analyse(c: &Connection, repo: &str, prompt: &str) -> Analysis {
             }
             Class::Anchor
         };
-        let ident = idents.iter().any(|i| *i == typed);
+        let ident = idents.contains(&typed);
         terms.push(Term { typed, form, class, df, ident, common, note });
     }
     // Adjacent terms in the prompt (no word or sentence punctuation between
@@ -814,7 +814,7 @@ pub fn context(env: &Env, c: &Connection, p: &Project, session_id: &str, prompt:
         }
     }
     // Strongest first; the full-text rank breaks ties (stable sort).
-    picked.sort_by(|x, y| y.strength.cmp(&x.strength));
+    picked.sort_by_key(|x| std::cmp::Reverse(x.strength));
     for o in picked {
         let mut head = format!("- {} — {}", o.r, o.rest);
         match (o.same, o.near) {
