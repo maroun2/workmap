@@ -306,42 +306,53 @@ fn help_probe_captures_stderr_for_opencode_style_clis() {
 }
 
 #[test]
-fn install_is_idempotent_and_refuses_symlinked_skill_dirs() {
+fn install_is_idempotent_and_links_symlinked_skill_dirs() {
     let fx = fixture();
     let env = Env::with_home(&fx.home);
     let (c, _) = scan_once(&env);
-    // Simulate a shared skills checkout linked into home for codex.
+    // A shared skills directory linked into home for codex.
     let shared = fx.home.join("shared-skills");
     std::fs::create_dir_all(&shared).unwrap();
     std::fs::create_dir_all(fx.home.join(".codex")).unwrap();
     std::os::unix::fs::symlink(&shared, fx.home.join(".codex/skills")).unwrap();
     let exe = fx.home.join("fake-bin");
     std::fs::write(&exe, b"#!/bin/sh\necho workmap\n").unwrap();
-    let opts = install::InstallOpts { activate: true };
+    let opts = install::InstallOpts { activate: true, hooks: false };
     let r1 = install::install(&env, &c, &exe, &opts).unwrap();
     let r2 = install::install(&env, &c, &exe, &opts).unwrap();
+    let stable = fx.home.join(".local/share/workmap/skills/workmap");
+    let bin = fx.home.join(".local/share/workmap/bin/workmap");
     assert!(r1.iter().any(|l| l.starts_with("updated claude skill")), "{r1:?}");
-    assert!(r1.iter().any(|l| l.starts_with("skipped codex skill") && l.contains("symlink")), "{r1:?}");
-    assert!(std::fs::read_dir(&shared).unwrap().next().is_none(), "nothing written through the symlink");
-    assert!(r2.iter().all(|l| !l.starts_with("updated") && !l.starts_with("wrote ")), "second run changes nothing: {r2:?}");
+    assert!(r1.iter().any(|l| l.starts_with("linked codex skill") && l.contains("symlink")), "{r1:?}");
+    assert!(!r1.iter().any(|l| l.starts_with(install::ERROR)), "{r1:?}");
+    // Only a link lands in the shared dir; generated text and binaries stay private.
+    let names: Vec<_> = std::fs::read_dir(&shared).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("workmap")]);
+    assert_eq!(std::fs::read_link(shared.join("workmap")).unwrap(), stable);
+    assert!(r2.iter().all(|l| !l.starts_with("updated") && !l.starts_with("wrote ") && !l.starts_with("linked") && !l.starts_with("migrated")), "second run changes nothing: {r2:?}");
     assert!(r1.iter().any(|l| l.contains("timer not activated")), "fake home never touches systemctl");
     let skill = std::fs::read_to_string(fx.home.join(".claude/skills/workmap/SKILL.md")).unwrap();
+    assert_eq!(std::fs::read_to_string(stable.join("SKILL.md")).unwrap(), skill, "one generated text everywhere");
     let desc_line = skill.lines().find(|l| l.starts_with("description: ")).unwrap();
     let desc: String = serde_json::from_str(desc_line.trim_start_matches("description: ")).unwrap();
     assert!(desc.starts_with(install::SEED) && desc.contains("proj") && desc.len() <= install::MAX_DESCRIPTION);
     assert!(skill.contains("## Indexed overview") && skill.contains("### proj — map · ") && skill.contains("export WORKMAP_PROJECT=<project>") && skill.contains("expand REF"));
     assert!(skill.len() < install::MAX_BODY + 8192);
-    assert!(fx.home.join(".claude/skills/workmap/bin/workmap").is_file());
+    assert!(!fx.home.join(".claude/skills/workmap/bin").exists(), "no per-provider binary copies");
+    assert!(skill.contains(&bin.display().to_string()), "skill runs the stable binary");
     assert!(fx.home.join(".config/opencode/skills/workmap/SKILL.md").is_file());
     assert!(skill.contains(install::MARKER) && skill.contains("## Registering project roots") && skill.contains("roots add <dir>"));
     let state = env.state_dir.display().to_string();
     assert!(skill.contains(&format!("env WORKMAP_STATE_DIR={state} WORKMAP_HOME={}", fx.home.display())), "generated commands keep state/home");
     assert!(r1.iter().any(|l| l.starts_with("next: register every project root")));
+    assert!(r1.iter().any(|l| l.starts_with("verify: codex reads") && l.ends_with("(workmap skill, ok)")), "{r1:?}");
     let svc = std::fs::read_to_string(fx.home.join(".config/systemd/user/workmap-scan.service")).unwrap();
     assert!(svc.contains(&format!("Environment=\"WORKMAP_STATE_DIR={state}\"")) && svc.contains(&format!("Environment=\"WORKMAP_HOME={}\"", fx.home.display())));
-    assert!(svc.contains(&format!("ExecStart={} scan --quiet", fx.home.join(".local/share/workmap/bin/workmap").display())));
+    assert!(svc.contains(&format!("ExecStart={} scan --quiet", bin.display())));
+    assert!(svc.contains("Environment=\"PATH=") && svc.contains(":/usr/bin:/bin\"") && svc.contains("Environment=\"WORKMAP_GIT_BIN=/"), "{svc}");
     let timer = std::fs::read_to_string(fx.home.join(".config/systemd/user/workmap-scan.timer")).unwrap();
     assert!(timer.contains("OnCalendar=daily") && timer.contains("Persistent=true"));
+    assert_eq!(std::fs::read_link(fx.home.join(".local/bin/workmap")).unwrap(), bin);
 }
 
 #[test]
@@ -354,12 +365,14 @@ fn scan_refreshes_only_installed_owned_skills() {
     std::os::unix::fs::symlink(&shared, fx.home.join(".codex/skills")).unwrap();
     let exe = fx.home.join("fake-bin");
     std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
-    install::install(&env, &c, &exe, &install::InstallOpts { activate: true }).unwrap();
+    install::install(&env, &c, &exe, &install::InstallOpts { activate: true, hooks: false }).unwrap();
     drop(c);
     let claude_dir = fx.home.join(".claude/skills/workmap");
     let claude_skill = claude_dir.join("SKILL.md");
-    // Binary copies are never refreshed by scans: a sentinel must survive.
-    std::fs::write(claude_dir.join("bin/workmap"), b"SENTINEL").unwrap();
+    let stable_skill = fx.home.join(".local/share/workmap/skills/workmap/SKILL.md");
+    // The binary is never rewritten by scans: a sentinel must survive.
+    let bin = fx.home.join(".local/share/workmap/bin/workmap");
+    std::fs::write(&bin, b"SENTINEL").unwrap();
     // A hand-written (unowned) skill must not be touched.
     let oc_skill = fx.home.join(".config/opencode/skills/workmap/SKILL.md");
     std::fs::write(&oc_skill, "---\nname: workmap\ndescription: mine\n---\nhand written\n").unwrap();
@@ -376,12 +389,15 @@ fn scan_refreshes_only_installed_owned_skills() {
     let (c, _) = scan_once(&env);
     let r = install::refresh_skills(&env, &c).unwrap();
     assert!(r.iter().any(|l| l.starts_with("refreshed claude")), "{r:?}");
+    assert!(r.iter().any(|l| l.starts_with("refreshed stable")), "{r:?}");
+    assert!(r.iter().any(|l| l.starts_with("linked codex")), "{r:?}");
     assert!(r.iter().any(|l| l.contains("opencode") && l.contains("not generated by workmap")), "{r:?}");
-    assert!(!r.iter().any(|l| l.contains("codex") && l.starts_with("refreshed")));
     let skill = std::fs::read_to_string(&claude_skill).unwrap();
     let desc = skill.lines().find(|l| l.starts_with("description: ")).unwrap();
     assert!(desc.contains("proj2"), "{desc}");
     assert!(skill.contains("Second project intro.") && skill.contains("start proj2"));
+    assert_eq!(std::fs::read_to_string(shared.join("workmap/SKILL.md")).unwrap(), skill, "codex reads the refreshed stable skill through its link");
+    assert_eq!(std::fs::read_to_string(&stable_skill).unwrap(), skill);
 
     // No-op scan: nothing rewritten.
     drop(c);
@@ -390,9 +406,9 @@ fn scan_refreshes_only_installed_owned_skills() {
     assert!(r2.iter().any(|l| l.starts_with("unchanged claude")), "{r2:?}");
     assert_eq!(std::fs::read_to_string(&claude_skill).unwrap(), skill);
     // Nothing else changed or appeared.
-    assert_eq!(std::fs::read(claude_dir.join("bin/workmap")).unwrap(), b"SENTINEL");
+    assert_eq!(std::fs::read(&bin).unwrap(), b"SENTINEL");
     assert!(std::fs::read_to_string(&oc_skill).unwrap().contains("hand written"));
-    assert!(std::fs::read_dir(&shared).unwrap().next().is_none());
+    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 1);
     assert_eq!(std::fs::read(&unit).unwrap(), unit_before);
     // Removing the install means refresh creates nothing.
     std::fs::remove_dir_all(&claude_dir).unwrap();
@@ -864,6 +880,8 @@ mod hook_tests;
 mod identity_tests;
 #[path = "tests_ingest.rs"]
 mod ingest_tests;
+#[path = "tests_install.rs"]
+mod install_tests;
 #[path = "tests_map.rs"]
 mod map_tests;
 #[path = "tests_prompt.rs"]

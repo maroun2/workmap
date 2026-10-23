@@ -199,7 +199,7 @@ impl Drop for TempClone {
 /// Hardened git: no prompts, no hooks, no lazy blob fetches, credentials only
 /// through helpers (the user's, plus `gh auth git-credential` for gh hosts).
 fn git(env: &Env, provider: &str, host: &str) -> Command {
-    let mut c = Command::new("git");
+    let mut c = crate::util::git_cmd();
     c.env("GIT_TERMINAL_PROMPT", "0").env("GIT_NO_LAZY_FETCH", "1").env("GIT_OPTIONAL_LOCKS", "0").env("GCM_INTERACTIVE", "never").env("GH_CONFIG_DIR", &env.gh_config).env("GH_PROMPT_DISABLED", "1");
     for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"] {
         c.env_remove(k);

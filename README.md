@@ -164,20 +164,55 @@ e.g. `home.packages = [ (import ./workmap { inherit pkgs; }) ];`.
 ### Install for agents (optional)
 
 ```sh
-workmap install          # copies the binary, writes skills and a daily systemd --user timer
+workmap install          # stable binary, skills, Claude/Codex hooks and a daily systemd --user timer
+workmap install --no-hooks   # same without host hooks (add them later with `workmap hooks install`)
 workmap uninstall        # removes them again; the index is kept until you delete it
 ```
 
-`install` copies the binary to `~/.local/share/workmap/bin/workmap` and writes a
-`workmap` skill (binary + `SKILL.md`) into `~/.claude/skills`,
-`~/.codex/skills` and `~/.config/opencode/skills`. The skill text is generated
-from your index: commands, registered roots, and a bounded project overview
-(≈24 KiB) that includes remote-only repositories by name. Every `workmap scan`
-refreshes skill files that workmap generated (marked with an HTML comment) and
-nothing else. It refuses to write through a symlinked skills directory or into
-a Git checkout, and never uses sudo. The timer runs `workmap scan --quiet`
-daily (`Persistent=true`). It is enabled only for your real home with a user
-session bus. `--no-activate` writes the units without enabling them.
+`install` copies the running binary to `~/.local/share/workmap/bin/workmap`
+(and links `~/.local/bin/workmap` to it when that name is free). Skills, hooks
+and the timer all run that one stable copy, never a build directory. Rerun the
+same command to upgrade; it changes only what differs and exits non-zero when it
+had to leave a conflicting file alone (`error:` lines).
+
+**Skills.** The `workmap` skill text is generated from your index: commands,
+registered roots, and a bounded project overview (≈24 KiB) that includes
+remote-only repositories by name. It is written once to
+`~/.local/share/workmap/skills/workmap/SKILL.md` and registered with
+`~/.claude/skills`, the Codex skills dir (`$CODEX_HOME/skills`, default
+`~/.codex/skills`) and `~/.config/opencode/skills`:
+
+- a plain catalog directory gets a real `workmap/SKILL.md`;
+- a catalog reached through a symlink or living in a Git checkout (a shared
+  skills repo, a `~/.codex` linked to another disk) gets only a symlink
+  `workmap -> ~/.local/share/workmap/skills/workmap`, so no generated project
+  context or binary lands in the shared repo. When that repo does not already
+  ignore the link, `install` adds one marked line to its local
+  `.git/info/exclude` (never to a tracked `.gitignore`); `uninstall` removes
+  only that line. Two providers sharing one catalog get one link.
+
+An existing `workmap` entry is replaced only when workmap generated it (marked
+with an HTML comment), including an earlier hand-made link to a generated copy,
+which is repointed atomically. Anything else is reported and left alone. Every
+`workmap scan` refreshes the generated files and nothing else. `install` ends
+with `verify:` lines showing the file each provider will read.
+
+**Hooks.** Where `~/.claude` or the Codex home exists, `install` merges the
+user-scope hooks described in [Host hooks](#host-hooks). Rerunning with
+unchanged definitions leaves the files byte-identical, so Codex trust stays
+valid. Codex runs non-managed hooks only after you review and trust their
+exact definitions with `/hooks` inside Codex; `install` reports how many trust
+records Codex has stored and never writes them itself.
+
+**Timer.** The service runs `workmap scan --quiet` daily (`Persistent=true`).
+systemd user managers often start with a minimal `PATH` without git, so the
+unit pins `WORKMAP_GIT_BIN` and a `PATH` made of the directories where
+`install` found git, gh and glab, plus `/usr/local/bin:/usr/bin:/bin`. `scan`
+and `ingest` fail with a clear message when git cannot run instead of indexing
+empty checkouts. Drop-ins in `workmap-scan.service.d/` are kept. The timer is
+enabled only for your real home with a user session bus (found under
+`/run/user/<uid>` when the environment lacks it); `install` never starts a scan.
+`--no-activate` writes the units without enabling them. Nothing uses sudo.
 
 ## Commands
 
@@ -435,9 +470,9 @@ add <old path> <branch>` command that recreates the original. If `--cwd`
 differs from the recorded directory, it first prints the recorded and current
 cwd, branch and HEAD side by side.
 
-## Host hooks (opt-in)
+## Host hooks
 
-`workmap hooks install` adds four hooks to a host's settings. They run only
+`workmap install` (unless `--no-hooks`) and `workmap hooks install` add four hooks to a host's settings. They run only
 local, indexed SQLite queries: no scan, network or model. They always exit 0,
 print nothing when they have nothing relevant, and keep output within
 `WORKMAP_HOOK_BUDGET` bytes (default 1500). Output is fully qualified
@@ -487,8 +522,9 @@ references with source excerpts, and never a summary.
 
 Installed entries are marked with `WORKMAP_HOOK=1` in the command.
 `install` is idempotent. It keeps every other key and every foreign hook,
-copies the previous file to `<file>.workmap-backup`, replaces the file
-atomically, and refuses invalid JSON or a symlinked settings file.
+keeps a copy of the previous file under `<state>/backups/` (never next to the
+settings, which may be tracked in a project), replaces the file atomically, and
+refuses invalid JSON or a symlinked settings file.
 `hooks uninstall` and `workmap uninstall` remove only workmap's own entries.
 Rewritten files keep their content, but JSON key order and whitespace are
 normalized. `--scope project` writes `.claude/settings.local.json` (personal;
@@ -515,7 +551,9 @@ directory.
 - `WORKMAP_HOME` replaces `$HOME` for scanning, provider stores, gh/glab config
   and install targets (tests and the demo use a fake home).
   `WORKMAP_CLAUDE_DIR`, `WORKMAP_CODEX_DIR` and `WORKMAP_OPENCODE_DIR` point at
-  other stores. `WORKMAP_GH_BIN` and `WORKMAP_GLAB_BIN` select the CLIs.
+  other stores; Codex's own `CODEX_HOME` is honoured, and a symlinked
+  `~/.codex` is resolved to its real path. `WORKMAP_GH_BIN`,
+  `WORKMAP_GLAB_BIN` and `WORKMAP_GIT_BIN` select the CLIs.
 
 ## Scale and limits
 
@@ -581,6 +619,16 @@ Known limits:
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
 
+## Upgrading to 0.4.1
+
+Rerun `workmap install`. It now also installs the Claude Code and Codex user
+hooks (opt out with `--no-hooks`), drops the per-provider binary copies in
+favour of `~/.local/share/workmap/bin/workmap`, links shared or symlinked skill
+catalogs to `~/.local/share/workmap/skills/workmap`, and pins git in the timer
+unit. Old `<settings>.workmap-backup` files next to settings are no longer
+written; delete them when you no longer need them. Codex asks for a `/hooks`
+review only when the hook definitions changed.
+
 ## Upgrading to 0.4
 
 `workmap context` now prints the compact map; the previous output is
@@ -596,7 +644,7 @@ No re-parse is needed.
 reads and recorded checkout snapshots are new) and builds the stemmed search
 table from existing passages on first open. Projects with duplicate names are
 now printed as `<name>~<hex>` instead of their checkout path; the path still
-resolves. Hooks are never installed implicitly: run `workmap hooks install`.
+resolves. Hooks are not installed implicitly by 0.3: run `workmap hooks install` (0.4.1 `install` adds them).
 
 ## Upgrading from 0.1
 

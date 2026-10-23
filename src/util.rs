@@ -442,6 +442,32 @@ pub fn identity_candidates(url: &str) -> Vec<String> {
     (2..=end).rev().map(|n| format!("{h}/{}", segs[..n].join("/"))).collect()
 }
 
+/// Git executable: `WORKMAP_GIT_BIN` (written into the systemd unit by
+/// `install`, whose manager PATH may not contain git) or `git` from PATH.
+pub fn git_bin() -> PathBuf {
+    std::env::var_os("WORKMAP_GIT_BIN").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("git"))
+}
+
+pub fn git_cmd() -> Command {
+    Command::new(git_bin())
+}
+
+/// First executable `name` in `path` (a PATH-style list), not canonicalized:
+/// profile dirs such as `/run/current-system/sw/bin` survive package updates.
+pub fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path?).filter(|d| d.is_absolute()).map(|d| d.join(name)).find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false))
+}
+
+/// `Ok(version line)` when `bin --version` runs, else why not.
+pub fn check_git(bin: &Path) -> Result<String, String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    match run_cmd(Command::new(bin).arg("--version"), Duration::from_secs(10)) {
+        Some(v) if v.starts_with("git version") => Ok(v.trim().to_string()),
+        _ => Err(format!("git is required but `{} --version` did not run (PATH={path}); install git or set WORKMAP_GIT_BIN to its absolute path", bin.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

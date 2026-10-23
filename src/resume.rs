@@ -94,7 +94,7 @@ fn parent_of(s: &Node) -> Option<String> {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut c = Command::new("git");
+    let mut c = crate::util::git_cmd();
     c.arg("-C").arg(dir).args(args);
     crate::util::run_cmd(&mut c, Duration::from_secs(5)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }

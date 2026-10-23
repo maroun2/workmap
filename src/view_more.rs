@@ -221,7 +221,7 @@ fn checkout_freshness(p: &Project, co: &Node) -> String {
     let Some(path) = co.path.as_deref().filter(|x| Path::new(x).is_dir()) else {
         return format!("worktree {name}: directory missing since the last scan (indexed at HEAD {indexed})");
     };
-    let now = crate::util::run_cmd(std::process::Command::new("git").args(["-C", path, "rev-parse", "HEAD"]), std::time::Duration::from_secs(5)).map(|s| s.trim().to_string()).unwrap_or_default();
+    let now = crate::util::run_cmd(crate::util::git_cmd().args(["-C", path, "rev-parse", "HEAD"]), std::time::Duration::from_secs(5)).map(|s| s.trim().to_string()).unwrap_or_default();
     if now.is_empty() || indexed.is_empty() {
         format!("worktree {name}: indexed at HEAD {}", if indexed.is_empty() { "?" } else { &indexed })
     } else if now.starts_with(&indexed) {

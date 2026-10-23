@@ -24,6 +24,10 @@ pub struct Env {
     pub env_token_hosts: Vec<(&'static str, String)>,
     /// Extra `git -c key=value` for snapshot clones (tests: `url.<base>.insteadOf`).
     pub snapshot_git_config: Vec<(String, String)>,
+    /// Codex home: `WORKMAP_CODEX_DIR`, else `CODEX_HOME` (Codex's own override),
+    /// else `~/.codex`; canonical when it exists, as Codex records rollout paths
+    /// canonically (a symlinked `~/.codex` otherwise misses its thread index).
+    pub codex_dir: PathBuf,
 }
 
 pub const PROVIDER_VARS: &[&str] = &["WORKMAP_CLAUDE_DIR", "WORKMAP_CODEX_DIR", "WORKMAP_OPENCODE_DIR"];
@@ -35,7 +39,7 @@ impl Env {
             None => (std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")), false),
         };
         let state_dir = std::env::var_os("WORKMAP_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".local/state/workmap"));
-        let provider_dirs = PROVIDER_VARS.iter().filter_map(|k| std::env::var_os(k).map(|v| (*k, PathBuf::from(v)))).collect();
+        let provider_dirs: Vec<(&str, PathBuf)> = PROVIDER_VARS.iter().filter_map(|k| std::env::var_os(k).map(|v| (*k, PathBuf::from(v)))).collect();
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
         let config = match (overridden, var("XDG_CONFIG_HOME")) {
             (false, Some(x)) => PathBuf::from(x),
@@ -56,11 +60,19 @@ impl Env {
                 env_token_hosts.push(("glab", host("GITLAB_HOST", "gitlab.com")));
             }
         }
+        let codex_dir = provider_dirs
+            .iter()
+            .find(|(k, _)| *k == "WORKMAP_CODEX_DIR")
+            .map(|(_, v)| v.clone())
+            .or_else(|| var("CODEX_HOME").filter(|_| !overridden).map(PathBuf::from))
+            .unwrap_or_else(|| home.join(".codex"));
+        let codex_dir = std::fs::canonicalize(&codex_dir).unwrap_or(codex_dir);
         Env {
             home,
             overridden,
             state_dir,
             provider_dirs,
+            codex_dir,
             gh_bin: var("WORKMAP_GH_BIN").map(PathBuf::from).unwrap_or_else(|| "gh".into()),
             glab_bin: var("WORKMAP_GLAB_BIN").map(PathBuf::from).unwrap_or_else(|| "glab".into()),
             gh_config,
@@ -84,6 +96,7 @@ impl Env {
             glab_config: home.join(".config/glab-cli"),
             env_token_hosts: vec![],
             snapshot_git_config: vec![],
+            codex_dir: home.join(".codex"),
         }
     }
 
@@ -104,7 +117,7 @@ impl Env {
     }
 
     pub fn codex_home(&self) -> PathBuf {
-        self.provider("WORKMAP_CODEX_DIR").unwrap_or_else(|| self.home.join(".codex"))
+        self.codex_dir.clone()
     }
 
     pub fn opencode_dir(&self) -> PathBuf {
@@ -120,6 +133,11 @@ impl Env {
         }
         for (k, p) in &self.provider_dirs {
             v.push((k.to_string(), p.display().to_string()));
+        }
+        // Derived (CODEX_HOME or a symlinked ~/.codex): pin it so units and hooks,
+        // which run without the caller's environment, read the same store.
+        if self.provider("WORKMAP_CODEX_DIR").is_none() && self.codex_dir != self.home.join(".codex") {
+            v.push(("WORKMAP_CODEX_DIR".into(), self.codex_dir.display().to_string()));
         }
         for (k, p) in [("WORKMAP_GH_BIN", &self.gh_bin), ("WORKMAP_GLAB_BIN", &self.glab_bin)] {
             if std::env::var_os(k).is_some() {

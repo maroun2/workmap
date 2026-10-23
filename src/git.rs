@@ -9,7 +9,7 @@ const T: Duration = Duration::from_secs(20);
 const LOG_T: Duration = Duration::from_secs(90);
 
 fn git(dir: &Path) -> Command {
-    let mut c = Command::new("git");
+    let mut c = crate::util::git_cmd();
     // No optional locks: never rewrite the index while we only look. Paths print
     // verbatim (`core.quotePath=false`), so non-ASCII names match the files on disk.
     c.env("GIT_OPTIONAL_LOCKS", "0").env("GIT_TERMINAL_PROMPT", "0").args(["-c", "core.quotePath=false"]).arg("-C").arg(dir);

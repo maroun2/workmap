@@ -73,7 +73,10 @@ USAGE:
                                                        ingest on stop; `hooks status` shows the support matrix
   workmap resume REF [--cwd DIR] [--dry-run]           interactive native resume of the ORIGINAL session in its
                                                        own CLI and recorded cwd (writes to it; `ask` is read-only)
-  workmap install [--no-activate] | workmap uninstall
+  workmap install [--no-activate] [--no-hooks]          stable binary, skill for every provider (links into shared or
+                                                       symlinked catalogs), Claude/Codex user hooks, daily timer;
+                                                       safe to rerun; exits non-zero on conflicts it left alone
+  workmap uninstall
   workmap status | workmap --version
 
 REF is <project>:<rest>, or :<rest> with a scope (--project P or WORKMAP_PROJECT=P;
@@ -90,7 +93,8 @@ paths come from an opt-in snapshot at a recorded commit), <project>,
 an absolute path, an internal id, <project> --conversation <title> [--provider P] [--date D] [--session ID].
 
 Scans $HOME plus persisted roots. State: ~/.local/state/workmap (WORKMAP_STATE_DIR; WORKMAP_HOME replaces
-$HOME for scanning, provider stores and install targets). Remote discovery uses gh/glab only when they are
+$HOME for scanning, provider stores and install targets; Codex home: WORKMAP_CODEX_DIR, CODEX_HOME or ~/.codex;
+git: WORKMAP_GIT_BIN or PATH). Remote discovery uses gh/glab only when they are
 already authenticated; opt out with `workmap remote disable`, WORKMAP_REMOTE=0 or scan --no-remote.
 Nothing is sent anywhere else. Help never installs anything. `ask` runs the provider's own resume read-only or refuses.";
 
@@ -208,7 +212,7 @@ fn run() -> Result<(), String> {
             let wants = std::env::var_os("WORKMAP_AUTO_INSTALL").is_some() || env.state_dir.join("auto-install").exists();
             if a.pos.is_empty() && wants && !a.has("--no-install") && !env.state_dir.join("installed").exists() {
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                for l in install::install(&env, &c, &exe, &install::InstallOpts { activate: true }).map_err(|e| e.to_string())? {
+                for l in install::install(&env, &c, &exe, &install::InstallOpts { activate: true, hooks: false }).map_err(|e| e.to_string())? {
                     eprintln!("install: {l}");
                 }
             }
@@ -250,6 +254,8 @@ fn run() -> Result<(), String> {
             print!("{out}");
         }
         "scan" => {
+            // Without git every checkout would index as empty and the scan would still "succeed".
+            util::check_git(&util::git_bin())?;
             let opts = scan::ScanOpts {
                 roots: a.all("--root").iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r))).collect(),
                 include_home: !a.has("--no-home"),
@@ -434,8 +440,13 @@ fn run() -> Result<(), String> {
         }
         "install" => {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            for l in install::install(&env, &c, &exe, &install::InstallOpts { activate: !a.has("--no-activate") }).map_err(|e| e.to_string())? {
+            let lines = install::install(&env, &c, &exe, &install::InstallOpts { activate: !a.has("--no-activate"), hooks: !a.has("--no-hooks") }).map_err(|e| e.to_string())?;
+            for l in &lines {
                 println!("{l}");
+            }
+            let bad = lines.iter().filter(|l| l.starts_with(install::ERROR)).count();
+            if bad > 0 {
+                return Err(format!("install finished with {bad} problem(s) listed above (`error:` lines); everything else is in place"));
             }
         }
         "status" => {
@@ -460,6 +471,7 @@ fn run() -> Result<(), String> {
             println!("last scan stats: {last}");
         }
         "ingest" => {
+            util::check_git(&util::git_bin())?;
             let o = scan::IngestOpts { transcripts: a.all("--transcript").iter().map(PathBuf::from).collect(), checkouts: a.all("--checkout").iter().map(PathBuf::from).collect() };
             if o.transcripts.is_empty() && o.checkouts.is_empty() {
                 return Err("usage: workmap ingest --transcript FILE... [--checkout DIR]... [--quiet]".into());

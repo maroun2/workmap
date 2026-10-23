@@ -563,13 +563,23 @@ fn symlinked(path: &Path) -> Option<String> {
     None
 }
 
+/// Where the previous version of `path` is kept: under the state dir, never
+/// next to the file (a project's `.codex/`/`.claude/` is often tracked).
+pub fn backup_path(env: &Env, path: &Path) -> PathBuf {
+    let flat: String = path.to_string_lossy().trim_start_matches('/').replace('/', "%");
+    env.state_dir.join("backups").join(format!("{flat}.workmap-backup"))
+}
+
 /// Atomic replace (temp + rename in the same directory) with a one-file backup.
-fn write_settings(path: &Path, v: &Value) -> Result<Option<PathBuf>, String> {
+fn write_settings(env: &Env, path: &Path, v: &Value) -> Result<Option<PathBuf>, String> {
     let dir = path.parent().ok_or("settings path has no directory")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let backup = if path.exists() {
-        let b = dir.join(format!("{name}.workmap-backup"));
+        let b = backup_path(env, path);
+        if let Some(d) = b.parent() {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
         std::fs::copy(path, &b).map_err(|e| format!("backup {}: {e}", b.display()))?;
         Some(b)
     } else {
@@ -605,14 +615,15 @@ pub fn install(env: &Env, o: &HooksOpts) -> Result<Vec<String>, String> {
     let next = with_owned(&base, &want)?;
     let mut report = Vec::new();
     if cur.as_ref() == Some(&next) {
-        report.push(format!("unchanged {} ({} workmap hook(s) already installed)", path.display(), want.len()));
+        let kept = if o.harness == "codex" { "; definitions unchanged, so an existing Codex trust still applies" } else { "" };
+        report.push(format!("unchanged {} ({} workmap hook(s) already installed{kept})", path.display(), want.len()));
     } else if o.dry_run {
         report.push(format!("would update {} (dry run; nothing written):", path.display()));
         for (e, c) in &want {
             report.push(format!("  {}: {c}", e.name()));
         }
     } else {
-        let b = write_settings(&path, &next)?;
+        let b = write_settings(env, &path, &next)?;
         report.push(format!("installed {} workmap hook(s) in {}{}", want.len(), path.display(), b.map(|b| format!(" (previous file saved as {})", b.display())).unwrap_or_default()));
         for (e, c) in &want {
             report.push(format!("  {}: {c}", e.name()));
@@ -620,7 +631,7 @@ pub fn install(env: &Env, o: &HooksOpts) -> Result<Vec<String>, String> {
     }
     report.push(format!("foreign hooks left untouched: {}", foreign_count(&next)));
     if o.harness == "codex" {
-        report.push("codex: non-managed hooks run only after you review and trust them with /hooks inside Codex (trust is per hash; re-trust after reinstalling)".into());
+        report.push("codex: non-managed hooks run only after you review and trust them with /hooks inside Codex (trust is per definition hash; changed definitions need a new review)".into());
         if o.scope == Scope::Project {
             report.push("codex: project-local hooks load only when the project's .codex/ layer is trusted".into());
         }
@@ -643,7 +654,7 @@ pub fn uninstall(env: &Env, harness: &str, scope: Scope, cwd: &Path, dry_run: bo
     if dry_run {
         return Ok(vec![format!("would remove {n} workmap hook(s) from {} (dry run)", path.display())]);
     }
-    write_settings(&path, &next)?;
+    write_settings(env, &path, &next)?;
     Ok(vec![format!("removed {n} workmap hook(s) from {} ({} foreign hook(s) kept)", path.display(), foreign_count(&next))])
 }
 
@@ -656,6 +667,44 @@ pub fn uninstall_user(env: &Env) -> Vec<String> {
             Err(e) => out.push(format!("left {h} hooks alone: {e}")),
         }
     }
+    out
+}
+
+/// Codex hook trust records (`[hooks.state."<key>"] trusted_hash = …` in
+/// `config.toml`), read only. Matching them to current definitions is Codex's
+/// job (`/hooks`), so this reports what is recorded, not a verdict.
+pub fn codex_trust_records(env: &Env) -> Vec<String> {
+    let text = std::fs::read_to_string(env.codex_home().join("config.toml")).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut cur: Option<String> = None;
+    for l in text.lines().map(str::trim) {
+        if l.starts_with('[') {
+            cur = l.strip_prefix("[hooks.state.").and_then(|r| r.strip_suffix(']')).map(|k| k.trim_matches('"').to_string());
+        } else if l.starts_with("trusted_hash") {
+            if let Some(k) = &cur {
+                out.push(k.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Install-time hook verification lines for `workmap install`.
+pub fn trust_lines(env: &Env) -> Vec<String> {
+    let mut out = Vec::new();
+    for h in HARNESSES {
+        let Ok(path) = settings_path(env, h, Scope::User, Path::new("/")) else { continue };
+        let owned = read_settings(&path).ok().flatten().map(|v| owned_commands(&v).len()).unwrap_or(0);
+        out.push(format!("verify: {h} user hooks {}: {owned} workmap entr{}", path.display(), if owned == 1 { "y" } else { "ies" }));
+    }
+    let hooks_json = env.codex_home().join("hooks.json");
+    let recs: Vec<String> = codex_trust_records(env).into_iter().filter(|k| k.contains(&*hooks_json.to_string_lossy())).collect();
+    out.push(format!(
+        "verify: codex trust records for {}: {} — Codex runs these hooks only after `/hooks` review accepts the exact current definitions{}",
+        hooks_json.display(),
+        recs.len(),
+        if recs.is_empty() { "; none recorded yet: open `codex`, run /hooks, review and trust the workmap entries" } else { "" }
+    ));
     out
 }
 

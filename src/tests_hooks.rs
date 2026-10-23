@@ -276,7 +276,8 @@ fn hooks_install_merges_idempotently_preserves_foreign_hooks_and_uninstalls_only
         assert_eq!(v["hooks"][ev].as_array().unwrap().len(), 1, "{ev}");
     }
     // Backup holds the previous bytes.
-    assert_eq!(std::fs::read(home.join(".claude/settings.json.workmap-backup")).unwrap(), original);
+    assert_eq!(std::fs::read(hook::backup_path(&env, &settings)).unwrap(), original);
+    assert!(hook::backup_path(&env, &settings).starts_with(&env.state_dir) && !home.join(".claude/settings.json.workmap-backup").exists(), "backups stay out of settings dirs");
 
     // Idempotent: second install changes nothing, byte for byte.
     let before = std::fs::read(&settings).unwrap();
@@ -331,7 +332,7 @@ fn hooks_install_refuses_broken_json_symlinks_and_unsupported_harnesses() {
         let e = hook::install(&env, &o).unwrap_err();
         assert!(e.contains("not touching it"), "{broken}: {e}");
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), broken);
-        assert!(!home.join(".claude/settings.json.workmap-backup").exists());
+        assert!(!home.join(".claude/settings.json.workmap-backup").exists() && !hook::backup_path(&env, &settings).exists());
         let _ = hook::uninstall(&env, "claude", Scope::User, &cwd, false); // refuses or finds nothing it owns
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), broken);
     }
