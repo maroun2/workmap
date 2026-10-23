@@ -329,7 +329,7 @@ fn install_is_idempotent_and_refuses_symlinked_skill_dirs() {
     let desc_line = skill.lines().find(|l| l.starts_with("description: ")).unwrap();
     let desc: String = serde_json::from_str(desc_line.trim_start_matches("description: ")).unwrap();
     assert!(desc.starts_with(install::SEED) && desc.contains("proj") && desc.len() <= install::MAX_DESCRIPTION);
-    assert!(skill.contains("## Indexed overview") && skill.contains("## Key files") && skill.contains("Scope: export WORKMAP_PROJECT=proj") && skill.contains("expand REF"));
+    assert!(skill.contains("## Indexed overview") && skill.contains("### proj — map · ") && skill.contains("export WORKMAP_PROJECT=<project>") && skill.contains("expand REF"));
     assert!(skill.len() < install::MAX_BODY + 8192);
     assert!(fx.home.join(".claude/skills/workmap/bin/workmap").is_file());
     assert!(fx.home.join(".config/opencode/skills/workmap/SKILL.md").is_file());
@@ -601,6 +601,9 @@ fn assert_refs_roundtrip(c: &Connection, scope: &str, out: &str) -> usize {
             let want = crate::util::sh_quote(rest);
             let want = want.split('#').next().unwrap();
             assert!(got.starts_with(&format!("# {want}")), "{r} expanded to a different node:\n{}", got.lines().next().unwrap_or(""));
+        } else if let Some(pre) = plain.strip_prefix(":session:") {
+            // Session-id refs (the compact map's stable form) name the conversation by its native id.
+            assert!(got.lines().any(|l| l.starts_with(&format!("session {pre}"))), "{r} expanded to a different conversation:\n{got}");
         } else if !plain.contains("(other") {
             assert!(got.starts_with(&format!("# {plain} ")), "{r} expanded to a different node:\n{}", got.lines().next().unwrap_or(""));
         }
@@ -614,8 +617,13 @@ fn scoped_refs_for_file_section_commit_and_project() {
     let env = Env::with_home(&fx.home);
     let (c, _) = scan_once(&env);
     let p = scoped("proj");
-    let m = view::context(&v(&c), "", &p).unwrap();
+    let m = view::context(&v(&c), "", &view::Req { detailed: true, ..scoped("proj") }).unwrap();
     assert!(m.starts_with("# proj — project map"), "{m}");
+    let compact = view::context(&v(&c), "", &p).unwrap();
+    assert!(compact.starts_with("# proj — map · main @ ") && compact.contains("Purpose (:README.md l.3): \"Tracks things.\""), "{compact}");
+    assert_eq!(compact.matches("Scope: export WORKMAP_PROJECT=proj").count(), 1, "scope printed once");
+    assert_eq!(compact.matches("workmap ").count(), 3, "commands printed once, in the Next line:\n{compact}");
+    assert!(assert_refs_roundtrip(&c, "proj", &compact) >= 5);
     assert_eq!(m.matches("Scope: export WORKMAP_PROJECT=proj").count(), 1, "scope printed once");
     assert!(!m.contains("workmap expand proj") && !m.contains("file-") && !m.contains("session-"), "no repeated commands or ids:\n{m}");
     assert!(m.contains("- :README.md l.3 \"Tracks things.\""), "{m}");
@@ -702,7 +710,9 @@ fn worktree_scope_selects_exact_checkout_for_same_path() {
     assert!(own.contains("Investigate backend") && !own.contains("Feature work"), "{main}");
     assert!(others.contains("proj@feature:main.py") && others.contains("\"Feature work\""), "{main}");
     let mf = view::context(&v(&c), "", &feat).unwrap();
-    assert!(mf.contains("WORKMAP_WORKTREE=feature") && mf.contains("* feature @"), "{mf}");
+    assert!(mf.contains("WORKMAP_WORKTREE=feature") && mf.contains("— map · feature @ ") && mf.contains("feature*"), "{mf}");
+    let md = view::context(&v(&c), "", &view::Req { detailed: true, ..feat }).unwrap();
+    assert!(md.contains("WORKMAP_WORKTREE=feature") && md.contains("* feature @"), "{md}");
     let e = view::expand(&v(&c), "proj:main.py", &view::Req { worktree: Some("nope".into()), ..Default::default() }).unwrap_err();
     assert!(e.contains("--worktree main") && e.contains("--worktree feature"), "{e}");
 }
@@ -725,7 +735,7 @@ fn duplicate_project_names_refuse_and_path_handle_works() {
     let handle = by_path.split_whitespace().nth(1).unwrap().to_string();
     assert!(handle.starts_with("proj~") && handle.len() >= 9 && e.contains(&handle), "{handle}\n{e}");
     let m = view::context(&v(&c), "", &scoped(&handle)).unwrap();
-    assert!(m.starts_with(&format!("# {handle} — project map")) && m.contains(&format!("WORKMAP_PROJECT={handle}")), "{m}");
+    assert!(m.starts_with(&format!("# {handle} — map · ")) && m.contains(&format!("WORKMAP_PROJECT={handle}")), "{m}");
     assert_eq!(m, by_path, "handle and path name the same project");
     let (c2, _) = scan_once(&env);
     assert_eq!(view::context(&v(&c2), "", &scoped(&handle)).unwrap(), m, "handle is stable across scans");
@@ -854,5 +864,7 @@ mod hook_tests;
 mod identity_tests;
 #[path = "tests_ingest.rs"]
 mod ingest_tests;
+#[path = "tests_map.rs"]
+mod map_tests;
 #[path = "tests_search.rs"]
 mod search_tests;

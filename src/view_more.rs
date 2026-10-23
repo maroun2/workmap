@@ -891,7 +891,7 @@ pub fn related_section(v: &View, p: &Project, n: usize) -> R<String> {
     Ok(o)
 }
 
-fn class_rank(c: &str) -> u8 {
+pub(crate) fn class_rank(c: &str) -> u8 {
     match c {
         "declared" => 0,
         "structural" => 1,

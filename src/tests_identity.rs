@@ -69,7 +69,7 @@ fn assert_locators(c: &Connection, out: &str) -> usize {
 #[test]
 fn version_string_embeds_semver_revision_and_build() {
     let v = crate::version();
-    assert!(v.starts_with(&format!("{} (rev ", env!("CARGO_PKG_VERSION"))) && env!("CARGO_PKG_VERSION") == "0.3.0", "{v}");
+    assert!(v.starts_with(&format!("{} (rev ", env!("CARGO_PKG_VERSION"))) && env!("CARGO_PKG_VERSION") == "0.4.0", "{v}");
     let rev = v.split("(rev ").nth(1).unwrap().split([';', ')']).next().unwrap();
     // From git: 12 hex digits (+ `-dirty`). From WORKMAP_BUILD_REV (Nix
     // `--argstr rev`): any value the sanitizer accepts, e.g. a short sha or tag.
@@ -127,7 +127,7 @@ fn duplicate_clones_get_stable_handles_in_every_listing() {
     let ov = overview::overview(&c, 40, "workmap").unwrap();
     assert!(ov.contains(&format!("- {main} — ")) && ov.contains(&format!("- {clone} — ")) && !ov.contains("- ledger-api — "), "{ov}");
     for h in [&main, &clone] {
-        assert!(view::context(&v(&c), h, &view::Req::default()).unwrap().starts_with(&format!("# {h} — project map")));
+        assert!(view::context(&v(&c), h, &view::Req::default()).unwrap().starts_with(&format!("# {h} — map · ")));
     }
 
     // Both handles' file refs roundtrip to their own clone.

@@ -21,6 +21,9 @@ use std::path::Path;
 #[path = "view_more.rs"]
 pub mod more;
 
+#[path = "view_map.rs"]
+pub mod map;
+
 type R<T> = Result<T, String>;
 
 fn db<T>(r: rusqlite::Result<T>) -> R<T> {
@@ -1531,6 +1534,10 @@ pub struct Req {
     pub conv: ConvSel,
     pub limit: Option<usize>,
     pub map: MapLimits,
+    /// `context --detailed`: the sections view instead of the compact map.
+    pub detailed: bool,
+    /// Compact map options (`--budget`, `--weak`).
+    pub map_opts: map::MapOpts,
 }
 
 impl Req {
@@ -1614,7 +1621,8 @@ fn conv_from(t: &Target, req: &Req) -> Option<ConvSel> {
 pub fn context(v: &View, target: &str, req: &Req) -> R<String> {
     let (p, t) = locate(v, target, req)?;
     match t {
-        Target::Project => project_map(v, &p, &req.map),
+        Target::Project if req.detailed => project_map(v, &p, &req.map),
+        Target::Project => map::compact_map(v, &p, &req.map, &req.map_opts),
         _ => Err(format!("`context` takes a project; for {target} use: {} expand {}", v.cmd, q(target))),
     }
 }

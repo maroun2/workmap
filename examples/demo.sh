@@ -134,6 +134,8 @@ run() { echo "\$ workmap $(printf '%q ' "$@")"; "$BIN" "$@" | sed "s|$DEMO|\$DEM
 run scan --quiet
 run overview
 run context inkwell
+run expand inkwell:session:5f2c9a10
+run context inkwell --detailed
 run search timeout
 run search retry deadline --project inkwell --kind message
 run expand inkwell:message:5f2c9a10:l5

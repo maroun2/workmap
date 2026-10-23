@@ -448,7 +448,7 @@ fn moved_worktree_keeps_historical_evidence_and_reconnects_only_with_identity_ev
         }
     }
     // The moved checkout is a live worktree of its own, with its branch read from git.
-    let map = view::context(&v(&c), "", &scoped(&api)).unwrap();
+    let map = view::context(&v(&c), "", &view::Req { detailed: true, ..scoped(&api) }).unwrap();
     assert!(!map.contains("MISSING since") && map.contains(&format!("@ {}", moved.display())), "{map}");
     // A partial scan elsewhere keeps the reconnection.
     let mut cp = db::open(&env.db_path()).unwrap();

@@ -32,7 +32,13 @@ const HELP: &str = "workmap — local map of repos, worktrees, docs, commits and
 
 USAGE:
   workmap [overview] [--limit N] [--no-install]          every project (local and remote-only) by name
-  workmap context [<project>] [--docs N] [--files N] [--commits N] [--sessions N]
+  workmap context [<project>] [--docs N] [--files N] [--commits N] [--sessions N] [--budget BYTES] [--weak]
+                                                       compact map: quoted purpose (doc path + line), then typed,
+                                                       directed connections grouped by source (default budget 4000
+                                                       bytes, whole lines); weak/unconfirmed edges only with --weak
+  workmap context [<project>] --detailed [--docs N] [--files N] [--commits N] [--sessions N]
+                                                       previous sections view: docs, key files with why, commits,
+                                                       conversations with access codes, related projects
   workmap context [<project>] --task 'words' [--file PATH]... [--budget BYTES]
                                                        ranked context for a task/files; each item says why
   workmap search WORDS... [--project P [--worktree W --this-worktree]] [--kind K[,K]] [--provider P]
@@ -164,6 +170,8 @@ impl Args {
                 sessions: self.num("--sessions", d.sessions),
                 related: d.related,
             },
+            detailed: self.has("--detailed"),
+            map_opts: view::map::MapOpts { budget: self.num("--budget", view::map::DEFAULT_BUDGET).max(view::map::MIN_BUDGET), weak: self.has("--weak") },
         }
         .scoped(self.get("--project"), env("WORKMAP_PROJECT"), env("WORKMAP_WORKTREE"))
     }

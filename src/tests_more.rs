@@ -268,9 +268,24 @@ fn relations_keep_their_kind_and_evidence() {
     assert!(first.contains("Cargo git dependency") || first.contains("Cargo path dependency"), "declared relations sort first:\n{rv}");
     let ev = view::expand(&v(&c), ":related:web", &scoped("app")).unwrap();
     assert!(ev.starts_with("# :related:web — evidence between app and web") && ev.contains("## Uncertain candidates (not evidence of a relation)"), "{ev}");
-    let map = view::context(&v(&c), "", &scoped("app")).unwrap();
+    let map = view::context(&v(&c), "", &view::Req { detailed: true, ..scoped("app") }).unwrap();
     assert!(map.contains("## Related projects"), "{map}");
     assert_refs_roundtrip(&c, "app", &map);
+    let compact = view::context(&v(&c), "", &scoped("app")).unwrap();
+    assert!(
+        compact.contains("app (this project)\n")
+            && compact.contains("  ref, dependency → :related:lib~")
+            && (compact.contains("  same-content → :related:web") || compact.contains("  same-content ← :related:web")),
+        "{compact}"
+    );
+    assert!(!compact.contains("name-match") && compact.contains("weak edges hidden: "), "candidates stay hidden by default:\n{compact}");
+    assert_refs_roundtrip(&c, "app", &compact);
+    let mut wreq = scoped("app");
+    wreq.map_opts.weak = true;
+    let weak = view::context(&v(&c), "", &wreq).unwrap();
+    let (_, unconfirmed) = weak.split_once("Unconfirmed (--weak; NOT evidence of access or relation):").unwrap_or_else(|| panic!("{weak}"));
+    assert!(unconfirmed.contains("app (this project)\n") && (unconfirmed.contains("  name-match → :related:web") || unconfirmed.contains("  name-match ← :related:web")), "{weak}");
+    assert!(weak.contains("weak edges hidden: none (--weak)"), "{weak}");
 }
 
 #[test]
@@ -374,7 +389,7 @@ fn remote_catalog_dedups_clones_isolates_failures_and_never_logs_secrets() {
         rv.contains("## Projects related to it (1)") && rv.contains("app ← Cargo git dependency [declared]") && rv.contains("secret-tool.git"),
         "git dependency on a non-cloned repo points at the remote entry:\n{rv}"
     );
-    let map = view::context(&v(&c), "", &scoped("app")).unwrap();
+    let map = view::context(&v(&c), "", &view::Req { detailed: true, ..scoped("app") }).unwrap();
     assert!(map.contains(":related:remote:github.com/acme/secret-tool — → Cargo git dependency [declared]"), "remote-only repo appears only as an evidenced relation:\n{map}");
     assert_refs_roundtrip(&c, "app", &map);
     assert!(!dump(&c).contains("LEAKED"), "no token text stored anywhere");

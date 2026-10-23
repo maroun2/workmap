@@ -103,9 +103,11 @@ pub fn command_prefix(env: &Env, bin: &Path) -> String {
 
 pub fn skill_body(c: &Connection, env: &Env, bin: &Path) -> String {
     let b = command_prefix(env, bin);
+    // The full prefix (same index, same provider dirs) is printed once; commands below say `workmap`.
+    let w = "workmap";
     let mut o = format!(
         "{MARKER}\n\n# workmap\n\nLocal index of Git repos, worktrees, docs, commits and native agent conversations (Claude Code, Codex, OpenCode). Output lists evidence with source paths, lines and timestamps; it does not decide what is authoritative.\n\n\
-         ## Commands\n\nPick a project from the overview below, then set the scope once and use short references:\n\n```\n{b} overview                                   # all indexed projects by name\nexport WORKMAP_PROJECT=<project>             # or add --project <project> to each command; WORKMAP_WORKTREE=<branch> for a non-main worktree\n{b} context                                    # project map: docs, key files, commits, conversations, related projects\n{b} context --task 'what you are doing' --file <path> --budget 6000   # ranked context for a task; every item says why\n{b} search 'words'                             # full text over docs, commits, conversation messages (all projects, or scoped with --project)\n{b} related                                    # related projects with evidence (manifests, submodules, symlinks, doc links, shared files)\n{b} why <project> <other>                      # shortest evidence chain between two projects (either may be remote:<host/ns/name>)\n{b} expand :<path>                             # conversations that read/wrote a file, docs naming it, commits\n{b} expand ':<doc>#<heading-slug>'             # one doc section, quoted from the file\n{b} expand :commit:<sha-prefix>                # one commit\n{b} expand ':conversation:<title prefix>'      # one agent conversation and its file accesses (:session:<id-prefix> also works)\n{b} ask ':conversation:<title prefix>' 'question' --dry-run   # read-only resume plan; drop --dry-run to run\n{b} scan                                       # refresh (incremental; also refreshes this file)\n```\n\nOutput is evidence (paths, lines, timestamps), not interpretation. Conversation text is historical; a latest user input is not a decision. Check the `Index:` line for staleness and `Coverage:` for truncated or missing transcripts. Entries marked remote: are repositories you can access but have not cloned (metadata; doc text only when remote snapshots are enabled, at a recorded commit, never local disk).\n\n"
+         ## Commands\n\nRead-only commands below say `{w}`; the full command (same index and agent stores) is:\n\n```\n{b}\n```\n\nUse that full form for `scan` and `roots`, which read agent stores and write the index. Start map-first, then go deeper only where needed:\n\n```\n{w} overview                                   # all indexed projects by name\nexport WORKMAP_PROJECT=<project>             # or add --project <project>; WORKMAP_WORKTREE=<branch> for a non-main worktree\n{w} context                                    # compact map: quoted purpose, typed directed connections grouped by source\n{w} expand REF                                 # details and evidence for one ref printed by the map (file, doc, commit, conversation, :related:<project>)\n{w} search 'words'                             # no obvious starting node? full text over docs, commits, conversation messages\n{w} context --detailed                         # previous sections view: docs, key files with reasons, commits, conversations\n{w} context --weak                             # also list unconfirmed edges (mentions, requested/failed access, name matches)\n{w} context --task 'what you are doing' --file <path> --budget 6000   # ranked context for a task; every item says why\n{w} related                                    # related projects with evidence\n{w} why <project> <other>                      # shortest evidence chain between two projects\n{w} ask ':session:<id-prefix>' 'question' --dry-run   # read-only resume plan; drop --dry-run to run\n{b} scan   # refresh (incremental; also refreshes this file)\n```\n\nMap lines read `A type → B` (stored edge from A to B; `←` the reverse). Only confirmed edges are listed; weak ones are counted in the `Selected` line. Conversation titles come with a `:session:<native-id-prefix>` ref that stays valid when another conversation gets the same title. Conversation text is historical; a latest user input is not a decision. Check the `Index:` line for staleness. Entries marked remote: are repositories you can access but have not cloned.\n\n"
     );
     o.push_str(&format!(
         "## Registering project roots (do this once after install)\n\nThe default scan walks {} (symlinks followed two levels deep; caches, `.config`, `.local`, `tmp` skipped). Ask the user which directories hold their projects, and also look for project locations named in their agent configs, shell history or the repos listed below. Register every root directory outside that walk, then rescan:\n\n```\n{b} roots list\n{b} roots add <dir>          # repeat per project root\n{b} scan\n```\n\nRegistered roots:\n",
@@ -120,22 +122,27 @@ pub fn skill_body(c: &Connection, env: &Env, bin: &Path) -> String {
     }
     o.push_str("\n## Indexed overview\n\n");
     // Drop the scan clock from the header so an unchanged index renders byte-identical.
-    let ov = crate::overview::overview(c, 40, &b).unwrap_or_default();
+    let ov = crate::overview::overview(c, 40, w).unwrap_or_default();
     let ov: Vec<String> = ov.lines().enumerate().map(|(i, l)| if i == 0 { l.split("; last scan").next().unwrap_or(l).to_string() } else { l.to_string() }).collect();
     o.push_str(&ov.join("\n"));
     o.push('\n');
-    let v = crate::view::View { c, cmd: b.clone(), state: String::new() };
-    let lim = crate::view::MapLimits { docs: 3, files: 4, commits: 2, sessions: 2, related: 3 };
+    let v = crate::view::View { c, cmd: w.to_string(), state: String::new() };
+    let lim = crate::view::MapLimits { docs: 3, files: 4, commits: 2, sessions: 3, related: 3 };
+    let opts = crate::view::map::MapOpts { budget: 1800, weak: false };
     if let Ok(mut st) = c.prepare("SELECT id FROM nodes WHERE kind='repo' ORDER BY ts DESC LIMIT 8") {
         let ids: Vec<String> = st.query_map([], |r| r.get(0)).map(|r| r.flatten().collect()).unwrap_or_default();
         for id in ids {
             if o.len() > MAX_BODY {
-                o.push_str(&format!("\n… truncated; run `{b} context <project>` for the rest.\n"));
+                o.push_str(&format!("\n… truncated; run `{w} context <project>` for the rest.\n"));
                 break;
             }
             if let Ok(p) = crate::view::resolve_project(c, &id) {
+                // Index freshness changes every scan (keep the file stable); scope and next
+                // commands are in the Commands section above, printed once.
+                let m = crate::view::map::compact_map(&v, &p, &lim, &opts).unwrap_or_default();
+                let m: String = m.lines().filter(|l| !["Index: ", "WARNING: index is stale", "Scope: ", "Next: "].iter().any(|x| l.starts_with(x))).map(|l| format!("{l}\n")).collect();
                 o.push('\n');
-                o.push_str(&crate::view::project_map(&v, &p, &lim).unwrap_or_default().replacen("# ", "### ", 1).replace("\n## ", "\n#### "));
+                o.push_str(&m.replacen("# ", "### ", 1));
             }
         }
     }

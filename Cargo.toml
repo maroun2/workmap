@@ -1,6 +1,6 @@
 [package]
 name = "workmap"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Local contextual map of repos, worktrees, docs and agent conversations"

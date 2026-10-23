@@ -39,19 +39,51 @@ Remote-only, not cloned (1; metadata from authenticated gh/glab; expand remote:<
 - remote:github.com/acme/inkwell-vscode — public — Editor extension for inkwell
 ```
 
-**2. One project at a glance.** Docs quoted with line numbers, key files with
-the reason they rank, commits, conversations, and related projects with
-evidence:
+**2. One project at a glance.** A quoted purpose line with its source, then
+a typed, directed map grouped by source node: each conversation, doc, commit or
+project printed once with its name and reference, followed by short target
+lists. Only confirmed edges appear; mentions and requested/failed accesses are
+counted and listed with `--weak`. `--detailed` prints the longer sections view.
 
 ```
 $ workmap context inkwell
-## Key files (5 with evidence; why: doc links, entry points, commits, conversation writes/reads)
-- :src/check.rs — named in README.md:6 (Commands); 1 commit(s), last 2026-09-01; conversations r1
-## Conversations (1; 1 with file reads/writes first)
-- ':conversation:Parser timeout' 2026-09-10 claude@main r1 w1 — "Parser timeout on huge files"
-## Related projects (2; evidence, not interpretation)
-- :related:inkcore — → Cargo path dependency [declared] at …/inkwell/Cargo.toml:6: "inkcore = { path = "../inkcore" }"
-- :related:notes — ← doc names its URL or path [documented] at …/notes/README.md:4: "See https://github.com/acme/inkwell/blob/main/README.md before tagging."
+# inkwell — map · main @ $DEMO/home/src/inkwell · HEAD 36d628cc · 0 modified · last commit 2026-09-01
+Purpose (:README.md l.3): "Command-line Markdown checker built on https://github.com/acme/inkcore."
+Scope: export WORKMAP_PROJECT=inkwell WORKMAP_STATE_DIR=$DEMO/state WORKMAP_HOME=$DEMO/home — `:` refs are relative to it; other worktrees/projects are fully qualified
+Worktrees (2): main*, timeout-fix
+Selected (confirmed edges only): docs 2/2 · files 3/3 · conversations 1/1 · commits 1/1 · projects 2/2 · weak edges hidden: 0
+Types (A type → B: stored edge from A to B; ← from B to A; +N: more targets, see expand A): read/write = tool result recorded; ref = doc names the path/repository; changes = commit changed the file; history = commit indexed on this branch; dependency = manifest/submodule declares it; co-use = a conversation used files of both projects (not a dependency)
+
+inkwell (this project)
+  ref, dependency, co-use → :related:inkcore
+  ref ← :related:inkcore, :related:notes
+worktree main
+  history → :commit:36d628cc
+"Parser timeout on huge files" :session:5f2c9a10 (claude@main 2026-09-10)
+  read → :src/check.rs
+  write → inkcore:src/retry.rs
+:README.md
+  ref → :docs/exit-codes.md, :src/check.rs
+:commit:36d628cc "check command and exit codes" (2026-09-01)
+  changes → :README.md, :docs/exit-codes.md, :src/check.rs, :src/main.rs, :Cargo.toml
+
+Next: workmap expand REF (evidence, details) · workmap search 'words' · workmap context --detailed (sections view)
+```
+
+Every reference expands to its details and evidence:
+
+```
+$ workmap expand inkwell:session:5f2c9a10
+# ':conversation:Parser timeout' — claude conversation in inkwell @main
+title "Parser timeout on huge files"
+session 5f2c9a10-demo · 2026-09-10 09:00Z → 2026-09-10 09:05Z · cwd $DEMO/home/src/inkwell
+transcript $DEMO/home/.claude/projects/-tmp-workmap-demo-home-src-inkwell/5f2c9a10-demo.jsonl
+first user input 2026-09-10 09:00Z l.2: "inkwell check hangs on a 40 MB file, why?"
+latest user input (as typed; not a decision record) 2026-09-10 09:05Z l.7: "ship it after the release checklist"
+access: r1 w1
+coverage: 4 searchable message(s)
+messages: :message:5f2c9a10:l2 (user), :message:5f2c9a10:l3 (assistant), :message:5f2c9a10:l5 (assistant) … (search inside: search 'words' --kind message)
+…
 ```
 
 **3. Search what was said, not just what was committed.** Individual messages
@@ -152,7 +184,8 @@ session bus. `--no-activate` writes the units without enabling them.
 | Command | What it shows |
 |---|---|
 | `workmap overview` | Every project by name, plus remote-only repositories |
-| `workmap context [P]` | Project map: worktrees, docs, key files, commits, conversations, related projects, index freshness and coverage |
+| `workmap context [P] [--budget BYTES] [--weak]` | Compact map: a quoted purpose line (doc path + line), then typed, directed connections grouped by source node: conversations (title + `:session:` ref), docs, commits, worktree history, related projects. Confirmed edges only; weak ones are counted, listed with `--weak`. Whole groups of lines within `--budget` (default 4000 bytes); the header and the `Next:` line always print |
+| `workmap context [P] --detailed` | The sections view: worktrees, docs, key files with reasons, commits, conversations with access codes, related projects, index coverage (also `workmap expand P`) |
 | `workmap context [P] --task '…' --file PATH… [--budget BYTES]` | Ranked, budget-bounded context; every item has a reason |
 | `workmap search WORDS… [--project P [--worktree W] [--here]] [--kind K] [--speaker user\|assistant] [--provider claude\|codex\|opencode] [--since DATE] [--any] [--exact] [--explain]` | Full-text search over project metadata, doc sections, commits, conversation messages and remote catalog/snapshot entries. Tiers, each hit labelled: `[exact]` tokens, then `[prefix]`, then `[stem]` (Porter), `[substring]` for sha/path/identifier-shaped queries; `[any]` only with `--any`. No synonyms. Zero/few hits print what was searched, coverage and runnable commands that widen the scope |
 | `workmap expand REF` | One file, doc section, commit, conversation, message or relation, with everything linked to it |
@@ -498,6 +531,11 @@ Known limits:
 - Manifests are parsed line by line, not with a full TOML parser. Unusual
   layouts (multi-line inline tables) can be missed. Python support covers PEP
   621 `dependencies`, Poetry dependency tables and `tool.uv.sources`.
+- The compact map selects per category by fixed rules (docs and files by
+  confirmed-edge count and rank, conversations with confirmed file access by
+  recency, commits by how many selected files they changed) and shows at most
+  6 targets per connection type. Its size depends on the graph; it is bounded by
+  the limits and `--budget`, not guaranteed smaller than `--detailed`.
 - Search is word-based (SQLite FTS5, `unicode61`, diacritics folded). It has
   no stemming and no fuzzy matching, and does not search code: use `rg` or your
   editor for that.
@@ -513,6 +551,15 @@ Known limits:
 - The scan skips dependency, cache and build directories (`node_modules`,
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
+
+## Upgrading to 0.4
+
+`workmap context` now prints the compact map; the previous output is
+`workmap context --detailed` (unchanged, also `workmap expand <project>`).
+Commit file lists keep non-ASCII paths verbatim (`core.quotePath=false`);
+a checkout drops its old quoted duplicates when it is re-indexed (new HEAD,
+index or doc change, or `scan --full`).
+No re-parse is needed.
 
 ## Upgrading to 0.3
 
