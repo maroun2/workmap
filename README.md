@@ -200,7 +200,7 @@ session bus. `--no-activate` writes the units without enabling them.
 | `workmap remote status\|list\|refresh\|enable\|disable` | The gh/glab catalog |
 | `workmap remote snapshots status\|enable\|disable\|set KEY VALUE` | Opt-in shallow snapshots of remote-only repositories |
 | `workmap status` | Counts, freshness, transcript coverage per provider, remote host status |
-| `workmap hook EVENT --harness claude\|codex` | Used by installed hooks: reads the host's event JSON on stdin, prints bounded context or nothing, always exits 0 |
+| `workmap hook EVENT --harness claude\|codex [--explain]` | Used by installed hooks: reads the host's event JSON on stdin, prints bounded context or nothing, always exits 0. `--explain` writes why each passage was kept or dropped to stderr |
 | `workmap --version` | Version, git revision (or `WORKMAP_BUILD_REV`, else `unknown`) and build profile |
 
 ### References
@@ -448,12 +448,40 @@ references with source excerpts, and never a summary.
   conversations in this checkout, and sibling worktrees with their latest
   activity, all as `workmap expand` references. In an unrelated directory it
   adds nothing.
-- **UserPromptSubmit:** searches the prompt's words (stop-words removed)
-  within that project. It adds only passages that contain at least two
-  distinct prompt words (more for long prompts), or a file whose path the
-  prompt names, along with the matched words. A reference already sent in a
-  session is not sent again; the per-session state lives in
-  `<state>/hook-seen/`, is pruned after 7 days, and is capped at 200 sessions.
+- **UserPromptSubmit:** searches the prompt's topic words within that
+  project and prefers saying nothing to adding weak matches:
+  - Generic intent words (`read`, `project`, `context`, `without`, `dont`, …)
+    and words found in more than 5% of all indexed passages never make a
+    passage relevant on their own. Words in more than 10% of this project's
+    passages count, with little weight, only next to a more distinctive word.
+  - A passage qualifies with an adjacent prompt phrase (`context injection`),
+    or with two or more prompt words close to each other that cover at least
+    half of the prompt's word weight (IDF). A word the project never mentions
+    still counts in that total, so the rest of the prompt cannot match
+    without it. A lone word qualifies only if it looks like an identifier
+    (`snake_case`, `CamelCase`, a sha). A file whose path the prompt names is
+    always offered.
+  - Skipped: the current conversation, messages that are one JSON object
+    (approval verdicts, tool payloads) and messages whose matched words sit in
+    text found verbatim in five or more conversations (prompt templates, tool
+    notices).
+  - Identical and near-identical passages, and text echoed into another
+    conversation, collapse into one reference marked `+N identical` /
+    `+N near-identical`; at most one passage per conversation or doc. Past
+    assistant answers are labelled `past answer, unverified`.
+  - An unknown word of five or more letters may complete to the clearly most
+    frequent indexed word it is a prefix of (one or two letters more), shown as
+    `contex→context`. No synonyms, translation or edit distance.
+
+  A reference already sent in a session is not sent again; the per-session
+  state lives in `<state>/hook-seen/`, is pruned after 7 days, and is capped
+  at 200 sessions. To see why a prompt got what it got, pipe the same event
+  JSON to `workmap hook UserPromptSubmit --harness claude --explain`: term
+  classes, every kept or dropped passage with the reason go to stderr, and
+  the per-session state is read but not updated. With `WORKMAP_HOOK_TRACE=1`
+  in the hook command's environment, each event appends one counts-only line
+  (no prompt or passage text) to `<state>/hook.log`, which tells "the hook ran
+  and chose nothing" from "the hook never ran".
 - **Stop, SessionEnd:** start a detached `workmap ingest --transcript <path>
   --quiet`, so the next session sees this one without waiting for a full scan.
 
@@ -544,7 +572,8 @@ Known limits:
 - `ask` enforcement is verified from each CLI's documented flags. OpenCode is
   unsupported.
 - Host hooks match prompts lexically, without stemming. A prompt that words a
-  problem differently from the transcripts gets no context.
+  problem differently from the transcripts, or in another language, gets no
+  context; a prompt made mostly of generic words gets none by design.
 - Identical-file detection stats at most 30,000 tracked files and records at
   most 20,000 per main checkout; very large repositories are only partly
   compared.

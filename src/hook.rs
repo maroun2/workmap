@@ -23,11 +23,10 @@
 //! identically for both context events.
 
 use crate::config::Env;
-use crate::overview::{nodes, rel, Node};
-use crate::search;
+use crate::overview::{nodes, Node};
 use crate::util::{clip, fmt_date, sh_quote};
 use crate::view::{self, Project};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -75,6 +74,14 @@ pub struct Ctx {
     pub budget: usize,
     /// How printed follow-up commands invoke workmap.
     pub cmd: String,
+    /// `--explain`: print why UserPromptSubmit chose (or dropped) each passage
+    /// to stderr; changes nothing else except that the per-session
+    /// "already shown" list is read but not updated.
+    pub explain: bool,
+    /// `WORKMAP_HOOK_TRACE=1`: one counts-only line per event in `<state>/hook.log`
+    /// (no prompt, no passage text), so "no output" can be told apart from
+    /// "hook never ran".
+    pub trace: bool,
 }
 
 /// What one event produced: stdout bytes and, for Stop/SessionEnd, the argv spawned.
@@ -82,6 +89,10 @@ pub struct Ctx {
 pub struct Outcome {
     pub stdout: String,
     pub spawned: Option<Vec<String>>,
+    /// Human-readable decision trace (`--explain`).
+    pub explain: Vec<String>,
+    /// Counts-only summary for the opt-in trace log.
+    pub tally: String,
 }
 
 pub fn budget_from_env() -> usize {
@@ -90,7 +101,7 @@ pub fn budget_from_env() -> usize {
 
 /// CLI entry: never fails the host session. Reads stdin (bounded), prints the
 /// result, logs internal errors to `<state>/hook.log`, always returns.
-pub fn main(env: &Env, event: Option<&str>, harness: &str, cmd: String) {
+pub fn main(env: &Env, event: Option<&str>, harness: &str, cmd: String, explain: bool) {
     let mut input = Vec::new();
     let _ = std::io::stdin().take(MAX_INPUT).read_to_end(&mut input);
     let self_exe = std::env::var_os("WORKMAP_HOOK_SELF").map(PathBuf::from).or_else(|| std::env::current_exe().ok()).unwrap_or_else(|| PathBuf::from("workmap"));
@@ -102,7 +113,8 @@ pub fn main(env: &Env, event: Option<&str>, harness: &str, cmd: String) {
         .map(|(k, v)| sh_quote(&format!("{k}={v}")))
         .collect();
     let cmd = if vars.is_empty() { cmd } else { format!("env {} {cmd}", vars.join(" ")) };
-    let out = respond(env, event, harness, &input, &Ctx { self_exe, budget: budget_from_env(), cmd });
+    let trace = std::env::var("WORKMAP_HOOK_TRACE").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+    let out = respond(env, event, harness, &input, &Ctx { self_exe, budget: budget_from_env(), cmd, explain, trace });
     if !out.is_empty() {
         use std::io::Write;
         let mut so = std::io::stdout().lock();
@@ -123,10 +135,22 @@ pub fn respond(env: &Env, event: Option<&str>, harness: &str, input: &[u8], ctx:
             if let Some(argv) = &o.spawned {
                 log(env, &format!("spawned {}", argv.join(" ")));
             }
+            if ctx.trace {
+                log(env, &format!("trace {} {harness}: {} byte(s) out{}", event.unwrap_or("?"), o.stdout.len(), if o.tally.is_empty() { String::new() } else { format!(" · {}", o.tally) }));
+            }
+            if ctx.explain {
+                for l in &o.explain {
+                    eprintln!("explain: {l}");
+                }
+                eprintln!("explain: {} byte(s) of additionalContext", o.stdout.len());
+            }
             o.stdout
         }
         Err(e) => {
             log(env, &format!("{} {}: {e}", event.unwrap_or("?"), harness));
+            if ctx.explain {
+                eprintln!("explain: error (logged): {e}");
+            }
             String::new()
         }
     }
@@ -173,21 +197,27 @@ pub fn handle(env: &Env, event: &str, harness: &str, input: &[u8], ctx: &Ctx) ->
             return Err(format!("stdin event {n:?} does not match argument {event:?}"));
         }
     }
+    let quiet = |why: &str| Ok(Outcome { explain: vec![why.to_string()], tally: why.to_string(), ..Default::default() });
     match ev {
-        Event::Stop | Event::SessionEnd => Ok(Outcome { stdout: String::new(), spawned: spawn_ingest(env, &s("transcript_path"), ev == Event::Stop, ctx)? }),
+        Event::Stop | Event::SessionEnd => Ok(Outcome { spawned: spawn_ingest(env, &s("transcript_path"), ev == Event::Stop, ctx)?, ..Default::default() }),
         Event::SessionStart | Event::UserPromptSubmit => {
             let cwd = s("cwd");
             if !cwd.starts_with('/') {
-                return Ok(Outcome::default());
+                return quiet("no absolute cwd in the event");
             }
-            let Some(c) = open_index(env) else { return Ok(Outcome::default()) };
-            let Ok(p) = view::resolve_project(&c, &cwd) else { return Ok(Outcome::default()) };
-            let text = if ev == Event::SessionStart { session_start(&c, &p, &s("session_id"), ctx)? } else { prompt_context(env, &c, &p, &s("session_id"), &s("prompt"), ctx)? };
+            let Some(c) = open_index(env) else { return quiet("no index") };
+            let Ok(p) = view::resolve_project(&c, &cwd) else { return quiet("cwd is not inside an indexed project") };
+            let (text, explain, tally) = if ev == Event::SessionStart {
+                (session_start(&c, &p, &s("session_id"), ctx)?, vec![], String::new())
+            } else {
+                let (t, e, n) = crate::hook_prompt::context(env, &c, &p, &s("session_id"), &s("prompt"), ctx)?;
+                (t, e, n.line())
+            };
             if text.is_empty() {
-                return Ok(Outcome::default());
+                return Ok(Outcome { explain, tally, ..Default::default() });
             }
             let out = json!({"hookSpecificOutput": {"hookEventName": ev.name(), "additionalContext": text}});
-            Ok(Outcome { stdout: format!("{out}\n"), spawned: None })
+            Ok(Outcome { stdout: format!("{out}\n"), spawned: None, explain, tally })
         }
     }
 }
@@ -236,11 +266,11 @@ fn spawn_ingest(env: &Env, transcript: &str, throttle: bool, ctx: &Ctx) -> Resul
 
 // ------------------------------------------------------------------ SessionStart
 
-fn meta<'a>(n: &'a Node, k: &str) -> &'a str {
+pub(crate) fn meta<'a>(n: &'a Node, k: &str) -> &'a str {
     n.meta.get(k).and_then(|x| x.as_str()).unwrap_or("")
 }
 
-fn repo_sessions(c: &Connection, repo: &str) -> Vec<Node> {
+pub(crate) fn repo_sessions(c: &Connection, repo: &str) -> Vec<Node> {
     nodes(c, "kind='session' AND repo_id=?1 ORDER BY ts DESC, id", &[&repo]).unwrap_or_default()
 }
 
@@ -322,288 +352,12 @@ fn session_start(c: &Connection, p: &Project, session_id: &str, ctx: &Ctx) -> Re
 
 // ------------------------------------------------------------------ UserPromptSubmit
 
-/// Function words that carry no topic; dropped before matching.
-const STOP: &[&str] = &[
-    "the",
-    "and",
-    "for",
-    "are",
-    "but",
-    "not",
-    "you",
-    "your",
-    "all",
-    "any",
-    "can",
-    "had",
-    "her",
-    "was",
-    "one",
-    "our",
-    "out",
-    "has",
-    "have",
-    "him",
-    "his",
-    "how",
-    "its",
-    "may",
-    "new",
-    "now",
-    "old",
-    "see",
-    "two",
-    "who",
-    "did",
-    "get",
-    "got",
-    "let",
-    "say",
-    "she",
-    "too",
-    "use",
-    "via",
-    "with",
-    "this",
-    "that",
-    "from",
-    "they",
-    "them",
-    "then",
-    "than",
-    "there",
-    "these",
-    "those",
-    "what",
-    "when",
-    "where",
-    "which",
-    "while",
-    "why",
-    "will",
-    "would",
-    "could",
-    "should",
-    "into",
-    "onto",
-    "about",
-    "after",
-    "before",
-    "again",
-    "also",
-    "just",
-    "like",
-    "make",
-    "made",
-    "more",
-    "most",
-    "much",
-    "must",
-    "need",
-    "only",
-    "other",
-    "over",
-    "same",
-    "some",
-    "such",
-    "very",
-    "were",
-    "been",
-    "being",
-    "does",
-    "doing",
-    "done",
-    "each",
-    "here",
-    "it's",
-    "i'm",
-    "please",
-    "want",
-    "know",
-    "think",
-    "look",
-    "check",
-    "find",
-    "show",
-    "tell",
-    "give",
-    "take",
-    "help",
-    "work",
-    "thing",
-    "things",
-    "something",
-    "anything",
-    "everything",
-    "really",
-    "maybe",
-    "still",
-    "yet",
-    "ok",
-    "okay",
-    "yes",
-    "lets",
-];
-
-fn words(text: &str) -> Vec<String> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect()
-}
-
-/// Topic terms of a prompt: distinct, no stop-words, at least 3 chars, at most 12.
-pub fn prompt_terms(prompt: &str) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for w in words(prompt) {
-        if w.chars().count() < 3 || STOP.contains(&w.as_str()) || (w.chars().all(|c| c.is_ascii_digit()) && w.len() < 4) {
-            continue;
-        }
-        if seen.insert(w.clone()) {
-            out.push(w);
-        }
-        if out.len() >= 12 {
-            break;
-        }
-    }
-    out
-}
-
-/// Path-like tokens (`ledger/webhooks.py`, `charges.py`) named in a prompt.
-fn prompt_paths(prompt: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for t in prompt.split_whitespace() {
-        let t = t.trim_matches(|c: char| "`'\"()[]{},;:!?<>".contains(c)).trim_end_matches('.');
-        let t = t.trim_start_matches("./");
-        let looks = t.len() >= 4
-            && t.len() <= 200
-            && (t.contains('/') || t.rsplit_once('.').map(|(a, b)| !a.is_empty() && (1..=5).contains(&b.len()) && b.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or(false));
-        if looks && !t.contains("://") && !t.starts_with('/') && !out.iter().any(|o: &String| o == t) {
-            out.push(t.to_string());
-        }
-        if out.len() >= 4 {
-            break;
-        }
-    }
-    out
-}
-
-/// Minimum distinct prompt terms a passage must contain.
-fn required(n: usize) -> usize {
-    n.div_ceil(3).clamp(2, 4)
-}
-
-fn passage_words(c: &Connection, node: &str, loc: &str) -> BTreeSet<String> {
-    let mut st = match c.prepare_cached("SELECT title, heading, text FROM passages WHERE node_id=?1 AND loc=?2 LIMIT 8") {
-        Ok(s) => s,
-        Err(_) => return BTreeSet::new(),
-    };
-    let rows = st.query_map(params![node, loc], |r| Ok(format!("{} {} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)));
-    rows.map(|r| r.flatten().flat_map(|t| words(&t)).collect()).unwrap_or_default()
-}
-
-struct Item {
-    r: String,
-    lines: Vec<String>,
-}
-
-fn prompt_context(env: &Env, c: &Connection, p: &Project, session_id: &str, prompt: &str, ctx: &Ctx) -> Result<String, String> {
-    let terms = prompt_terms(prompt);
-    let paths = prompt_paths(prompt);
-    let mut items: Vec<Item> = Vec::new();
-    // Exact path hits inside this project.
-    for t in &paths {
-        let like = format!("%/{}", t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-        let cands = nodes(c, "repo_id=?1 AND kind IN ('file','doc') AND path LIKE ?2 ESCAPE '\\' LIMIT 20", &[&p.repo.id, &like]).unwrap_or_default();
-        let n_conv =
-            |id: &str| c.query_row("SELECT count(DISTINCT src) FROM edges WHERE dst=?1 AND kind IN ('read','write') AND strength IN ('observed','parsed')", [id], |r| r.get::<_, i64>(0)).unwrap_or(0);
-        let best = cands
-            .iter()
-            .filter_map(|n| n.checkout_id.as_deref().and_then(|id| p.checkouts.iter().find(|x| x.id == id)).map(|co| (n_conv(&n.id), co.id == p.focus.id, n, co)))
-            .max_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        if let Some((k, _, n, co)) = best {
-            let relp = rel(n.path.as_deref().unwrap_or(""), &p.top(co)).to_string();
-            let r = sh_quote(&view::qualified_raw(p, co, &relp));
-            items.push(Item { r: r.clone(), lines: vec![format!("- {r} — file named in the prompt · {k} recorded conversation(s) read/wrote it")] });
-        }
-    }
-    if terms.len() >= 2 {
-        let q = search::Query { text: terms.join(" "), kinds: vec!["doc".into(), "message".into(), "commit".into()], any: true, limit: 25, ..Default::default() };
-        let (hits, _) = search::run_pref(c, &q, Some(&p.repo.id), None, Some(&p.focus.id)).map_err(|e| e.to_string())?;
-        let need = required(terms.len());
-        let mut sessions: Option<Vec<Node>> = None;
-        for h in hits {
-            if items.len() >= 6 {
-                break;
-            }
-            let have = passage_words(c, &h.node_id, &h.loc);
-            let matched: Vec<&str> = terms.iter().filter(|t| have.contains(*t)).map(String::as_str).collect();
-            if matched.len() < need {
-                continue;
-            }
-            let co = h.checkout_id.as_deref().and_then(|id| p.checkouts.iter().find(|x| x.id == id)).unwrap_or(&p.focus);
-            let (r, desc) = match h.kind.as_str() {
-                "message" => {
-                    let all = sessions.get_or_insert_with(|| repo_sessions(c, &p.repo.id));
-                    let Some(s) = all.iter().find(|s| s.id == h.node_id) else { continue };
-                    if !session_id.is_empty() && meta(s, "native_id") == session_id {
-                        continue; // this very conversation
-                    }
-                    let rest = format!("message:{}:{}", view::more::session_prefix(all, s), h.loc);
-                    (sh_quote(&view::qualified_raw(p, co, &rest)), format!("{} {} message {} · conversation \"{}\"", meta(s, "provider"), h.speaker, fmt_date(h.ts), clip(&s.label, 50)))
-                }
-                "doc" => {
-                    let relp = if h.title.starts_with("claude-memory/") { h.title.clone() } else { rel(&h.source_path, &p.top(co)).to_string() };
-                    let rest = if h.loc.is_empty() { relp.clone() } else { format!("{relp}#{}", h.loc) };
-                    (sh_quote(&view::qualified_raw(p, co, &rest)), format!("doc {relp}{} l.{}", if h.heading.is_empty() { String::new() } else { format!(" § {}", clip(&h.heading, 40)) }, h.line))
-                }
-                "commit" => {
-                    let main = p.checkouts.first().unwrap_or(&p.focus);
-                    let sha = &h.loc[..h.loc.len().min(8)];
-                    (sh_quote(&view::qualified_raw(p, main, &format!("commit:{sha}"))), format!("commit {sha} by {} {}", h.speaker, fmt_date(h.ts)))
-                }
-                _ => continue,
-            };
-            if items.iter().any(|i| i.r == r) {
-                continue;
-            }
-            let excerpt = clip(&h.snippet.replace('\n', " "), 200);
-            items.push(Item { r: r.clone(), lines: vec![format!("- {r} — {desc} · matched: {}", matched.join(", ")), format!("  \"{excerpt}\"")] });
-        }
-    }
-    if items.is_empty() {
-        return Ok(String::new());
-    }
-    let seen_path = seen_file(env, session_id);
-    let seen: BTreeSet<String> = seen_path.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default();
-    items.retain(|i| !seen.contains(&i.r));
-    if items.is_empty() {
-        return Ok(String::new());
-    }
-    let mut o = format!("workmap: indexed evidence in project {} lexically matching this prompt (historical text, not decisions):\n", p.handle);
-    let foot = format!("Expand a reference for the full text and neighbours: {} expand '<ref>'\n", ctx.cmd);
-    let budget = ctx.budget.saturating_sub(foot.len());
-    let mut emitted = Vec::new();
-    for it in items {
-        let block: String = it.lines.iter().map(|l| format!("{l}\n")).collect();
-        if o.len() + block.len() > budget {
-            continue; // a smaller later item may still fit; never cut one
-        }
-        o.push_str(&block);
-        emitted.push(it.r);
-    }
-    if emitted.is_empty() {
-        return Ok(String::new());
-    }
-    o.push_str(&foot);
-    if let Some(f) = seen_path {
-        remember(&f, &seen, &emitted);
-    }
-    Ok(o)
-}
+// Retrieval lives in `hook_prompt`.
 
 // ------------------------------------------------------------------ per-session dedup
 
 /// `<state>/hook-seen/<sanitized session id>`; None without a session id.
-fn seen_file(env: &Env, session_id: &str) -> Option<PathBuf> {
+pub(crate) fn seen_file(env: &Env, session_id: &str) -> Option<PathBuf> {
     let safe: String = session_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(80).collect();
     if safe.is_empty() {
         return None;
@@ -611,7 +365,7 @@ fn seen_file(env: &Env, session_id: &str) -> Option<PathBuf> {
     Some(env.state_dir.join("hook-seen").join(safe))
 }
 
-fn remember(f: &Path, seen: &BTreeSet<String>, new: &[String]) {
+pub(crate) fn remember(f: &Path, seen: &BTreeSet<String>, new: &[String]) {
     let Some(dir) = f.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;

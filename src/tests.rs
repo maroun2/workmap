@@ -866,5 +866,7 @@ mod identity_tests;
 mod ingest_tests;
 #[path = "tests_map.rs"]
 mod map_tests;
+#[path = "tests_prompt.rs"]
+mod prompt_tests;
 #[path = "tests_search.rs"]
 mod search_tests;

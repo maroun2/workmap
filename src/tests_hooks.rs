@@ -9,7 +9,7 @@ use crate::testutil::{ledger, Ledger};
 use std::time::{Duration, Instant};
 
 fn ctx(budget: usize) -> Ctx {
-    Ctx { self_exe: PathBuf::from("/nonexistent/workmap"), budget, cmd: "workmap".into() }
+    Ctx { self_exe: PathBuf::from("/nonexistent/workmap"), budget, cmd: "workmap".into(), explain: false, trace: false }
 }
 
 /// Event JSON shaped like the documented examples (common fields + event fields).
@@ -176,7 +176,7 @@ fn stop_and_session_end_spawn_detached_ingest_of_the_transcript() {
     let t = TempDir::new("self");
     for (ev, harness) in [("Stop", "claude"), ("SessionEnd", "codex")] {
         let (bin, log) = recorder(t.path(), ev);
-        let c = Ctx { self_exe: bin.clone(), budget: 1500, cmd: "workmap".into() };
+        let c = Ctx { self_exe: bin.clone(), budget: 1500, cmd: "workmap".into(), explain: false, trace: false };
         let mut input = event(ev, "aaaa1111-fix", &fx.api_fix, json!({"stop_hook_active": false, "reason": "other"}));
         let mut v: serde_json::Value = serde_json::from_slice(&input).unwrap();
         v["transcript_path"] = json!(fx.conv_fix.display().to_string());
@@ -193,7 +193,7 @@ fn stop_and_session_end_spawn_detached_ingest_of_the_transcript() {
     }
     // Stop fires after every turn: a second Stop right away is throttled, SessionEnd is not.
     let (bin, log) = recorder(t.path(), "again");
-    let c = Ctx { self_exe: bin, budget: 1500, cmd: "workmap".into() };
+    let c = Ctx { self_exe: bin, budget: 1500, cmd: "workmap".into(), explain: false, trace: false };
     let mut v: serde_json::Value = serde_json::from_slice(&event("Stop", "s", &fx.api_fix, json!({}))).unwrap();
     v["transcript_path"] = json!(fx.conv_fix.display().to_string());
     assert!(hook::handle(&env, "Stop", "claude", v.to_string().as_bytes(), &c).unwrap().spawned.is_none());
@@ -202,7 +202,7 @@ fn stop_and_session_end_spawn_detached_ingest_of_the_transcript() {
     wait_for(&log);
     // Codex may send `transcript_path: null`; a missing file is skipped too.
     let (bin, log) = recorder(t.path(), "none");
-    let c = Ctx { self_exe: bin, budget: 1500, cmd: "workmap".into() };
+    let c = Ctx { self_exe: bin, budget: 1500, cmd: "workmap".into(), explain: false, trace: false };
     for tp in [json!(null), json!("/no/such/transcript.jsonl"), json!("relative.jsonl")] {
         let mut v: serde_json::Value = serde_json::from_slice(&event("Stop", "s", &fx.api, json!({}))).unwrap();
         v["transcript_path"] = tp;

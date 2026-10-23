@@ -8,6 +8,7 @@ mod discover;
 mod docs;
 mod git;
 mod hook;
+mod hook_prompt;
 mod install;
 mod overview;
 mod relations;
@@ -63,8 +64,10 @@ USAGE:
                                                        index only these sources now (no home walk, no pruning,
                                                        no remote sync); OpenCode: --transcript '<db>#session=<id>'.
                                                        `install` adds a daily systemd user timer running a full scan
-  workmap hook <event> --harness claude|codex          read a host hook event (JSON) on stdin; print bounded
-                                                       context or nothing; always exits 0 (used by installed hooks)
+  workmap hook <event> --harness claude|codex [--explain]
+                                                       read a host hook event (JSON) on stdin; print bounded
+                                                       context or nothing; always exits 0 (used by installed hooks);
+                                                       --explain prints why each passage was kept or dropped to stderr
   workmap hooks status|install|uninstall [--harness claude|codex] [--scope user|project] [--dry-run]
                                                        opt-in host hooks: context at session start / per prompt,
                                                        ingest on stop; `hooks status` shows the support matrix
@@ -194,7 +197,7 @@ fn run() -> Result<(), String> {
     if a.pos.first().map(|s| s == "hook").unwrap_or(false) {
         // Host hook: must never fail or block the host session, so it runs before
         // (and instead of) the regular index open, which creates/migrates and waits.
-        hook::main(&env, a.pos.get(1).map(String::as_str), a.get("--harness").as_deref().unwrap_or("claude"), cli_cmd());
+        hook::main(&env, a.pos.get(1).map(String::as_str), a.get("--harness").as_deref().unwrap_or("claude"), cli_cmd(), a.has("--explain"));
         return Ok(());
     }
     let mut c = db::open(&env.db_path()).map_err(|e| format!("open index {}: {e}", env.db_path().display()))?;

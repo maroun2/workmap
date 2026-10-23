@@ -119,8 +119,11 @@ impl Session {
         if t.is_empty() || (speaker == "user" && is_injected(t)) {
             return;
         }
-        if !self.seen_msgs.insert(crate::util::fnv64(&format!("{speaker}\0{t}"))) {
-            return; // Codex records the same text as event and as response item
+        // Codex records the same text as event and as response item; the
+        // response item joins its content blocks with newlines the event lacks.
+        let norm: Vec<&str> = t.split_whitespace().collect();
+        if !self.seen_msgs.insert(crate::util::fnv64(&format!("{speaker}\0{}", norm.join(" ")))) {
+            return;
         }
         if self.messages.len() >= MAX_MSGS || self.msg_bytes >= MAX_MSG_BYTES {
             self.messages_capped = true;
