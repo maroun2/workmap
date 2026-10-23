@@ -699,7 +699,10 @@ pub fn trust_lines(env: &Env) -> Vec<String> {
     }
     let hooks_json = env.codex_home().join("hooks.json");
     let all = codex_trust_records(env);
-    let here = all.iter().filter(|k| k.contains(&*hooks_json.to_string_lossy())).count();
+    // Keys read `<hooks.json path as Codex saw it>:<event>:<group>:<handler>`; the path may be
+    // the symlinked spelling (`~/.codex/...`), so compare files, not strings.
+    let target = std::fs::canonicalize(&hooks_json).unwrap_or_else(|_| hooks_json.clone());
+    let here = all.iter().filter(|k| k.rsplitn(4, ':').nth(3).map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)) == target).unwrap_or(false)).count();
     out.push(format!(
         "verify: codex trust records in {}: {} total, {here} naming {} — Codex runs these hooks only after `/hooks` review accepts the exact current definitions{}",
         env.codex_home().join("config.toml").display(),

@@ -258,10 +258,16 @@ fn codex_trust_records_are_read_not_written() {
     let env = env_for(&l);
     let cfg = l.codex.join("config.toml");
     let hooks = l.codex.join("hooks.json");
-    let text = format!("model = \"m\"\n[hooks.state.\"{}:stop:0:0\"]\ntrusted_hash = \"sha256:abc\"\n[projects.\"/x\"]\ntrust_level = \"trusted\"\n", hooks.display());
+    write(&hooks, "{}");
+    // Codex keys use the path as it saw it: here the symlinked ~/.codex spelling.
+    let seen = l.home.join(".codex/hooks.json");
+    let text = format!(
+        "model = \"m\"\n[hooks.state]\n\n[hooks.state.\"{}:stop:0:0\"]\ntrusted_hash = \"sha256:abc\"\n[hooks.state.\"/elsewhere/hooks.json:stop:0:0\"]\ntrusted_hash = \"sha256:def\"\n[projects.\"/x\"]\ntrust_level = \"trusted\"\n",
+        seen.display()
+    );
     write(&cfg, &text);
-    assert_eq!(hook::codex_trust_records(&env), vec![format!("{}:stop:0:0", hooks.display())]);
+    assert_eq!(hook::codex_trust_records(&env), vec![format!("{}:stop:0:0", seen.display()), "/elsewhere/hooks.json:stop:0:0".to_string()]);
     let lines = hook::trust_lines(&env).join("\n");
-    assert!(lines.contains("trust records in") && lines.contains(": 1 total, 1 naming"), "{lines}");
+    assert!(lines.contains("trust records in") && lines.contains(": 2 total, 1 naming"), "{lines}");
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
 }
