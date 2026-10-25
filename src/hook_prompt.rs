@@ -27,6 +27,10 @@
 //!    A passage that restates the prompt itself (the same question asked in
 //!    an earlier session), or matches only where it quotes the prompt, tells
 //!    the model nothing new and is skipped.
+//! 0. A task-completion notice from the orchestrator ("Delegated task <id>
+//!    reached a terminal state. Use task_status …") is not a question: nothing
+//!    is searched. Percent-encoded protocol tokens (`command%3Amcp%3A…`) are
+//!    removed from any prompt before its words are read.
 //! 5. Typos: an unknown word of ≥5 letters may complete to the clearly most
 //!    frequent indexed word it is a prefix of (≤2 more letters, `contex→context`),
 //!    shown in `matched:`. No synonyms, no translation, no edit distance.
@@ -693,10 +697,43 @@ impl Tally {
 
 /// Bounded `additionalContext` for one prompt (empty: say nothing), the
 /// `--explain` trace and the counts.
+/// The orchestrator's fixed completion notice for a delegated task.
+pub fn is_task_notice(prompt: &str) -> bool {
+    let t = prompt.trim();
+    let Some(rest) = t.strip_prefix("Delegated task ") else { return false };
+    let Some((id, rest)) = rest.split_once(" reached a terminal state. Use task_status with taskId ") else { return false };
+    let Some(id2) = rest.strip_suffix(" to read the result.").or_else(|| rest.strip_suffix(" to read the result")) else { return false };
+    let one = |x: &str| !x.is_empty() && !x.contains(char::is_whitespace);
+    one(id) && one(id2)
+}
+
+/// `%XX` inside a token: an encoded identifier, not words.
+fn encoded(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    b.windows(3).any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit())
+}
+
+/// The prompt without percent-encoded protocol tokens.
+pub fn protocol_free(prompt: &str) -> String {
+    if !prompt.contains('%') {
+        return prompt.to_string();
+    }
+    prompt.split(' ').filter(|t| !encoded(t)).collect::<Vec<_>>().join(" ")
+}
+
 pub fn context(env: &Env, c: &Connection, p: &Project, session_id: &str, prompt: &str, ctx: &Ctx) -> Result<(String, Vec<String>, Tally), String> {
     let mut tr: Vec<String> = Vec::new();
     let mut tally = Tally::default();
     let mut items: Vec<Item> = Vec::new();
+    if is_task_notice(prompt) {
+        tr.push("delegated-task completion notice: nothing searched".into());
+        return Ok((String::new(), tr, tally));
+    }
+    let cleaned = protocol_free(prompt);
+    if cleaned.len() != prompt.len() {
+        tr.push("percent-encoded protocol tokens removed from the prompt".into());
+    }
+    let prompt = cleaned.as_str();
     // Exact path hits inside this project.
     for t in prompt_paths(prompt) {
         let like = format!("%/{}", t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));

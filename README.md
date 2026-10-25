@@ -504,6 +504,10 @@ references with source excerpts, and never a summary.
     conversation, collapse into one reference marked `+N identical` /
     `+N near-identical`; at most one passage per conversation or doc. Past
     assistant answers are labelled `past answer, unverified`.
+  - An orchestrator's delegated-task completion notice ("Delegated task <id>
+    reached a terminal state. Use task_status …") adds nothing, and
+    percent-encoded protocol tokens (`command%3Amcp%3A…`) are dropped from any
+    prompt before matching.
   - A passage that restates the prompt itself (the same question asked in an
     earlier session) is skipped: repeating the question is not evidence.
   - An unknown word of five or more letters may complete to the clearly most
@@ -620,6 +624,11 @@ Known limits:
 - The scan skips dependency, cache and build directories (`node_modules`,
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
+
+## Upgrading to 0.4.3
+
+Replace the binary (`workmap install`). Delegated-task completion notices get
+no prompt context. Hook definitions are unchanged.
 
 ## Upgrading to 0.4.2
 

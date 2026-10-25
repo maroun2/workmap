@@ -12,6 +12,7 @@
 #[allow(unused_imports)]
 use super::*;
 use crate::hook::{self, Ctx};
+use crate::hook_prompt;
 use crate::testutil::{commit_all, jsonl};
 use std::time::Instant;
 
@@ -365,4 +366,25 @@ fn a_prompt_asked_in_an_earlier_session_is_not_its_own_evidence() {
     // A longer message that merely contains a short prompt's words is kept.
     let t = fx.ask("f0000003-new", "add jitter to the retry deadline");
     assert!(items(&t).iter().any(|l| l.contains(":message:c0000001:")), "{t}");
+}
+
+#[test]
+fn task_completion_notices_say_nothing_but_questions_about_tasks_still_search() {
+    let fx = relay_with(false);
+    // Orchestration metadata recorded in an earlier conversation.
+    let id = "node:delegated-task:command%3Amcp%3Ab1e2c3d4-0000-4000-8000-00000000abcd%3Adelegate-task%3Arelay-retry-fix-v1";
+    let notice = format!("Delegated task {id} reached a terminal state. Use task_status with taskId {id} to read the result.");
+    assert!(hook_prompt::is_task_notice(&notice));
+    assert!(!hook_prompt::is_task_notice("Why are delegated tasks failing?"));
+    assert_eq!(fx.ask("g0000001-new", &notice), "");
+    let (_, tr, _) = fx.explain("g0000002-new", &notice);
+    assert!(tr.iter().any(|l| l.contains("completion notice")), "{tr:#?}");
+    // Encoded ids in any other prompt are not words; the rest still matches.
+    let t = fx.ask("g0000003-new", &format!("add jitter to the retry deadline for {id}"));
+    assert!(items(&t).iter().any(|l| l.contains(":message:c0000001:")), "{t}");
+    assert!(!t.contains("3amcp"), "{t}");
+    assert_eq!(hook_prompt::protocol_free("why did node:x%3Ay fail"), "why did fail");
+    // A real question about delegated tasks is analysed as usual.
+    let (_, tr, _) = fx.explain("g0000004-new", "Why are delegated tasks failing?");
+    assert!(tr.iter().any(|l| l.starts_with("term delegated")) && !tr.iter().any(|l| l.contains("completion notice")), "{tr:#?}");
 }
