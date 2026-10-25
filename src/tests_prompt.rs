@@ -48,6 +48,11 @@ const PR_LINE: &str = "#212 fix(gateway): ordered priority-context injection for
 const VERDICT: &str = r#"{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"Read-only inspection of template context after patch application failure."}"#;
 
 fn relay() -> Relay {
+    relay_with(false)
+}
+
+/// `asked`: add an earlier session that asked the reported prompts verbatim.
+fn relay_with(asked: bool) -> Relay {
     let t = TempDir::new("relay");
     let home = t.path().join("home");
     let api = home.join("work/relay-api");
@@ -109,6 +114,24 @@ fn relay() -> Relay {
     }
     // The conversation the prompts are typed in (must never be offered to itself).
     claude(&home, &api, "e0000001-self", "Project context summary", 20, &[("user", "What context did you get from or about workmap. Dont read anything jet")]);
+    // An earlier session where the same questions were already asked: the
+    // indexed copies of a prompt are not evidence for that prompt.
+    if asked {
+        claude(
+            &home,
+            &api,
+            "e0000002-asked",
+            "Project context summary",
+            19,
+            &[
+                ("user", "Tell me what you know about this project without any additional read. Just from the context, or write me what you getted from the contex"),
+                ("user", "What context did you get from or about workmap. Dont read anything jet"),
+                ("user", "Vizualizace for me the contex allocation and how much the context injection allocate"),
+                ("assistant", "The hook fired for each message. Hook #2: \"What context did you get from or about workmap. Dont read anything jet\" matched context, workmap, dont, read."),
+                ("assistant", "Your question \"where does the webhook signature secret live\": it lives in the vault under relay/hooks/signing."),
+            ],
+        );
+    }
 
     // Codex approval-review transcript: every history delta is recorded twice
     // (response item with content blocks, then the same text as an event).
@@ -319,4 +342,27 @@ fn heldout_prompts_budget_speed_and_trace() {
     let before = std::fs::read_to_string(fx.env.state_dir.join("hook.log")).unwrap();
     fx.ask("s-tr2", "what about zephyrmap secrets");
     assert_eq!(std::fs::read_to_string(fx.env.state_dir.join("hook.log")).unwrap(), before);
+}
+
+#[test]
+fn a_prompt_asked_in_an_earlier_session_is_not_its_own_evidence() {
+    let fx = relay_with(true);
+    let me = "f0000001-new";
+    let p1 = "Tell me what you know about this project without any additional read. Just from the context, or write me what you getted from the contex";
+    assert_eq!(fx.ask(me, p1), "");
+    assert_eq!(fx.ask(me, "What context did you get from or about workmap. Dont read anything jet"), "");
+    let p3 = "Vizualizace for me the contex allocation and how much the context injection allocate";
+    let t = fx.ask(me, p3);
+    let it = items(&t);
+    assert_eq!(it.len(), 1, "{t}");
+    assert!(it[0].contains(":message:0f000001:") && !t.contains("e0000002"), "{t}");
+    let (_, tr, tally) = fx.explain("f0000002-new", p3);
+    assert!(tr.iter().any(|l| l.contains("restates or quotes this prompt")), "{tr:#?}");
+    assert!(tally.contains("echo=1"), "{tally}");
+    // A quote is not evidence, but an answer next to the quote still is.
+    let t = fx.ask("f0000004-new", "where does the webhook signature secret live");
+    assert!(items(&t).iter().any(|l| l.contains("c0000005") || l.contains("c0000006") || l.contains("e0000002")), "{t}");
+    // A longer message that merely contains a short prompt's words is kept.
+    let t = fx.ask("f0000003-new", "add jitter to the retry deadline");
+    assert!(items(&t).iter().any(|l| l.contains(":message:c0000001:")), "{t}");
 }

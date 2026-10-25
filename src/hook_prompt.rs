@@ -24,6 +24,9 @@
 //! 4. Identical (case/whitespace-normalized, same speaker), near-identical
 //!    (word-set Jaccard ≥ [`NEAR`]) and echoed (shared 8-word window) passages
 //!    collapse into the first; at most one passage per conversation or doc.
+//!    A passage that restates the prompt itself (the same question asked in
+//!    an earlier session), or matches only where it quotes the prompt, tells
+//!    the model nothing new and is skipped.
 //! 5. Typos: an unknown word of ≥5 letters may complete to the clearly most
 //!    frequent indexed word it is a prefix of (≤2 more letters, `contex→context`),
 //!    shown in `matched:`. No synonyms, no translation, no edit distance.
@@ -599,6 +602,32 @@ fn contains_seq(hay: &[String], needle: &[String]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The passage is this prompt again (near-identical words), or matches it only
+/// inside text quoting the prompt: runs of [`WIN`] or more of its words (the
+/// whole prompt when shorter). Words outside the quotes must qualify alone.
+fn restates(a: &Analysis, asked: &[String], asked_set: &BTreeSet<&str>, toks: &[String]) -> bool {
+    if asked.len() < 3 {
+        return false;
+    }
+    let set: BTreeSet<&str> = toks.iter().map(String::as_str).collect();
+    if jaccard(asked_set, &set) >= NEAR {
+        return true;
+    }
+    let w = WIN.min(asked.len());
+    let quoted: BTreeSet<&[String]> = asked.windows(w).collect();
+    let mut cut = vec![false; toks.len()];
+    for (i, win) in toks.windows(w).enumerate() {
+        if quoted.contains(win) {
+            cut[i..i + w].iter_mut().for_each(|x| *x = true);
+        }
+    }
+    if !cut.contains(&true) {
+        return false;
+    }
+    let rest: Vec<String> = toks.iter().zip(&cut).filter(|(_, c)| !**c).map(|(t, _)| t.clone()).collect();
+    !judge(a, &rest).ok
+}
+
 pub struct Item {
     pub r: String,
     pub lines: Vec<String>,
@@ -631,6 +660,7 @@ pub struct Tally {
     pub candidates: usize,
     pub not_relevant: usize,
     pub own: usize,
+    pub echo: usize,
     pub template: usize,
     pub duplicate: usize,
     pub same_source: usize,
@@ -642,8 +672,21 @@ pub struct Tally {
 impl Tally {
     pub fn line(&self) -> String {
         format!(
-            "terms={} anchors={} unknown={} weak={} candidates={} not_relevant={} own={} template={} duplicate={} same_source={} seen={} budget={} emitted={}",
-            self.terms, self.anchors, self.unknown, self.weak, self.candidates, self.not_relevant, self.own, self.template, self.duplicate, self.same_source, self.seen, self.budget, self.emitted
+            "terms={} anchors={} unknown={} weak={} candidates={} not_relevant={} own={} echo={} template={} duplicate={} same_source={} seen={} budget={} emitted={}",
+            self.terms,
+            self.anchors,
+            self.unknown,
+            self.weak,
+            self.candidates,
+            self.not_relevant,
+            self.own,
+            self.echo,
+            self.template,
+            self.duplicate,
+            self.same_source,
+            self.seen,
+            self.budget,
+            self.emitted
         )
     }
 }
@@ -695,6 +738,8 @@ pub fn context(env: &Env, c: &Connection, p: &Project, session_id: &str, prompt:
         }
     }
     let query = a.query();
+    let asked = words(prompt);
+    let asked_set: BTreeSet<&str> = asked.iter().map(String::as_str).collect();
     let mut picked: Vec<Picked> = Vec::new();
     if query.is_empty() {
         tr.push("no known anchor or phrase in the prompt: nothing searched".into());
@@ -746,6 +791,11 @@ pub fn context(env: &Env, c: &Connection, p: &Project, session_id: &str, prompt:
                 }
                 _ => continue,
             };
+            if restates(&a, &asked, &asked_set, &toks) {
+                tally.echo += 1;
+                tr.push(format!("drop {r}: restates or quotes this prompt; nothing else in it matches"));
+                continue;
+            }
             let first = j.first.unwrap_or(0);
             let key = format!("{}\0{}", h.speaker, toks.join(" "));
             let set: BTreeSet<&str> = toks.iter().map(String::as_str).collect();

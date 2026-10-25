@@ -504,6 +504,8 @@ references with source excerpts, and never a summary.
     conversation, collapse into one reference marked `+N identical` /
     `+N near-identical`; at most one passage per conversation or doc. Past
     assistant answers are labelled `past answer, unverified`.
+  - A passage that restates the prompt itself (the same question asked in an
+    earlier session) is skipped: repeating the question is not evidence.
   - An unknown word of five or more letters may complete to the clearly most
     frequent indexed word it is a prefix of (one or two letters more), shown as
     `contex→context`. No synonyms, translation or edit distance.
@@ -618,6 +620,12 @@ Known limits:
 - The scan skips dependency, cache and build directories (`node_modules`,
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
+
+## Upgrading to 0.4.2
+
+Replace the binary (`workmap install`). The prompt hook no longer offers an
+earlier copy of the same question as evidence. No re-parse is needed and the
+Codex hook definitions are unchanged, so no new `/hooks` review is asked.
 
 ## Upgrading to 0.4.1
 
