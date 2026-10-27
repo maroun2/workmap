@@ -406,6 +406,11 @@ fn run() -> Result<(), String> {
                 for r in env.load_roots() {
                     println!("{}", r.display());
                 }
+                // On-demand registration guidance (the generated skill only points here).
+                println!(
+                    "\nThe home walk follows symlinks two levels deep and skips caches, .config, .local and tmp. Ask the user which directories hold their \
+                     projects (also check agent configs and shell history), then for each one outside that walk: `workmap roots add <DIR>`, and finally `workmap scan`."
+                );
             }
             Some(x) => return Err(format!("unknown roots subcommand {x}")),
         },

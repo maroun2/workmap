@@ -175,9 +175,14 @@ and the timer all run that one stable copy, never a build directory. Rerun the
 same command to upgrade; it changes only what differs and exits non-zero when it
 had to leave a conflicting file alone (`error:` lines).
 
-**Skills.** The `workmap` skill text is generated from your index: commands,
-registered roots, and a bounded project overview (≈24 KiB) that includes
-remote-only repositories by name. It is written once to
+**Skills.** The `workmap` skill is a short router (≈3 KiB, ≈700 tokens): what
+the index holds, the command prefix that pins your state dir and agent stores
+(canonical Codex home included), and which command answers which question
+(`overview`, `context`, `search`, `expand`, `related`, `why`, `ask`). It names no
+projects and embeds no maps; agents run `workmap overview` to discover them and
+`workmap roots list` for root registration guidance. Its text depends only on
+that prefix, so it stays the same size however many projects are indexed. It is
+written once to
 `~/.local/share/workmap/skills/workmap/SKILL.md` and registered with
 `~/.claude/skills`, the Codex skills dir (`$CODEX_HOME/skills`, default
 `~/.codex/skills`) and `~/.config/opencode/skills`:
@@ -624,6 +629,16 @@ Known limits:
 - The scan skips dependency, cache and build directories (`node_modules`,
   `target`, `.cache`, `.config`, `.local`, `tmp`, … see `discover::SKIP_DIRS`)
   and follows symlinked directories only within two levels of a root.
+
+## Upgrading to 0.5.0
+
+Replace the binary (`workmap install`; the next `workmap scan` does it too). The
+generated skill shrinks from an inventory (project list in the description, the
+overview and up to eight project maps, ≈6,000 tokens) to a fixed router of about
+700 tokens with a 231-character description. Project names and maps now come
+from `workmap overview` / `workmap context` on demand. `workmap roots list` prints
+the root-registration guidance the skill used to carry. Hook definitions and
+hook output are unchanged.
 
 ## Upgrading to 0.4.3
 

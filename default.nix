@@ -4,7 +4,7 @@
 { pkgs ? import <nixpkgs> { }, rev ? "unknown" }:
 pkgs.rustPlatform.buildRustPackage {
   pname = "workmap";
-  version = "0.4.3";
+  version = "0.5.0";
   src = pkgs.lib.cleanSourceWith {
     src = ./.;
     filter = path: type: !(pkgs.lib.hasInfix "/target" path) && baseNameOf path != ".git";
