@@ -9,9 +9,12 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const SEED: &str = "Use before exploring an unfamiliar project or repeating an investigation. Discover related work you may not know exists: files, worktrees, commits, and previous agent conversations. Find who already investigated a problem, search past conversation messages, see related projects with evidence, and ask follow-up questions using their saved context. Indexed projects: ";
-pub const MAX_DESCRIPTION: usize = 1000;
-pub const MAX_BODY: usize = 24 * 1024;
+pub const DESCRIPTION: &str = "Use before exploring an unfamiliar project or repeating an investigation: find related repos, worktrees, docs, commits and past Claude/Codex/OpenCode conversations, who already investigated it; search messages, ask a saved session.";
+/// Listing budget for the description (characters).
+pub const MAX_DESCRIPTION: usize = 250;
+/// Upper bound for the whole generated SKILL.md (bytes), independent of index size (tests).
+#[cfg(test)]
+pub const MAX_SKILL: usize = 4096;
 
 pub struct InstallOpts {
     pub activate: bool,
@@ -275,39 +278,10 @@ fn register(env: &Env, provider: &str, catalog: &Path, base: &Path, skill: &str,
     }
 }
 
-pub fn description(c: &Connection) -> String {
-    // Project handles, not bare labels: two clones named alike are listed as
-    // `name~hex` each (the same names `overview` prints and commands accept).
-    let mut labels: Vec<String> = Vec::new();
-    for r in crate::overview::nodes(c, "kind='repo' ORDER BY ts DESC, label, id", &[]).unwrap_or_default() {
-        let h = crate::view::project_handle(c, &r).unwrap_or(r.label);
-        if !labels.contains(&h) {
-            labels.push(h);
-        }
-    }
-    let mut d = SEED.to_string();
-    let mut shown = 0;
-    for l in &labels {
-        let piece = if shown == 0 { l.clone() } else { format!(", {l}") };
-        if d.len() + piece.len() + 16 > MAX_DESCRIPTION {
-            break;
-        }
-        d.push_str(&piece);
-        shown += 1;
-    }
-    if shown < labels.len() {
-        d.push_str(&format!(" (+{} more)", labels.len() - shown));
-    }
-    if labels.is_empty() {
-        d.push_str("(none yet; run workmap scan)");
-    }
-    d.push('.');
-    let remote: i64 = c.query_row("SELECT count(*) FROM nodes WHERE kind='remote'", [], |r| r.get(0)).unwrap_or(0);
-    let extra = format!(" Plus {remote} accessible remote repositories not cloned here.");
-    if remote > 0 && d.len() + extra.len() <= MAX_DESCRIPTION {
-        d.push_str(&extra);
-    }
-    d
+/// Fixed text: the listing line every session pays for. Project names are found
+/// on demand with `workmap overview`, so the description does not grow with the index.
+pub fn description(_c: &Connection) -> String {
+    DESCRIPTION.to_string()
 }
 
 /// Ownership marker: only files carrying it are ever rewritten by `refresh_skills`.
@@ -319,61 +293,41 @@ pub fn command_prefix(env: &Env, bin: &Path) -> String {
     format!("env {} {}", vars.join(" "), sh_quote(&bin.display().to_string()))
 }
 
-pub fn skill_body(c: &Connection, env: &Env, bin: &Path) -> String {
+/// Routing instructions only: no project inventory, no embedded maps. The text
+/// depends on the command prefix alone, so scans leave it byte-identical and its
+/// size does not grow with the number of indexed projects.
+pub fn skill_body(_c: &Connection, env: &Env, bin: &Path) -> String {
     let b = command_prefix(env, bin);
-    // The full prefix (same index, same provider dirs) is printed once; commands below say `workmap`.
     let w = "workmap";
-    let mut o = format!(
-        "{MARKER}\n\n# workmap\n\nLocal index of Git repos, worktrees, docs, commits and native agent conversations (Claude Code, Codex, OpenCode). Output lists evidence with source paths, lines and timestamps; it does not decide what is authoritative.\n\n\
-         ## Commands\n\nRead-only commands below say `{w}`; the full command (same index and agent stores) is:\n\n```\n{b}\n```\n\nUse that full form for `scan` and `roots`, which read agent stores and write the index. Start map-first, then go deeper only where needed:\n\n```\n{w} overview                                   # all indexed projects by name\nexport WORKMAP_PROJECT=<project>             # or add --project <project>; WORKMAP_WORKTREE=<branch> for a non-main worktree\n{w} context                                    # compact map: quoted purpose, typed directed connections grouped by source\n{w} expand REF                                 # details and evidence for one ref printed by the map (file, doc, commit, conversation, :related:<project>)\n{w} search 'words'                             # no obvious starting node? full text over docs, commits, conversation messages\n{w} context --detailed                         # previous sections view: docs, key files with reasons, commits, conversations\n{w} context --weak                             # also list unconfirmed edges (mentions, requested/failed access, name matches)\n{w} context --task 'what you are doing' --file <path> --budget 6000   # ranked context for a task; every item says why\n{w} related                                    # related projects with evidence\n{w} why <project> <other>                      # shortest evidence chain between two projects\n{w} ask ':session:<id-prefix>' 'question' --dry-run   # read-only resume plan; drop --dry-run to run\n{b} scan   # refresh (incremental; also refreshes this file)\n```\n\nMap lines read `A type → B` (stored edge from A to B; `←` the reverse). Only confirmed edges are listed; weak ones are counted in the `Selected` line. Conversation titles come with a `:session:<native-id-prefix>` ref that stays valid when another conversation gets the same title. Conversation text is historical; a latest user input is not a decision. Check the `Index:` line for staleness. Entries marked remote: are repositories you can access but have not cloned.\n\n"
-    );
-    o.push_str(&format!(
-        "## Registering project roots (do this once after install)\n\nThe default scan walks {} (symlinks followed two levels deep; caches, `.config`, `.local`, `tmp` skipped). Ask the user which directories hold their projects, and also look for project locations named in their agent configs, shell history or the repos listed below. Register every root directory outside that walk, then rescan:\n\n```\n{b} roots list\n{b} roots add <dir>          # repeat per project root\n{b} scan\n```\n\nRegistered roots:\n",
-        env.home.display()
-    ));
-    let roots = env.load_roots();
-    if roots.is_empty() {
-        o.push_str("- (none yet)\n");
-    }
-    for r in roots {
-        o.push_str(&format!("- {}\n", r.display()));
-    }
-    o.push_str("\n## Indexed overview\n\n");
-    // Drop the scan clock from the header so an unchanged index renders byte-identical.
-    let ov = crate::overview::overview(c, 40, w).unwrap_or_default();
-    let ov: Vec<String> = ov.lines().enumerate().map(|(i, l)| if i == 0 { l.split("; last scan").next().unwrap_or(l).to_string() } else { l.to_string() }).collect();
-    o.push_str(&ov.join("\n"));
-    o.push('\n');
-    let v = crate::view::View { c, cmd: w.to_string(), state: String::new() };
-    let lim = crate::view::MapLimits { docs: 3, files: 4, commits: 2, sessions: 3, related: 3 };
-    let opts = crate::view::map::MapOpts { budget: 1800, weak: false };
-    if let Ok(mut st) = c.prepare("SELECT id FROM nodes WHERE kind='repo' ORDER BY ts DESC LIMIT 8") {
-        let ids: Vec<String> = st.query_map([], |r| r.get(0)).map(|r| r.flatten().collect()).unwrap_or_default();
-        for id in ids {
-            if o.len() > MAX_BODY {
-                o.push_str(&format!("\n… truncated; run `{w} context <project>` for the rest.\n"));
-                break;
-            }
-            if let Ok(p) = crate::view::resolve_project(c, &id) {
-                // Index freshness changes every scan (keep the file stable); scope and next
-                // commands are in the Commands section above, printed once.
-                let m = crate::view::map::compact_map(&v, &p, &lim, &opts).unwrap_or_default();
-                let m: String = m.lines().filter(|l| !["Index: ", "WARNING: index is stale", "Scope: ", "Next: "].iter().any(|x| l.starts_with(x))).map(|l| format!("{l}\n")).collect();
-                o.push('\n');
-                o.push_str(&m.replacen("# ", "### ", 1));
-            }
-        }
-    }
-    if o.len() > MAX_BODY + 4096 {
-        let mut cut = MAX_BODY + 4096;
-        while !o.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        o.truncate(cut);
-        o.push_str("\n… truncated\n");
-    }
-    o
+    format!(
+        "{MARKER}\n\n# workmap\n\n\
+         Local index of Git repos, worktrees, docs, commits and native agent conversations (Claude Code, Codex, OpenCode). \
+         Output is evidence with source paths, lines and timestamps; it does not decide what is authoritative.\n\n\
+         Full command (same index and agent stores):\n\n```\n{b}\n```\n\n\
+         `{w}` below stands for it; type it in full for `scan` and `roots`, and whenever bare `{w}` is not on PATH.\n\n\
+         ```\n\
+         {w} overview                          # projects by handle (name or name~hex), incl. remote-only\n\
+         export WORKMAP_PROJECT=<project>          # or --project P; WORKMAP_WORKTREE=<branch> for a non-main worktree\n\
+         {w} context                           # compact map: purpose, typed edges; --weak, --detailed\n\
+         {w} context --task 'goal' --file <path>   # ranked context for a task; each item says why\n\
+         {w} search 'words'                    # full text over docs, commits, messages; --here, --kind, --since\n\
+         {w} expand REF                        # one ref printed by any command, with its evidence\n\
+         {w} related                           # related projects with evidence\n\
+         {w} why <project> <other>             # shortest evidence chain between two projects\n\
+         {w} ask :session:<id-prefix> 'question' --dry-run   # read-only follow-up in a past conversation\n\
+         {b} scan\n\
+         {b} roots list   # scanned dirs; how to add project roots\n\
+         ```\n\n\
+         Start with `context` (or `search` when no project is obvious), then `expand` only what matters. \
+         REF forms: `<project>:<path>`, `:<doc>#<heading>`, `:commit:<sha>`, `:session:<native-id-prefix>` (stays valid when titles repeat), \
+         `:message:…` from search, `:related:<other>`, `remote:<host/ns/name>` (accessible, not cloned). \
+         `A type → B` is an edge from A (`←` reverse); weak edges are only counted. \
+         Conversation text is historical: a latest user message is not a decision. Check the `Index:` line for staleness. \
+         All flags: `{w} --help`.\n"
+    )
 }
+
+const _: () = assert!(DESCRIPTION.len() <= MAX_DESCRIPTION);
 
 pub fn render_skill(c: &Connection, env: &Env, bin: &Path) -> String {
     format!("---\nname: workmap\ndescription: {}\n---\n\n{}", yaml_quote(&description(c)), skill_body(c, env, bin))
@@ -685,7 +639,7 @@ pub fn install(env: &Env, c: &Connection, self_exe: &Path, opts: &InstallOpts) -
     std::fs::create_dir_all(&env.state_dir)?;
     write_if_changed(&env.state_dir.join("installed"), b"1\n")?;
     report.extend(verify(env));
-    report.push(format!("next: register every project root outside {} with `workmap roots add <dir>`, then `workmap scan` (the skill lists this step for agents)", env.home.display()));
+    report.push(format!("next: register every project root outside {} with `workmap roots add <dir>`, then `workmap scan` (`workmap roots list` explains it for agents)", env.home.display()));
     Ok(report)
 }
 

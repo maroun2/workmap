@@ -69,7 +69,7 @@ fn assert_locators(c: &Connection, out: &str) -> usize {
 #[test]
 fn version_string_embeds_semver_revision_and_build() {
     let v = crate::version();
-    assert!(v.starts_with(&format!("{} (rev ", env!("CARGO_PKG_VERSION"))) && env!("CARGO_PKG_VERSION") == "0.4.3", "{v}");
+    assert!(v.starts_with(&format!("{} (rev ", env!("CARGO_PKG_VERSION"))) && env!("CARGO_PKG_VERSION") == "0.5.0", "{v}");
     let rev = v.split("(rev ").nth(1).unwrap().split([';', ')']).next().unwrap();
     // From git: 12 hex digits (+ `-dirty`). From WORKMAP_BUILD_REV (Nix
     // `--argstr rev`): any value the sanitizer accepts, e.g. a short sha or tag.
@@ -112,16 +112,9 @@ fn duplicate_clones_get_stable_handles_in_every_listing() {
     let err = view::resolve_project(&c, "ledger-api").err().unwrap();
     assert!(err.contains("ambiguous") && err.contains(&main) && err.contains(&clone), "{err}");
 
-    // Skill description: every project once, by handle; never a repeated bare name.
-    let d = install::description(&c);
-    let list = d.split("Indexed projects: ").nth(1).unwrap().split('.').next().unwrap();
-    let mut names: Vec<&str> = list.split(", ").collect();
-    names.sort();
-    let mut want = vec![main.as_str(), clone.as_str(), "ledger-sdk"];
-    want.sort();
-    assert_eq!(names, want, "{d}");
+    // The skill names no project at all; handles are discovered with `overview` (below).
     let skill = install::render_skill(&c, &env, Path::new("/opt/workmap"));
-    assert!(!skill.contains("ledger-api, ") && !skill.contains("- ledger-api —"), "{skill}");
+    assert!(!skill.contains("ledger-api") && !skill.contains("ledger-sdk"), "{skill}");
 
     // Overview lists handles, each with a command that works.
     let ov = overview::overview(&c, 40, "workmap").unwrap();

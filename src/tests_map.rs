@@ -335,17 +335,54 @@ fn detailed_is_the_previous_project_map_byte_for_byte() {
 }
 
 #[test]
-fn skill_prints_the_command_prefix_once_and_compact_maps() {
+fn skill_is_a_compact_router_independent_of_the_index() {
     let fx = crate::testutil::ledger();
     let env = Env::with_home(&fx.home);
+    let bin = fx.home.join(".local/share/workmap/bin/workmap");
+    let empty = db::open(&fx.home.join("empty.db")).unwrap();
+    let before = install::render_skill(&empty, &env, &bin);
     let (c, _) = scan_once(&env);
-    let bin = fx.home.join(".claude/skills/workmap/bin/workmap");
     let skill = install::render_skill(&c, &env, &bin);
+    // Same bytes for an empty and a populated index: no inventory, no maps, bounded size.
+    assert_eq!(skill, before);
+    assert!(skill.len() <= install::MAX_SKILL, "{} bytes", skill.len());
+    assert!(!skill.contains("ledger-api") && !skill.contains("ledger-sdk") && !skill.contains("— map ·") && !skill.contains("## Key files"), "{skill}");
+    let desc = skill.lines().find_map(|l| l.strip_prefix("description: ")).unwrap();
+    let desc: String = serde_json::from_str(desc).unwrap();
+    assert!(desc.len() <= install::MAX_DESCRIPTION && desc.contains("conversations"), "{desc}");
+
+    // The full command (index + agent stores) is printed once and spelled out for scan/roots only.
     let prefix = install::command_prefix(&env, &bin);
-    // Printed once for reading, and only on the commands that scan or change roots.
-    assert_eq!(skill.matches(&prefix).count(), 5, "{skill}");
-    assert_eq!(skill.lines().filter(|l| l.starts_with(&prefix) && !l.contains(" scan") && !l.contains(" roots ")).count(), 1, "{skill}");
-    assert!(skill.contains("— map ·") && skill.contains("workmap context --detailed") && skill.contains("workmap expand"), "{skill}");
-    assert!(!skill.contains("## Key files"), "skill uses the compact map:\n{skill}");
-    assert!(skill.len() < install::MAX_BODY + 4096);
+    assert!(prefix.starts_with("env 'WORKMAP_STATE_DIR=") || prefix.starts_with("env WORKMAP_STATE_DIR="), "{prefix}");
+    assert_eq!(skill.lines().filter(|l| l == &prefix).count(), 1, "{skill}");
+    let full: Vec<&str> = skill.lines().filter(|l| l.starts_with(&prefix) && l != &prefix).collect();
+    assert_eq!(full.len(), 2, "{skill}");
+    assert!(full.iter().all(|l| l.contains(" scan") || l.contains(" roots ")), "{full:?}");
+
+    // Every command line routes to a subcommand and flags the CLI documents.
+    let mut subs = Vec::new();
+    let mut fenced = false;
+    for l in skill.lines() {
+        if l.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if !fenced || l == prefix || l.starts_with("export ") {
+            continue;
+        }
+        let cmd = l.strip_prefix(&prefix).map(str::trim_start).or_else(|| l.strip_prefix("workmap ")).unwrap_or_else(|| panic!("unroutable line {l:?}"));
+        let sub = cmd.split_whitespace().next().unwrap();
+        assert!(crate::HELP.contains(&format!("workmap {sub} ")) || crate::HELP.contains(&format!("workmap [{sub}]")), "{sub} not in --help");
+        subs.push(sub.to_string());
+        for flag in cmd.split_whitespace().filter(|w| w.starts_with("--")) {
+            let flag = flag.trim_end_matches(',');
+            assert!(crate::HELP.contains(flag), "{flag} not in --help ({l})");
+        }
+    }
+    for want in ["overview", "context", "search", "expand", "related", "why", "ask", "scan", "roots"] {
+        assert!(subs.iter().any(|s| s == want), "skill lost `{want}`: {skill}");
+    }
+    for want in ["WORKMAP_PROJECT", "WORKMAP_WORKTREE", ":session:<native-id-prefix>", "--detailed", "--weak", "--task", "--dry-run", "Index:", "remote:"] {
+        assert!(skill.contains(want), "skill lost {want}");
+    }
 }
