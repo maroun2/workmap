@@ -29,3 +29,29 @@ jobs:
           cargo test --locked
       - name: release build
         run: cargo build --release --locked
+      - name: demo output
+        # End-to-end run of the release binary on the synthetic demo home;
+        # fails when user-visible output drifts from examples/demo-output.txt.
+        run: examples/demo-check.sh target/release/workmap
+
+  msrv:
+    # Cargo.toml declares rust-version; prove it still builds and passes there.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80
+      - uses: Swatinem/rust-cache@v2
+      - name: test
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          cargo test --locked
+
+  nix:
+    # The packaged build: runs the test suite inside the Nix sandbox (no HOME, no network).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: nix-build
+        run: nix-build -I nixpkgs=flake:nixpkgs --no-out-link --argstr rev "$(git rev-parse --short=12 HEAD)"

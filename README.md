@@ -693,7 +693,16 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 Tests build throwaway Git repositories, worktrees and synthetic Claude Code,
 Codex and OpenCode stores in a temp dir, and fake `gh`/`glab` scripts. They
-never touch your home or the network. CI runs the same on every push.
+never touch your home or the network.
+
+```sh
+cargo build --release && examples/demo-check.sh   # end-to-end: demo output vs examples/demo-output.txt
+examples/demo-check.sh target/release/workmap --update   # after an intended output change
+```
+
+CI runs on pushes to `main` and on pull requests: fmt, clippy, tests and the
+demo check on stable; tests on the declared minimum Rust (1.80); and
+`nix-build`, which runs the suite inside the Nix sandbox.
 
 ## License
 

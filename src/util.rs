@@ -82,8 +82,9 @@ pub fn parse_iso(s: &str) -> Option<i64> {
     let rest = &s[19..];
     let rest = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
     if rest.len() >= 6 && (rest.starts_with('+') || rest.starts_with('-')) {
-        let oh: i64 = rest[1..3].parse().ok()?;
-        let om: i64 = rest[4..6].parse().ok()?;
+        // Checked slices: transcript text is untrusted and may hold multi-byte chars here.
+        let oh: i64 = rest.get(1..3)?.parse().ok()?;
+        let om: i64 = rest.get(4..6)?.parse().ok()?;
         let off = oh * 3600 + om * 60;
         t -= if rest.starts_with('+') { off } else { -off };
     }
@@ -505,6 +506,10 @@ mod tests {
         let t = parse_iso("2026-10-10T20:06:47.155Z").unwrap();
         assert_eq!(fmt_ts(t), "2026-10-10 20:06Z");
         assert_eq!(parse_iso("2026-10-10T22:06:47+02:00"), Some(t));
+        assert_eq!(parse_iso("2026-10-10T18:06:47-02:00"), Some(t));
+        for bad in ["2026-10-10T20:06:47+0é:00", "2026-10-10T20:06:47+02:é0", "2026-10-10T20:06é", "2026-10-10T20:06:4é", "short"] {
+            assert_eq!(parse_iso(bad), None, "{bad}");
+        }
     }
 
     #[test]

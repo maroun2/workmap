@@ -210,7 +210,9 @@ fn install_adds_hooks_by_default_idempotently_and_keeps_backups_out_of_settings_
     assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
     assert_eq!(v["hooks"]["SessionStart"][0], foreign["hooks"]["SessionStart"][0]);
     let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-    assert!(cmd.contains(&env.home.join(".local/share/workmap/bin/workmap").display().to_string()) && !cmd.contains("/build/"), "stable binary, not the build path: {cmd}");
+    // Compare with the exact build path: under nix-build every temp path starts with /build/.
+    let built = exe(&l).display().to_string();
+    assert!(cmd.contains(&env.home.join(".local/share/workmap/bin/workmap").display().to_string()) && !cmd.contains(&built), "stable binary, not the build path {built}: {cmd}");
     // Backups live in the state dir, not in ~/.codex.
     assert!(!std::fs::read_dir(&l.codex).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("backup")));
     assert!(hook::backup_path(&env, &l.codex.join("hooks.json")).is_file());
