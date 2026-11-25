@@ -464,7 +464,8 @@ fn uri_path(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(x) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+            // Checked slice: a `%` may be followed by a multi-byte char.
+            if let Some(x) = rest.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(x);
                 i += 3;
                 continue;
@@ -973,6 +974,16 @@ mod tests {
     fn patch_headers_from_js_literal() {
         let js = r#"text(await tools.apply_patch("*** Begin Patch\n*** Add File: /r/a.md\n+x\n*** Update File: src/b.rs\n@@\n*** End Patch"))"#;
         assert_eq!(patch_paths(js), vec!["/r/a.md", "src/b.rs"]);
+    }
+
+    #[test]
+    fn file_uris_decode_and_never_split_a_char() {
+        assert_eq!(uri_path("file:///a%20b/c"), "/a b/c");
+        assert_eq!(uri_path("/plain/%20"), "/plain/%20");
+        assert_eq!(uri_path("file:///x%2"), "/x%2");
+        // `%` then a hex digit then a multi-byte char: not an escape, kept as text.
+        assert_eq!(uri_path("file:///x%aé"), "/x%aé");
+        assert_eq!(uri_path("file:///x%éa"), "/x%éa");
     }
 
     #[test]

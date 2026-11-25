@@ -70,6 +70,9 @@ fn assert_locators(c: &Connection, out: &str) -> usize {
 fn version_string_embeds_semver_revision_and_build() {
     let v = crate::version();
     assert!(v.starts_with(&format!("{} (rev ", env!("CARGO_PKG_VERSION"))) && env!("CARGO_PKG_VERSION") == "0.5.0", "{v}");
+    // The Nix package is versioned by hand; a release bump must touch both files.
+    let nix = include_str!("../default.nix");
+    assert!(nix.contains(&format!("version = \"{}\";", env!("CARGO_PKG_VERSION"))), "default.nix version differs from Cargo.toml {}", env!("CARGO_PKG_VERSION"));
     let rev = v.split("(rev ").nth(1).unwrap().split([';', ')']).next().unwrap();
     // From git: 12 hex digits (+ `-dirty`). From WORKMAP_BUILD_REV (Nix
     // `--argstr rev`): any value the sanitizer accepts, e.g. a short sha or tag.

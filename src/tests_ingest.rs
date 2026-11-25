@@ -580,3 +580,41 @@ fn codex_parsed_shell_reads_are_their_own_evidence_class() {
     assert!(graph.contains("[hop1] read via shell command (parsed by Codex, best effort) by"), "parsed read must keep its best-effort meaning in task graph hops:\n{graph}");
     assert!(!graph.lines().any(|l| l.contains(":ledger/charges.py") && l.contains("[hop1] failed access by")), "{graph}");
 }
+
+#[test]
+fn corrupt_transcript_fields_do_not_abort_ingest() {
+    let fx: Ledger = ledger();
+    let env = Env::with_home(&fx.home);
+    let (c, _) = scan_once(&env);
+    drop(c);
+    let f = fx.api.display().to_string();
+    let file = claude_file(&fx.home, &fx.api, "eeee5555-ts");
+    // A multi-byte char inside the UTC offset (a corrupted or hand-edited transcript)
+    // must cost only that timestamp, not the whole ingest.
+    write(
+        &file,
+        &jsonl(&[
+            json!({"type":"summary","summary":"Corrupt clock"}),
+            json!({"type":"user","cwd":f,"sessionId":"eeee5555-ts","timestamp":"2026-09-10T10:00:00+0é:00","message":{"role":"user","content":"the vorpaltrex importer stalls"}}),
+            json!({"type":"user","cwd":f,"sessionId":"eeee5555-ts","timestamp":"2026-09-10T12:30:00+02:00","message":{"role":"user","content":"still stalls after the gloamquist fix"}}),
+        ]),
+    );
+    // A Codex command whose `file://` cwd has `%` followed by a hex digit and a multi-byte char.
+    let rollout = fx.home.join(".codex/sessions/2026/09/12/rollout-2026-09-12T09-00-00-ffff.jsonl");
+    write(
+        &rollout,
+        &jsonl(&[
+            json!({"timestamp":"2026-09-12T09:00:00Z","type":"session_meta","payload":{"id":"ffff-codex","cwd":f}}),
+            json!({"timestamp":"2026-09-12T09:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"why does the brindlequark job hang"}}),
+            json!({"timestamp":"2026-09-12T09:00:02Z","type":"event_msg","payload":{"type":"item_started","item":{"type":"CommandExecution","id":"x1","command":["cat","README.md"],"cwd":format!("file://{f}/%aé")}}}),
+        ]),
+    );
+    let mut c = db::open(&env.db_path()).unwrap();
+    let r = scan::ingest(&env, &mut c, &scan::IngestOpts { transcripts: vec![file.clone(), rollout.clone()], checkouts: vec![] }).unwrap();
+    assert!(r.lines.iter().any(|l| l.starts_with("parsed claude") && l.ends_with("eeee5555-ts.jsonl")), "{:?}", r.lines);
+    assert!(r.lines.iter().any(|l| l.starts_with("parsed codex") && l.ends_with("ffff.jsonl")), "{:?}", r.lines);
+    assert!(search(&c, "vorpaltrex").contains("Corrupt clock"));
+    assert!(search(&c, "brindlequark").contains("brindlequark"));
+    let ts: i64 = c.query_row("SELECT ts FROM passages WHERE text LIKE '%gloamquist%' AND speaker='user'", [], |r| r.get(0)).unwrap();
+    assert_eq!(crate::util::fmt_ts(ts), "2026-09-10 10:30Z", "valid line keeps its own offset");
+}
