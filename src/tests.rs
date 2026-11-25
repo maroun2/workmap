@@ -757,7 +757,9 @@ fn duplicate_project_names_refuse_and_path_handle_works() {
     assert!(m.starts_with(&format!("# {handle} — map · ")) && m.contains(&format!("WORKMAP_PROJECT={handle}")), "{m}");
     assert_eq!(m, by_path, "handle and path name the same project");
     let (c2, _) = scan_once(&env);
-    assert_eq!(view::context(&v(&c2), "", &scoped(&handle)).unwrap(), m, "handle is stable across scans");
+    // The `Index: last scan HH:MMZ` line moves with the clock; the rest must not.
+    let no_index = |s: &str| s.lines().filter(|l| !l.starts_with("Index: ")).collect::<Vec<_>>().join("\n");
+    assert_eq!(no_index(&view::context(&v(&c2), "", &scoped(&handle)).unwrap()), no_index(&m), "handle is stable across scans");
     assert_refs_roundtrip(&c, &handle, &m);
     assert!(view::context(&v(&c), "nosuch", &view::Req::default()).unwrap_err().contains("no project named"));
 }
