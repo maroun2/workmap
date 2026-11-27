@@ -12,5 +12,13 @@ Everything here is synthetic and reproducible. No real projects or transcripts.
   files, transcripts × messages; sizes via `REPOS`, `FILES`, `SESSIONS`,
   `MSGS`) and prints scan, search and context timings plus the index size.
 
-Both scripts set `WORKMAP_HOME` and `WORKMAP_STATE_DIR`, so your real home and
-index are never read or written.
+- [`hooks_ab.py`](hooks_ab.py) runs a paired hooks-on/off comparison on your
+  own questions: each question is asked in two fresh, non-persisted
+  `claude -p` sessions that differ only in the workmap SessionStart and
+  UserPromptSubmit hooks (Stop/SessionEnd are never installed, so nothing is
+  ingested). Point `--state-dir` at a copy of the index, keep the dataset
+  private, then run `settings`, `retrieval`, `run`, `score` and `report`
+  (`examples/hooks_ab.py -h`).
+
+`demo.sh` and `bench.sh` set `WORKMAP_HOME` and `WORKMAP_STATE_DIR`, so your
+real home and index are never read or written.
